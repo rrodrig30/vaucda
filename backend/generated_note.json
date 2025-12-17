@@ -1,0 +1,224 @@
+{
+  "preliminary_note": "",
+  "extracted_entities": [
+    {
+      "field": "psa",
+      "value": 6.8,
+      "confidence": 0.9,
+      "source_text": "PSA: 6.8"
+    },
+    {
+      "field": "age",
+      "value": 58,
+      "confidence": 0.9,
+      "source_text": "58 years old"
+    },
+    {
+      "field": "creatinine",
+      "value": 1.1,
+      "confidence": 0.9,
+      "source_text": "Creatinine: 1.1"
+    }
+  ],
+  "suggested_calculators": [
+    {
+      "calculator_id": "pcpt_risk",
+      "calculator_name": "PCPT Risk Calculator",
+      "category": "prostate",
+      "confidence": "high",
+      "auto_selected": true,
+      "reason": "All required inputs detected",
+      "required_inputs": [
+        "psa",
+        "age"
+      ],
+      "available_inputs": [
+        "psa",
+        "age"
+      ],
+      "missing_inputs": [
+        "dre_abnormal",
+        "family_history",
+        "prior_biopsy",
+        "race"
+      ],
+      "detected_entities": {
+        "psa": 6.8,
+        "age": 58
+      }
+    },
+    {
+      "calculator_id": "free_psa",
+      "calculator_name": "Free PSA Ratio",
+      "category": "prostate",
+      "confidence": "medium",
+      "auto_selected": false,
+      "reason": "Missing 1 required input(s)",
+      "required_inputs": [
+        "psa",
+        "free_psa"
+      ],
+      "available_inputs": [
+        "psa"
+      ],
+      "missing_inputs": [
+        "free_psa"
+      ],
+      "detected_entities": {
+        "psa": 6.8
+      }
+    },
+    {
+      "calculator_id": "dre_volume",
+      "calculator_name": "DRE Prostate Volume",
+      "category": "prostate",
+      "confidence": "medium",
+      "auto_selected": false,
+      "reason": "Missing 1 required input(s)",
+      "required_inputs": [
+        "prostate_volume_cc"
+      ],
+      "available_inputs": [
+        "psa"
+      ],
+      "missing_inputs": [
+        "prostate_volume_cc"
+      ],
+      "detected_entities": {
+        "psa": 6.8
+      }
+    },
+    {
+      "calculator_id": "cci",
+      "calculator_name": "Charlson Comorbidity Index",
+      "category": "surgical",
+      "confidence": "medium",
+      "auto_selected": false,
+      "reason": "Missing 1 required input(s)",
+      "required_inputs": [
+        "age",
+        "comorbidities"
+      ],
+      "available_inputs": [
+        "age"
+      ],
+      "missing_inputs": [
+        "comorbidities"
+      ],
+      "detected_entities": {
+        "age": 58
+      }
+    },
+    {
+      "calculator_id": "capra_score",
+      "calculator_name": "CAPRA Score",
+      "category": "prostate",
+      "confidence": "low",
+      "auto_selected": false,
+      "reason": "Insufficient data detected (2/6 required)",
+      "required_inputs": [
+        "psa",
+        "age",
+        "gleason_primary",
+        "gleason_secondary",
+        "clinical_stage",
+        "percent_positive_cores"
+      ],
+      "available_inputs": [
+        "psa",
+        "age"
+      ],
+      "missing_inputs": [
+        "gleason_primary",
+        "gleason_secondary",
+        "clinical_stage",
+        "percent_positive_cores"
+      ],
+      "detected_entities": {
+        "psa": 6.8,
+        "age": 58
+      }
+    },
+    {
+      "calculator_id": "nccn_risk",
+      "calculator_name": "NCCN Risk Stratification",
+      "category": "prostate",
+      "confidence": "low",
+      "auto_selected": false,
+      "reason": "Insufficient data detected (1/4 required)",
+      "required_inputs": [
+        "psa",
+        "gleason_primary",
+        "gleason_secondary",
+        "clinical_stage"
+      ],
+      "available_inputs": [
+        "psa"
+      ],
+      "missing_inputs": [
+        "gleason_primary",
+        "gleason_secondary",
+        "clinical_stage",
+        "percent_positive_cores"
+      ],
+      "detected_entities": {
+        "psa": 6.8
+      }
+    },
+    {
+      "calculator_id": "phi_score",
+      "calculator_name": "Prostate Health Index (PHI)",
+      "category": "prostate",
+      "confidence": "low",
+      "auto_selected": false,
+      "reason": "Insufficient data detected (1/3 required)",
+      "required_inputs": [
+        "psa",
+        "free_psa",
+        "p2psa"
+      ],
+      "available_inputs": [
+        "psa"
+      ],
+      "missing_inputs": [
+        "free_psa",
+        "p2psa"
+      ],
+      "detected_entities": {
+        "psa": 6.8
+      }
+    },
+    {
+      "calculator_id": "cueto_score",
+      "calculator_name": "Cueto BCG Score",
+      "category": "bladder",
+      "confidence": "low",
+      "auto_selected": false,
+      "reason": "Insufficient data detected (1/4 required)",
+      "required_inputs": [
+        "age",
+        "prior_recurrence",
+        "num_tumors",
+        "tumor_grade"
+      ],
+      "available_inputs": [
+        "age"
+      ],
+      "missing_inputs": [
+        "prior_recurrence",
+        "num_tumors",
+        "tumor_grade"
+      ],
+      "detected_entities": {
+        "age": 58
+      }
+    }
+  ],
+  "metadata": {
+    "generation_time_seconds": 32.44,
+    "entities_extracted": 3,
+    "calculators_suggested": 8,
+    "note_type": "clinic_note",
+    "llm_provider": "ollama"
+  }
+}

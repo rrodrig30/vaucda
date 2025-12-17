@@ -1,0 +1,100 @@
+PATIENT: John Smith
+MRN: 12345678
+DOB: 05/15/1965 (58 years old)
+Visit Date: 12/06/2025
+
+VITAL SIGNS:
+BP: 138/85 mmHg
+HR: 78 bpm
+Temp: 98.6 F
+Weight: 185 lbs
+Height: 5'10"
+
+CHIEF COMPLAINT:
+Hematuria and lower urinary tract symptoms for 3 months
+
+HISTORY OF PRESENT ILLNESS:
+58-year-old male presents with gross hematuria noticed intermittently over the past 3 months. Reports increased urinary frequency (every 1-2 hours during day), nocturia (3-4 times per night), weak stream, and hesitancy. Denies dysuria, flank pain, or fever. No history of kidney stones. Nonsmoker. Works as accountant.
+
+PAST MEDICAL HISTORY:
+- Hypertension (diagnosed 2010)
+- Type 2 Diabetes Mellitus (diagnosed 2015)
+- Benign Prostatic Hyperplasia (diagnosed 2020)
+
+MEDICATIONS:
+- Lisinopril 10mg daily
+- Metformin 1000mg twice daily
+- Tamsulosin 0.4mg daily
+- Aspirin 81mg daily
+
+ALLERGIES:
+Penicillin (rash)
+
+SOCIAL HISTORY:
+Never smoker, occasional alcohol (1-2 drinks/week), married, 2 adult children, sedentary lifestyle
+
+FAMILY HISTORY:
+Father - prostate cancer (diagnosed age 72)
+Mother - hypertension, diabetes
+
+REVIEW OF SYSTEMS:
+Constitutional: Denies fever, chills, weight loss
+Cardiovascular: Denies chest pain, palpitations
+Respiratory: Denies cough, dyspnea
+GI: Denies abdominal pain, changes in bowel habits
+GU: As per HPI
+Musculoskeletal: Denies joint pain
+
+PHYSICAL EXAMINATION:
+General: Well-appearing male in no acute distress
+Vital Signs: As above
+Cardiovascular: Regular rate and rhythm, no murmurs
+Respiratory: Clear to auscultation bilaterally
+Abdomen: Soft, non-tender, no masses palpable, no CVA tenderness
+GU: Normal external genitalia, no inguinal lymphadenopathy
+DRE: Prostate moderately enlarged (estimated 50g), firm, symmetric, no nodules
+
+LABORATORY RESULTS:
+PSA: 6.8 ng/mL (elevated, previous 4.2 ng/mL one year ago)
+Creatinine: 1.1 mg/dL (normal)
+eGFR: 75 mL/min/1.73m2
+Urinalysis:
+  - Color: Red
+  - RBC: >100/hpf
+  - WBC: 2-5/hpf
+  - Protein: trace
+  - Bacteria: none
+  - Nitrites: negative
+
+Urine Cytology: Pending
+
+IMAGING:
+Renal Ultrasound (12/01/2025):
+- Right kidney: 11.2 cm, normal cortical thickness, no hydronephrosis or masses
+- Left kidney: 10.8 cm, normal cortical thickness, no hydronephrosis or masses
+- Bladder: Incompletely visualized, recommend cystoscopy
+
+ASSESSMENT:
+1. Gross hematuria - concerning for bladder pathology given age, risk factors
+2. Lower urinary tract symptoms - likely BPH-related
+3. Elevated PSA - trending upward, family history of prostate cancer
+
+PLAN:
+1. Cystoscopy scheduled for 12/13/2025 to evaluate bladder and rule out malignancy
+2. Urine cytology pending - will review results
+3. Consider prostate MRI if PSA continues to rise
+4. CT urogram to evaluate upper tracts
+5. Continue current medications
+6. Follow-up in 2 weeks after cystoscopy
+7. Patient educated about warning signs, importance of follow-up
+
+DISCUSSED:
+- Differential diagnosis including bladder cancer, BPH, prostatitis, kidney stones
+- Need for thorough workup given hematuria
+- Procedural risks and benefits of cystoscopy
+- Patient verbalized understanding and agreed to plan
+
+Follow-up: 2 weeks or sooner if symptoms worsen
+
+Dr. Sarah Johnson, MD
+Urology

@@ -1,0 +1,145 @@
+version: '3.8'
+
+services:
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: vaucda-neo4j
+    restart: unless-stopped
+
+    ports:
+      - "7474:7474"   # HTTP (Neo4j Browser)
+      - "7687:7687"   # Bolt protocol
+      - "2004:2004"   # Prometheus metrics
+
+    environment:
+      # Authentication
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-changeme123}
+
+      # Memory configuration (aligned with neo4j.conf)
+      - NEO4J_dbms_memory_heap_initial__size=8g
+      - NEO4J_dbms_memory_heap_max__size=8g
+      - NEO4J_dbms_memory_pagecache_size=16g
+
+      # Plugins
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+
+      # Security procedures
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*,gds.*
+
+      # Logging (HIPAA-compliant: no parameter logging)
+      - NEO4J_dbms_logs_query_enabled=true
+      - NEO4J_dbms_logs_query_threshold=1s
+      - NEO4J_dbms_logs_query_parameter__logging__enabled=false
+
+      # Performance
+      - NEO4J_db_index_vector_ephemeral__graph__enabled=true
+      - NEO4J_dbms_transaction_timeout=30s
+      - NEO4J_dbms_connector_bolt_thread__pool_min__size=50
+      - NEO4J_dbms_connector_bolt_thread__pool_max__size=400
+
+      # Metrics
+      - NEO4J_metrics_enabled=true
+      - NEO4J_metrics_prometheus_enabled=true
+      - NEO4J_metrics_prometheus_endpoint=0.0.0.0:2004
+
+    volumes:
+      # Persistent data
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/import
+      - neo4j_plugins:/plugins
+
+      # Custom configuration
+      - ./conf/neo4j.conf:/var/lib/neo4j/conf/neo4j.conf:ro
+
+      # SSL certificates (if available)
+      - ./certificates:/var/lib/neo4j/certificates:ro
+
+    networks:
+      - vaucda-network
+
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-changeme123} 'RETURN 1' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 28G
+        reservations:
+          cpus: '4'
+          memory: 24G
+
+    labels:
+      - "com.vaucda.service=neo4j"
+      - "com.vaucda.environment=production"
+
+  # Neo4j Read Replica (optional, for production scaling)
+  # Uncomment for high-availability deployments
+  # neo4j-replica:
+  #   image: neo4j:5.15-enterprise
+  #   container_name: vaucda-neo4j-replica
+  #   restart: unless-stopped
+  #
+  #   ports:
+  #     - "7688:7687"
+  #
+  #   environment:
+  #     - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-changeme123}
+  #     - NEO4J_dbms_mode=READ_REPLICA
+  #     - NEO4J_dbms_cluster_discovery_endpoints=neo4j:5000
+  #
+  #   volumes:
+  #     - neo4j_replica_data:/data
+  #     - neo4j_replica_logs:/logs
+  #
+  #   networks:
+  #     - vaucda-network
+  #
+  #   depends_on:
+  #     - neo4j
+
+volumes:
+  neo4j_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /var/lib/neo4j/data
+      o: bind
+
+  neo4j_logs:
+    driver: local
+    driver_opts:
+      type: none
+      device: /var/log/neo4j
+      o: bind
+
+  neo4j_import:
+    driver: local
+    driver_opts:
+      type: none
+      device: /var/lib/neo4j/import
+      o: bind
+
+  neo4j_plugins:
+    driver: local
+    driver_opts:
+      type: none
+      device: /var/lib/neo4j/plugins
+      o: bind
+
+  # neo4j_replica_data:
+  # neo4j_replica_logs:
+
+networks:
+  vaucda-network:
+    external: true
+    name: vaucda_default

@@ -1,0 +1,39 @@
+
+================================================================================
+CONSULT EXTRACTION VALIDATION REPORT
+================================================================================
+Test Data: /home/gulab/PythonProjects/VAUCDA/logs/input.txt
+Expected Output: /home/gulab/PythonProjects/VAUCDA/logs/better_note.log
+Date: 2025-12-14 20:01:00
+================================================================================
+
+✓ Input file loaded: 113165 characters
+✓ Expected output loaded: 12100 characters
+
+
+COMPONENT VALIDATION RESULTS:
+--------------------------------------------------------------------------------
+✓ 1. Patient Name Extraction               [PASS] KILE,STEPHEN A
+✓ 2. SSN Extraction                        [PASS] Last 4: 7007
+✓ 3. PSA Curve Extraction                  [PASS] 6 values
+✓ 4. Imaging Completeness                  [PASS] 1.1 cm cyst
+✓ 5. Document Classifier                   [PASS] Consult + PCP notes
+✓ 6. PCP Note Extraction                   [PASS] Annual assessment
+✓ 7. Stone Labs Extraction                 [PASS] BUN, Cr, eGFR, UA
+✓ 8. General Labs (Calcium)                [PASS] 15 values
+✓ 9. Social History                        [PASS] Tobacco, alcohol
+✓ 10. Family History                       [PASS] Brother CA, Mother DM
+✓ 11. Surgical History                     [PASS] 6 surgeries
+✓ 12. Dietary History                      [PASS] Standard American diet
+✓ 13. Testosterone Labs                    [PASS] 2 values
+✓ 14. HPI Quality                          [PASS] 180 words
+✓ 15. IPSS Template                        [PASS] Formatted table
+✓ 16. Pathology Field                      [PASS] None documented
+--------------------------------------------------------------------------------
+
+EXTRACTION RATE: 16/16 (100.0%)
+
+✓✓✓ ALL TESTS PASSED - EXTRACTION SYSTEM VALIDATED ✓✓✓
+
+================================================================================
+

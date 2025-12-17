@@ -1,0 +1,400 @@
+{
+  "total_examples": 82,
+  "successful_examples": 0,
+  "partial_examples": 0,
+  "failed_examples": 82,
+  "avg_overall_score": 0.25666422730054084,
+  "avg_extraction_time": 1.0049148236469525,
+  "section_stats": {
+    "HPI": {
+      "avg_coverage": 0.17237224157955866,
+      "avg_accuracy": 0.2530487804878049,
+      "avg_format": 0.07341620726101235,
+      "total_hallucinations": 146,
+      "count": 82
+    },
+    "PAST MEDICAL HISTORY": {
+      "avg_coverage": 0.08739837398373984,
+      "avg_accuracy": 0.6402439024390244,
+      "avg_format": 0.18432057512938832,
+      "total_hallucinations": 62,
+      "count": 82
+    },
+    "PSA CURVE": {
+      "avg_coverage": 0.02631578947368421,
+      "avg_accuracy": 0.9473684210526315,
+      "avg_format": 0.3975897936847333,
+      "total_hallucinations": 36,
+      "count": 76
+    },
+    "MEDICATIONS": {
+      "avg_coverage": 0.24400757135503795,
+      "avg_accuracy": 0.7032520325203252,
+      "avg_format": 0.07534691207356303,
+      "total_hallucinations": 574,
+      "count": 82
+    },
+    "ENDOCRINE LABS": {
+      "avg_coverage": 0.036164736164736165,
+      "avg_accuracy": 0.06756756756756757,
+      "avg_format": 0.044688272723739944,
+      "total_hallucinations": 50,
+      "count": 74
+    },
+    "LABS": {
+      "avg_coverage": 0.06935686153024392,
+      "avg_accuracy": 0.05555555555555555,
+      "avg_format": 0.0748183459645969,
+      "total_hallucinations": 534,
+      "count": 81
+    },
+    "IMAGING": {
+      "avg_coverage": 0.15625,
+      "avg_accuracy": 0.1625,
+      "avg_format": 0.20550929091076225,
+      "total_hallucinations": 239,
+      "count": 80
+    },
+    "ROS": {
+      "avg_coverage": 0.036585365853658534,
+      "avg_accuracy": 0.036585365853658534,
+      "avg_format": 0.05583443103581189,
+      "total_hallucinations": 1489,
+      "count": 82
+    },
+    "PHYSICAL EXAM": {
+      "avg_coverage": 0.07477497096399535,
+      "avg_accuracy": 0.04989725721433038,
+      "avg_format": 0.07244566948267316,
+      "total_hallucinations": 251,
+      "count": 82
+    },
+    "ASSESSMENT": {
+      "avg_coverage": 0.06639566395663957,
+      "avg_accuracy": 0.39634146341463417,
+      "avg_format": 0.042538763178262114,
+      "total_hallucinations": 663,
+      "count": 82
+    },
+    "PLAN": {
+      "avg_coverage": 0.08191056910569106,
+      "avg_accuracy": 0.23577235772357721,
+      "avg_format": 0.024412132357325943,
+      "total_hallucinations": 1023,
+      "count": 82
+    },
+    "CC": {
+      "avg_coverage": 0.0,
+      "avg_accuracy": 1.0,
+      "avg_format": 0.07671819365763408,
+      "total_hallucinations": 71,
+      "count": 34
+    },
+    "DIETARY HISTORY": {
+      "avg_coverage": 0.0,
+      "avg_accuracy": 1.0,
+      "avg_format": 0.29532026306678,
+      "total_hallucinations": 4,
+      "count": 49
+    },
+    "SOCIAL HISTORY": {
+      "avg_coverage": 0.061224489795918366,
+      "avg_accuracy": 0.673469387755102,
+      "avg_format": 0.2534908372577615,
+      "total_hallucinations": 228,
+      "count": 49
+    },
+    "FAMILY HISTORY": {
+      "avg_coverage": 0.0,
+      "avg_accuracy": 1.0,
+      "avg_format": 0.3633668618350365,
+      "total_hallucinations": 27,
+      "count": 50
+    },
+    "SEXUAL HISTORY": {
+      "avg_coverage": 0.05102040816326531,
+      "avg_accuracy": 0.7959183673469388,
+      "avg_format": 0.34819955113513057,
+      "total_hallucinations": 1,
+      "count": 49
+    },
+    "PAST SURGICAL HISTORY": {
+      "avg_coverage": 0.20512820512820512,
+      "avg_accuracy": 0.6282051282051282,
+      "avg_format": 0.3480207220540963,
+      "total_hallucinations": 23,
+      "count": 78
+    },
+    "PATHOLOGY RESULTS": {
+      "avg_coverage": 0.23513708513708514,
+      "avg_accuracy": 0.5,
+      "avg_format": 0.10349151614901643,
+      "total_hallucinations": 26,
+      "count": 66
+    },
+    "ALLERGIES": {
+      "avg_coverage": 0.005747126436781609,
+      "avg_accuracy": 0.9310344827586207,
+      "avg_format": 0.15041019101102643,
+      "total_hallucinations": 136,
+      "count": 58
+    }
+  },
+  "most_missing_fields": [
+    [
+      "ROS::CNS",
+      79
+    ],
+    [
+      "PHYSICAL EXAM::RECTAL",
+      79
+    ],
+    [
+      "PHYSICAL EXAM::GU",
+      77
+    ],
+    [
+      "PHYSICAL EXAM::CHEST",
+      77
+    ],
+    [
+      "PHYSICAL EXAM::ABDOMEN",
+      76
+    ],
+    [
+      "PHYSICAL EXAM::HEENT",
+      74
+    ],
+    [
+      "PHYSICAL EXAM::GENERAL",
+      74
+    ],
+    [
+      "IMAGING::dates",
+      47
+    ],
+    [
+      "HPI::dates",
+      43
+    ],
+    [
+      "ENDOCRINE LABS::dates",
+      41
+    ],
+    [
+      "LABS::dates",
+      39
+    ],
+    [
+      "MEDICATIONS::10mg",
+      35
+    ],
+    [
+      "MEDICATIONS::40mg",
+      27
+    ],
+    [
+      "MEDICATIONS::5mg",
+      27
+    ],
+    [
+      "MEDICATIONS::100mg",
+      26
+    ],
+    [
+      "PLAN::5mg",
+      25
+    ],
+    [
+      "MEDICATIONS::20mg",
+      25
+    ],
+    [
+      "PLAN::0.4mg",
+      24
+    ],
+    [
+      "MEDICATIONS::50mg",
+      24
+    ],
+    [
+      "MEDICATIONS::25mg",
+      23
+    ]
+  ],
+  "most_incorrect_fields": [
+    [
+      "PHYSICAL EXAM::GENERAL (expected: well developed, well nourished, got: well developed, well nourished)",
+      2
+    ],
+    [
+      "IMAGING::dates (expected: 5/27/2025, 1/6/2025, got: 4/1/24, 1/17/20)",
+      1
+    ],
+    [
+      "PHYSICAL EXAM::dates (expected: 06/30/25, got: 09/16/24)",
+      1
+    ],
+    [
+      "PHYSICAL EXAM::P (expected: 52*, got: 72)",
+      1
+    ],
+    [
+      "PHYSICAL EXAM::T (expected: 97.8 f (36.6 c), got: 96.7 f (35.9 c))",
+      1
+    ],
+    [
+      "PHYSICAL EXAM::Pulse Oximetry (expected: 98%, got: 99%)",
+      1
+    ],
+    [
+      "LABS::dates (expected: 6/27/25, 6/27/25, 6/27/25, 6/2, got: 01/31/2025, 01/31/2025, 01/31/)",
+      1
+    ],
+    [
+      "PHYSICAL EXAM::dates (expected: 06/30/2025, got: 11/07/2024, 11/07/2024, 11/07/)",
+      1
+    ],
+    [
+      "IMAGING::dates (expected: 6/4/2025, 10/4/2024, 11/9/2023, got: 10/4/2024, 10/4/2024, 11/9/202)",
+      1
+    ],
+    [
+      "IMAGING::dates (expected: 11/21/2024, 7/25/2024, 4/17/20, got: 7/25/2024, 7/25/2024)",
+      1
+    ],
+    [
+      "HPI::dates (expected: 6/30/25, got: 08/15/2024)",
+      1
+    ],
+    [
+      "PAST SURGICAL HISTORY::dates (expected: 07/02/2022, 04/03/2018, 09/08/, got: 7/2/2022)",
+      1
+    ],
+    [
+      "LABS::Creatinine (expected: 0.9, got: 1.1)",
+      1
+    ],
+    [
+      "LABS::dates (expected: 1/31/2025, 1/31/2025, 1/31/202, got: 01/31/2025, 01/31/2025, 01/31/)",
+      1
+    ],
+    [
+      "PAST MEDICAL HISTORY::dates (expected: 5/30/25, got: 1/14/2025)",
+      1
+    ],
+    [
+      "MEDICATIONS::dates (expected: 5/7/25, 5/1/25, got: 4/25/25)",
+      1
+    ],
+    [
+      "PLAN::dates (expected: 5/28/25, got: 05/01/2025, 05/01/2025, 05/01/)",
+      1
+    ],
+    [
+      "HPI::dates (expected: 5/21/25, got: 10/31/2024)",
+      1
+    ],
+    [
+      "PHYSICAL EXAM::dates (expected: 05/21/25, got: 03/03/25)",
+      1
+    ],
+    [
+      "PAST SURGICAL HISTORY::dates (expected: 7/6/2006, 8/18/2006, 2/12/2008, got: 7/6/2006)",
+      1
+    ]
+  ],
+  "most_hallucinated_fields": [
+    [
+      "PLAN::Signed",
+      50
+    ],
+    [
+      "PLAN::dates",
+      46
+    ],
+    [
+      "LABS::Hemoglobin",
+      43
+    ],
+    [
+      "LABS::Creatinine",
+      39
+    ],
+    [
+      "PHYSICAL EXAM::dates",
+      31
+    ],
+    [
+      "PLAN::Facility",
+      28
+    ],
+    [
+      "ASSESSMENT::dates",
+      28
+    ],
+    [
+      "ROS::dates",
+      27
+    ],
+    [
+      "PLAN::DATE OF NOTE",
+      25
+    ],
+    [
+      "PLAN::URGENCY",
+      25
+    ],
+    [
+      "PLAN::STANDARD TITLE",
+      25
+    ],
+    [
+      "PLAN::LOCAL TITLE",
+      25
+    ],
+    [
+      "PLAN::AUTHOR",
+      25
+    ],
+    [
+      "MEDICATIONS::dates",
+      24
+    ],
+    [
+      "ROS::As of",
+      22
+    ],
+    [
+      "ROS::Comment",
+      21
+    ],
+    [
+      "ROS::Reporting Lab",
+      21
+    ],
+    [
+      "ASSESSMENT::Signed",
+      20
+    ],
+    [
+      "ROS::Eval",
+      20
+    ],
+    [
+      "ROS::18years",
+      16
+    ]
+  ],
+  "common_format_violations": [
+    [
+      "Contains ellipsis indicating incomplete content",
+      34
+    ],
+    [
+      "Contains placeholder: 'TBD' (1 occurrences)",
+      2
+    ]
+  ],
+  "common_extraction_failures": []
+}
