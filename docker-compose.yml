@@ -1,0 +1,286 @@
+version: '3.8'
+
+# ==================================================================================
+# VAUCDA Docker Compose Configuration
+# Production-ready multi-container deployment
+# ==================================================================================
+
+services:
+  # ================================================================================
+  # FastAPI Backend API Server
+  # ================================================================================
+  vaucda-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        - PYTHON_VERSION=3.11
+    container_name: vaucda-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - DEBUG=${DEBUG:-false}
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis}@redis:6379/0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-redis}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-redis}@redis:6379/1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./urology_prompt.txt:/app/urology_prompt.txt:ro
+      - ./logo.svg:/app/logo.svg:ro
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - vaucda-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ================================================================================
+  # React Frontend Application
+  # ================================================================================
+  vaucda-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NODE_VERSION=20
+    container_name: vaucda-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - VITE_API_URL=http://localhost:${API_PORT:-8000}
+      - VITE_WS_URL=ws://localhost:${API_PORT:-8000}
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./logo.svg:/app/public/logo.svg:ro
+    depends_on:
+      - vaucda-api
+    networks:
+      - vaucda-network
+
+  # ================================================================================
+  # Neo4j Graph Database + Vector Store
+  # ================================================================================
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: vaucda-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=2G
+      - NEO4J_dbms_memory_pagecache_size=1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+      - neo4j_plugins:/plugins
+      - ./backend/db/migrations/neo4j:/migrations:ro
+    networks:
+      - vaucda-network
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "${NEO4J_USER}", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ================================================================================
+  # Ollama Local LLM Server (Primary Provider)
+  # ================================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: vaucda-ollama
+    restart: unless-stopped
+    runtime: ${OLLAMA_RUNTIME:-nvidia}
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=0
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
+      - OLLAMA_MAX_LOADED_MODELS=3
+      - OLLAMA_DEBUG=false
+      - OLLAMA_FLASH_ATTENTION=1
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - vaucda-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Run model pull script after startup
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /bin/ollama serve &
+        sleep 10
+        ollama pull ${OLLAMA_NOTE_GENERATION_MODEL:-llama3.1:70b}
+        ollama pull ${OLLAMA_CLINICAL_EXTRACTION_MODEL:-llama3.1:8b}
+        ollama pull ${OLLAMA_CALCULATOR_ASSIST_MODEL:-phi3:medium}
+        ollama pull mistral:7b
+        ollama pull nomic-embed-text
+        wait
+
+  # ================================================================================
+  # Redis (Message Broker & Cache)
+  # ================================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: vaucda-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis}
+    volumes:
+      - redis_data:/data
+    networks:
+      - vaucda-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ================================================================================
+  # Celery Worker (Background Task Processing)
+  # ================================================================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vaucda-celery-worker
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis}@redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-redis}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-redis}@redis:6379/1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - vaucda-network
+
+  # ================================================================================
+  # Celery Beat (Scheduled Tasks)
+  # ================================================================================
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vaucda-celery-beat
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app beat --loglevel=info
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis}@redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-redis}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-redis}@redis:6379/1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      celery-worker:
+        condition: service_started
+    networks:
+      - vaucda-network
+
+  # ================================================================================
+  # Nginx Reverse Proxy (Production)
+  # ================================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: vaucda-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx/vaucda.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deployment/ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - vaucda-api
+      - vaucda-frontend
+    networks:
+      - vaucda-network
+    profiles:
+      - production
+
+# ==================================================================================
+# Persistent Volumes
+# ==================================================================================
+volumes:
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
+  neo4j_import:
+    driver: local
+  neo4j_plugins:
+    driver: local
+  ollama_models:
+    driver: local
+  redis_data:
+    driver: local
+
+# ==================================================================================
+# Networks
+# ==================================================================================
+networks:
+  vaucda-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16

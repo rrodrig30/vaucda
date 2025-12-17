@@ -1,0 +1,10 @@
+// Export all API modules
+export { authApi } from './auth'
+export { notesApi } from './notes'
+export { calculatorsApi } from './calculators'
+export { templatesApi } from './templates'
+export { settingsApi } from './settings'
+export { llmApi } from './llm'
+export { ragApi } from './rag'
+export { healthApi } from './health'
+export { default as apiClient } from './client'

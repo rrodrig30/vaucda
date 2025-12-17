@@ -1,0 +1,86 @@
+Time of Start:
+Time End:
+Time Spent in Chart prep, review, interpretation, & documentation: See Below
+Total Time Spent: 40 minutes
+
+
+
++---------------------------------------------------+------+
+|                  Time Breakdown                   | Mins |
++---------------------------------------------------+------+
+| Chart Prep:                                       |   5  |
++---------------------------------------------------+------+
+| Image Review:                                     |   X  |
++---------------------------------------------------+------+
+| Lab Review:                                       |   X  |
++---------------------------------------------------+------+
+| Notes:                                            |   5  |
++---------------------------------------------------+------+
+| Obtaining/Reviewing separately obtained history:  |  10  |
++---------------------------------------------------+------+
+| Medical/PE:                                       |   X  |
++---------------------------------------------------+------+
+| Counseling, Educating patient, family, caregiver: |  10  |
++---------------------------------------------------+------+
+| Ordering:                                         |   X  |
++---------------------------------------------------+------+
+| Referring or Communicating with other providers:  |   X  |
++---------------------------------------------------+------+
+| Documentation clinical information in HER:        |  10  |
++---------------------------------------------------+------+
+| Independent interpretation:                       |   X  |
++---------------------------------------------------+------+
+| Care Coordination:                                |      |
++---------------------------------------------------+------+
+|                                                   |      |
+| Total:                                            |  40  |
++---------------------------------------------------+------+
+
+
+Please note that I have spent >40 total minutes in this visit including counseling, coordination of care, chart review, lab interpretation, discussion of findings with the patient, independent interpretation of data, communicating or referring to providers, formation of a treatment plan with shared decision making , placing orders, coordinating follow-up and documenting the encounter.
+
+
+
++++++++++++++++++++++++++++++++++++++++++
+
+
+Time of Start:
+Time End:
+Time Spent in Chart prep, review, interpretation, & documentation: See Below
+Total Time Spent: 45 minutes
+
+
+
++---------------------------------------------------+------+
+|                  Time Breakdown                   | Mins |
++---------------------------------------------------+------+
+| Chart Prep:                                       |   5  |
++---------------------------------------------------+------+
+| Image Review:                                     |   X  |
++---------------------------------------------------+------+
+| Lab Review:                                       |   X  |
++---------------------------------------------------+------+
+| Notes:                                            |   5  |
++---------------------------------------------------+------+
+| Obtaining/Reviewing separately obtained history:  |  10  |
++---------------------------------------------------+------+
+| Medical/PE:                                       |   3  |
++---------------------------------------------------+------+
+| Counseling, Educating patient, family, caregiver: |  10  |
++---------------------------------------------------+------+
+| Ordering:                                         |   2 |
++---------------------------------------------------+------+
+| Referring or Communicating with other providers:  |   X  |
++---------------------------------------------------+------+
+| Documentation clinical information in HER:        |  10  |
++---------------------------------------------------+------+
+| Independent interpretation:                       |   X  |
++---------------------------------------------------+------+
+| Care Coordination:                                |      |
++---------------------------------------------------+------+
+|                                                   |      |
+| Total:                                            |  45  |
++---------------------------------------------------+------+
+
+
+Please note that I have spent >45 total minutes in this visit including counseling, coordination of care, chart review, lab interpretation, discussion of findings with the patient, independent interpretation of data, communicating or referring to providers, formation of a treatment plan with shared decision making , placing orders, coordinating follow-up and documenting the encounter.
