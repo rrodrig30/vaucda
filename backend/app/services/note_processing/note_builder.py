@@ -13,20 +13,36 @@ from pathlib import Path
 from .note_identifier import identify_notes
 from .agents.gu_agent import process_gu_notes
 from .agents.non_gu_agent import process_non_gu_notes
-from .extractors import extract_pmh, extract_medications, extract_pathology, extract_imaging
+from .extractors import extract_pmh, extract_medications, extract_pathology, extract_imaging, extract_allergies_from_document
 from .extractors.psh_extractor import extract_psh
-from .extractors.consult_request_extractor import extract_consult_request
+from .extractors.consult_request_extractor import (
+    extract_consult_request,
+    is_urology_consult,
+    get_providers_to_scan
+)
+from .extractors.provider_note_scanner import scan_provider_notes_for_urologic_content
 from .extractors.psa_extractor import extract_psa
 from .extractors.lab_extractor import extract_labs, extract_stone_labs, extract_calcium_series
 from .extractors.endocrine_extractor import extract_endocrine_labs
-from .extractors.social_extractor import extract_social
+from .extractors.social_extractor import extract_social, extract_social_with_change_detection
 from .extractors.family_extractor import extract_family
+from .extractors.diet_extractor import extract_diet
 from .document_classifier import DocumentClassifier, extract_document_type
 from .extractors.pcp_note_extractor import PCPNoteExtractor
+from .extractors.specialty_urologic_scanner import (
+    scan_non_gu_notes_for_urologic_content,
+    format_cross_specialty_context
+)
+from .visit_progression_analyzer import analyze_visit_progression
 
 # Import synthesis agents
 from .agents.cc_agent import synthesize_cc
 from .agents.hpi_agent import synthesize_hpi, synthesize_consult_hpi
+from .agents.prior_ap_agent import (
+    synthesize_prior_ap_context,
+    format_prior_ap_for_hpi
+)
+from .extractors import extract_assessment, extract_plan
 from .agents.ipss_agent import synthesize_ipss
 from .agents.diet_agent import synthesize_diet
 from .agents.pmh_agent import synthesize_pmh
@@ -149,6 +165,17 @@ def build_urology_note(clinical_document: str) -> str:
     print(f"      Processed {len(gu_notes)} GU note dictionaries")
     print(f"      Processed {len(non_gu_notes)} non-GU note dictionaries")
 
+    # Step 2b: Scan non-GU notes for urologically-relevant cross-specialty content
+    print("\n[2b/5] Scanning non-GU notes for urologic content...")
+    cross_specialty_results = scan_non_gu_notes_for_urologic_content(notes_dict["non_gu_notes"])
+    cross_specialty_context = format_cross_specialty_context(cross_specialty_results)
+    if cross_specialty_results:
+        specialties_found = set(r.get("specialty", "Unknown") for r in cross_specialty_results)
+        print(f"      Found urologic content in {len(cross_specialty_results)} non-GU notes")
+        print(f"      Specialties: {', '.join(specialties_found)}")
+    else:
+        print(f"      No urologic content found in non-GU notes")
+
     # Step 3: Extract document-level data
     print("\n[3/5] Extracting document-level data...")
 
@@ -173,11 +200,13 @@ def build_urology_note(clinical_document: str) -> str:
 
         # For consults, always extract social and family from full document
         # (they're in the consult request body, not PCP note)
-        document_social = extract_social(clinical_document)
+        # Use change detection to flag differences from prior A&P statements
+        document_social = extract_social_with_change_detection(clinical_document, clinical_document)
         document_family = extract_family(clinical_document)
     else:
-        # For regular clinic notes, use standard extraction
-        document_social = extract_social(clinical_document)
+        # For regular clinic notes, use standard extraction with change detection
+        # Pass full document for A&P comparison to flag social history changes
+        document_social = extract_social_with_change_detection(clinical_document, clinical_document)
         document_family = extract_family(clinical_document)
 
     document_pmh = extract_pmh(clinical_document)
@@ -190,6 +219,8 @@ def build_urology_note(clinical_document: str) -> str:
     document_stone_labs = extract_stone_labs(clinical_document)
     document_calcium = extract_calcium_series(clinical_document)
     document_endocrine = extract_endocrine_labs(clinical_document)
+    document_dietary = extract_diet(clinical_document)
+    document_allergies = extract_allergies_from_document(clinical_document)
 
     print(f"      PMH: {len(document_pmh.split(chr(10)) if document_pmh else [])} diagnoses")
     print(f"      Medications: {len(document_medications.split(chr(10)) if document_medications else [])} meds")
@@ -202,6 +233,8 @@ def build_urology_note(clinical_document: str) -> str:
     print(f"      Endocrine: {'Found' if document_endocrine else 'None'}")
     print(f"      Social: {'Found' if document_social else 'None'}")
     print(f"      Family: {'Found' if document_family else 'None'}")
+    print(f"      Dietary: {'Found' if document_dietary else 'None'}")
+    print(f"      Allergies: {'Found' if document_allergies else 'None'}")
 
     # Step 4: Synthesize all sections
     print("\n[4/5] Synthesizing sections...")
@@ -210,62 +243,189 @@ def build_urology_note(clinical_document: str) -> str:
     is_gu_consult = False
     consult_cc = None
     consult_hpi = None
+    consult_data = None
+    provider_urologic_context = None
     patient_name = None
     patient_ssn = None
     patient_age = None
+    patient_sex = None
+    patient_race = None
 
+    # ======================================================================
+    # EXTRACT PATIENT DEMOGRAPHICS (for BOTH consult AND clinic notes)
+    # Primary sources: AUTOMATED RESULTS LETTER, TELEPHONE NOTE
+    # These contain reliable patient name, SSN, age, sex, and race
+    # ======================================================================
+    from .extractors.consult_request_extractor import ConsultRequestExtractor
+    demographics_extractor = ConsultRequestExtractor()
+    demographics = demographics_extractor.extract_patient_demographics(clinical_document)
+
+    if demographics:
+        patient_name = demographics.get('patient_name_formatted')
+        patient_ssn = demographics.get('ssn')
+        patient_age = demographics.get('age')
+        patient_sex = demographics.get('sex')
+        patient_race = demographics.get('race')
+
+    if patient_name or patient_ssn or patient_age:
+        print(f"      Patient: {patient_name} (SSN: {patient_ssn}, Age: {patient_age}, Sex: {patient_sex}, Race: {patient_race})")
+    else:
+        print(f"      Patient demographics: Not found in document")
+
+    # ======================================================================
+    # CONSULT-SPECIFIC PROCESSING
+    # ======================================================================
     if is_consult:
-        # Determine if this is a GU consult or non-GU consult
         consult_content = notes_dict["consult_requests"][0]["content"]
-        # Check for "To Service:" line containing GU/Urology keywords
-        is_gu_consult = any(keyword in consult_content.upper() for keyword in [
-            "SURG GU", "GU OUTPATIENT", "UROLOGY", "URO "
-        ])
-        print(f"      Detected {'GU' if is_gu_consult else 'non-GU'} consult")
 
-        # Extract CC and HPI from consult header
+        # NEW: Use enhanced SURG-GU detection per instructions.txt
+        # SURG-GU identifier ALWAYS starts with "SURG-GU" in To Service or Orderable Item
+        is_gu_consult = is_urology_consult(consult_content)
+        print(f"      Detected {'SURG-GU (Urology)' if is_gu_consult else 'non-GU'} consult")
+
+        # NEW: Extract all 9 consult tags per instructions.txt
         consult_data = extract_consult_request(consult_content)
         if consult_data:
-            consult_cc = consult_data.get("CC")
-            consult_hpi = consult_data.get("HPI")
-            print(f"      Extracted CC and HPI from consult request")
+            # CC = Provisional Diagnosis (per instructions.txt)
+            consult_cc = consult_data.get("CC")  # Already maps to provisional_diagnosis
+            consult_hpi = consult_data.get("HPI")  # Combined Reason for Request + Reason for Consult Request
+            print(f"      Extracted CC from Provisional Diagnosis: {consult_cc[:50] if consult_cc else 'None'}...")
 
-        # Extract patient demographics from FULL document (patient info may be in PCP notes)
-        from .extractors.consult_request_extractor import ConsultRequestExtractor
-        extractor = ConsultRequestExtractor()
-        demographics = extractor.extract_patient_demographics(clinical_document)
-        if demographics and demographics.get('patient_name'):
-            patient_name = demographics.get('patient_name_formatted')
-            patient_ssn = demographics.get('ssn')
-            patient_age = demographics.get('age')
-            print(f"      Extracted patient demographics from document")
-            print(f"      Patient: {patient_name} (SSN: {patient_ssn}, Age: {patient_age})")
+            # Log extracted consult tags
+            print(f"      Current PC Provider: {consult_data.get('current_pc_provider', 'Not found')}")
+            print(f"      Requesting Provider: {consult_data.get('requesting_provider', 'Not found')}")
+            print(f"      To Service: {consult_data.get('to_service', 'Not found')}")
+            print(f"      Orderable Item: {consult_data.get('orderable_item', 'Not found')}")
+
+            # NEW: Scan provider notes for urologic content per instructions.txt
+            # "scan for any notes from either the requesting physician or the Current PC Provider"
+            providers_to_scan = consult_data.get('providers_to_scan', [])
+            if providers_to_scan:
+                print(f"      Scanning notes from providers: {', '.join(providers_to_scan)}")
+                provider_urologic_context = scan_provider_notes_for_urologic_content(
+                    clinical_document,
+                    providers_to_scan
+                )
+                if provider_urologic_context:
+                    print(f"      Found urologic context from provider notes: {len(provider_urologic_context)} chars")
+                else:
+                    print(f"      No urologic content found in provider notes")
+
+            # Override demographics from consult data if available and not already found
+            # (consult_data extraction might find additional info from consult-specific fields)
+            if not patient_name and consult_data.get('patient_name'):
+                patient_name = consult_data.get('patient_name')
+            if not patient_ssn and consult_data.get('ssn'):
+                patient_ssn = consult_data.get('ssn')
+            if not patient_age and consult_data.get('age'):
+                patient_age = consult_data.get('age')
+            if not patient_sex and consult_data.get('sex'):
+                patient_sex = consult_data.get('sex')
+            if not patient_race and consult_data.get('race'):
+                patient_race = consult_data.get('race')
 
     # Use consult CC/HPI if available, otherwise synthesize from notes
     cc = consult_cc if consult_cc else synthesize_cc(gu_notes, non_gu_notes)
     print(f"      CC: {len(cc) if cc else 0} chars")
 
+    # Analyze visit progression (what changed since last urology visit)
+    # This is for followup visits - skip for consults (new patients)
+    visit_progression = ""
+    prior_ap_context_for_hpi = ""
+    if not is_consult and gu_notes:
+        print("      Analyzing visit progression...")
+        visit_progression = analyze_visit_progression(
+            prior_gu_notes=notes_dict["gu_notes"],
+            current_clinical_data={
+                "psa": document_psa,
+                "pathology": document_pathology,
+                "imaging": document_imaging,
+                "labs": document_labs,
+                "medications": document_medications,
+            }
+        )
+        if visit_progression:
+            print(f"      Visit progression: {len(visit_progression)} chars")
+        else:
+            print("      No prior plan found for progression analysis")
+
+        # Extract prior Assessment & Plan context for HPI synthesis
+        # This provides temporal continuity for followup visits
+        print("      Extracting prior A&P context for HPI...")
+        prior_assessments = []
+        prior_plans = []
+        for note in notes_dict["gu_notes"]:
+            note_content = note.get("content", "")
+            assessment = extract_assessment(note_content)
+            plan = extract_plan(note_content)
+            if assessment and assessment.strip():
+                prior_assessments.append(assessment)
+            if plan and plan.strip():
+                prior_plans.append(plan)
+
+        if prior_assessments or prior_plans:
+            prior_ap_context = synthesize_prior_ap_context(
+                prior_assessments=prior_assessments,
+                prior_plans=prior_plans,
+                patient_age=patient_age,
+                patient_sex=patient_sex
+            )
+            prior_ap_context_for_hpi = format_prior_ap_for_hpi(prior_ap_context)
+            if prior_ap_context_for_hpi:
+                print(f"      Prior A&P context for HPI: {len(prior_ap_context_for_hpi)} chars")
+            else:
+                print("      No prior A&P context generated")
+        else:
+            print("      No prior assessments or plans found in GU notes")
+
     # For consults, synthesize comprehensive HPI from all available data
+    # Per instructions.txt workflow:
+    # 1. Initial HPI from Reason for Request + Reason for Consult Request
+    # 2. Combine with urologic content from provider notes
+    # 3. Synthesize comprehensive HPI
     if is_consult and consult_hpi:
-        # Use new consult HPI synthesis that incorporates all data
+        # Get Reason For Request (separate from Reason for Consult Request)
+        reason_for_request = consult_data.get('reason_for_request', '') if consult_data else ''
+
+        # Use enhanced consult HPI synthesis with provider context
+        # Pass PSA, pathology, and labs so HPI reflects current clinical status
         hpi = synthesize_consult_hpi(
             consult_reason=consult_hpi,
             patient_name=patient_name,
             patient_age=patient_age,
+            patient_sex=patient_sex,  # NEW: from TELEPHONE NOTE demographics
             pmh=document_pmh,
             psh=None,  # Will be synthesized later
             medications=document_medications,
             imaging=document_imaging,
-            pcp_note_data=pcp_data if is_consult and pcp_note_content else None
+            pcp_note_data=pcp_data if is_consult and pcp_note_content else None,
+            provider_urologic_context=provider_urologic_context,  # NEW: from provider note scanning
+            reason_for_request=reason_for_request,  # NEW: additional request details
+            psa_data=document_psa,
+            pathology_data=document_pathology,
+            labs_data=document_labs
         )
+        print(f"      HPI synthesized from consult + provider context + clinical data")
     else:
-        hpi = synthesize_hpi(gu_notes, non_gu_notes)
+        # Pass PSA, pathology, labs, and imaging so HPI reflects current clinical status
+        # Also pass cross-specialty context, visit progression, and prior A&P context for temporal awareness
+        hpi = synthesize_hpi(
+            gu_notes, non_gu_notes,
+            psa_data=document_psa,
+            pathology_data=document_pathology,
+            labs_data=document_labs,
+            imaging_data=document_imaging,
+            cross_specialty_context=cross_specialty_context,
+            visit_progression=visit_progression,
+            prior_ap_context=prior_ap_context_for_hpi
+        )
     print(f"      HPI: {len(hpi) if hpi else 0} chars")
 
     ipss = synthesize_ipss(gu_notes)
     print(f"      IPSS: {len(ipss) if ipss else 0} chars")
 
-    dhx = synthesize_diet(gu_notes)
+    # For dietary, prefer document-level extraction, then GU notes
+    dhx = document_dietary if document_dietary else synthesize_diet(gu_notes)
     pmh = synthesize_pmh(document_pmh, gu_notes, non_gu_notes)
     # For consults, use document-level PSH if available
     if is_consult and document_psh:
@@ -291,7 +451,12 @@ def build_urology_note(clinical_document: str) -> str:
     else:
         social = synthesize_social(gu_notes, non_gu_notes)
         family = synthesize_family(gu_notes, non_gu_notes)
-        psa = synthesize_psa(gu_notes)
+        # For clinic notes, ALSO prefer document-level PSA from lab results if available
+        # PSA lab values may be in lab sections, not within GU note text itself
+        if document_psa:
+            psa = synthesize_psa([{"PSA": document_psa}])
+        else:
+            psa = synthesize_psa(gu_notes)
         endocrine = synthesize_endocrine_labs(gu_notes)
         labs = synthesize_general_labs(gu_notes)
         stone = document_stone_labs if document_stone_labs else synthesize_stone_labs(gu_notes)
@@ -301,10 +466,10 @@ def build_urology_note(clinical_document: str) -> str:
     pathology = synthesize_pathology(document_pathology, gu_notes)
     testosterone = synthesize_testosterone(gu_notes)
     medications = synthesize_medications(document_medications, gu_notes)
-    allergies = synthesize_allergies(gu_notes, non_gu_notes)
+    allergies = synthesize_allergies(gu_notes, non_gu_notes, document_allergies=document_allergies)
     imaging = synthesize_imaging(document_imaging, gu_notes)
     ros = synthesize_ros(gu_notes, non_gu_notes)
-    pe = synthesize_pe(gu_notes, non_gu_notes)
+    pe = synthesize_pe(gu_notes, non_gu_notes, patient_sex=patient_sex)
     # Note: Assessment and Plan are NOT generated in Stage 1 - they are completed during/after the visit
 
     print(f"      Synthesized all sections")
@@ -335,7 +500,10 @@ def build_urology_note(clinical_document: str) -> str:
         is_consult=is_consult,
         is_gu_consult=is_gu_consult,
         patient_name=patient_name,
-        patient_ssn=patient_ssn
+        patient_ssn=patient_ssn,
+        patient_age=patient_age,
+        patient_sex=patient_sex,
+        patient_race=patient_race
         # Note: Assessment and Plan are NOT included in Stage 1 preliminary note
     )
 
@@ -357,6 +525,9 @@ def assemble_note(**sections) -> str:
         is_gu_consult: Boolean flag indicating if this is a GU consult (vs non-GU)
         patient_name: Patient name (optional)
         patient_ssn: Full SSN (optional)
+        patient_age: Patient age (optional)
+        patient_sex: Patient sex - MALE/FEMALE (optional)
+        patient_race: Patient race (optional)
 
     Returns:
         Formatted note following urology_prompt.txt template or consult note template
@@ -366,16 +537,33 @@ def assemble_note(**sections) -> str:
     is_gu_consult = sections.get("is_gu_consult", True)  # Default to GU if not specified
     patient_name = sections.get("patient_name")
     patient_ssn = sections.get("patient_ssn")
+    patient_age = sections.get("patient_age")
+    patient_sex = sections.get("patient_sex")
+    patient_race = sections.get("patient_race")
 
     # Patient Header (if available)
-    if patient_name or patient_ssn:
+    # Format: "Patient: NAME (SSN: XXX-XX-XXXX) | Age: XX | Sex: MALE/FEMALE | Race: XXXX"
+    if patient_name or patient_ssn or patient_age or patient_sex:
         header_parts = []
         if patient_name:
             header_parts.append(patient_name)
         if patient_ssn:
-            header_parts.append(patient_ssn)
+            # Show last 4 only for privacy
+            ssn_last4 = patient_ssn.split('-')[-1] if patient_ssn and '-' in patient_ssn else patient_ssn
+            header_parts.append(f"(SSN: XXX-XX-{ssn_last4})")
+
+        demographics_parts = []
+        if patient_age:
+            demographics_parts.append(f"Age: {patient_age}")
+        if patient_sex:
+            demographics_parts.append(f"Sex: {patient_sex}")
+        if patient_race:
+            demographics_parts.append(f"Race: {patient_race}")
 
         patient_header = " ".join(header_parts)
+        if demographics_parts:
+            patient_header += " | " + " | ".join(demographics_parts)
+
         note_parts.append(f"Patient: {patient_header}\n")
 
     # CC (always required)
@@ -392,19 +580,25 @@ def assemble_note(**sections) -> str:
 
     # Continue with all sections for both consults and clinic notes
 
-    # IPSS
-    if sections.get("ipss"):
-        note_parts.append(f"IPSS:\n{sections['ipss']}\n")
-    else:
-        # Always include IPSS section for urology notes (placeholder if not documented)
-        note_parts.append("IPSS: Not documented\n")
+    # Determine if patient is female for gender-specific section exclusions
+    is_female = patient_sex and patient_sex.upper().strip() in ("FEMALE", "F")
 
-    # Dietary History
+    # IPSS - MALE ONLY (International Prostate Symptom Score is not applicable for female patients)
+    # For female patients with voiding symptoms, use OAB-q or other female-specific tools
+    if not is_female:
+        if sections.get("ipss"):
+            note_parts.append(f"IPSS:\n{sections['ipss']}\n")
+        else:
+            # No IPSS data found - use the empty template from ipss_agent
+            from .agents.ipss_agent import get_empty_ipss_template
+            note_parts.append(f"IPSS:\n{get_empty_ipss_template()}\n")
+
+    # Dietary History - Only include if documented
     if sections.get("dhx"):
         note_parts.append(f"DIETARY HISTORY:\n{sections['dhx']}\n")
     else:
-        # Always include dietary section for urology notes
-        note_parts.append("DIETARY HISTORY: Not documented\n")
+        # If no dietary history found, indicate not documented (per user feedback - no placeholders)
+        note_parts.append("DIETARY HISTORY:\nNot documented\n")
 
     # Social History
     if sections.get("social"):
@@ -426,8 +620,8 @@ def assemble_note(**sections) -> str:
     if sections.get("psh"):
         note_parts.append(f"PAST SURGICAL HISTORY:\n{sections['psh']}\n")
 
-    # PSA Curve
-    if sections.get("psa"):
+    # PSA Curve - MALE ONLY (females do not have prostate, no PSA screening)
+    if not is_female and sections.get("psa"):
         note_parts.append(f"PSA CURVE:\n{sections['psa']}\n")
 
     # Medications
@@ -440,10 +634,10 @@ def assemble_note(**sections) -> str:
 
     # Pathology
     if sections.get("pathology"):
-        note_parts.append(f"\n{'='*78}\nPATHOLOGY:\n{sections['pathology']}\n")
+        note_parts.append(f"\n{'='*78}\nPATHOLOGY RESULTS:\n{sections['pathology']}\n")
     else:
         # Always include pathology section for urology notes
-        note_parts.append(f"\n{'='*78}\nPATHOLOGY: None documented\n")
+        note_parts.append(f"\n{'='*78}\nPATHOLOGY RESULTS: None documented\n")
 
     # Testosterone
     if sections.get("testosterone"):
