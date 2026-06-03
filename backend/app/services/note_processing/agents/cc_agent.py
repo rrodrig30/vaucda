@@ -2,50 +2,472 @@
 Chief Complaint (CC) Agent
 
 Combines CCs from all notes, focusing on urologic concerns.
+
+A urology clinic CC must always be urologic. This agent enforces that
+invariant by:
+  1. Filtering extracted CCs to keep only those containing a urologic
+     keyword (so a stray "annual physical" or "back pain" CC carried
+     over from an old non-urologic visit can't be the final CC).
+  2. Falling back to a CC derived from the patient's urologic context
+     (pathology, PMH, PSA trend) when no urologic CC is extracted.
+  3. Returning a generic "Urology follow-up" sentinel only as the last
+     resort — never an empty string. The renderer no longer needs the
+     "CC: Unknown" branch.
 """
 
-from typing import List, Dict
+import re
+from typing import List, Dict, Optional
 from ..llm_helper import combine_sections_with_llm
 from .history_cleaners import clean_llm_commentary
 
 
-def synthesize_cc(gu_notes: List[Dict[str, str]], non_gu_notes: List[Dict[str, str]]) -> str:
-    """
-    Synthesize Chief Complaint from GU notes ONLY.
+# Urologic-content marker. If a CC string contains ANY of these tokens,
+# we treat it as urologic and pass it through. Order doesn't matter;
+# the alternation runs case-insensitive. Tokens are intentionally broad
+# (substring match where useful — "prostat" catches prostate /
+# prostatitis / prostatectomy / prostatomegaly without 5 separate rules).
+UROLOGIC_KEYWORDS = re.compile(
+    r'(?:'
+    r'prostat|psa\b|gleason|adenocarcinoma|grade\s+group|'
+    r'\bbph\b|hyperplasia|'
+    r'erectile|impoten|libido|hypogonad|low\s+t|testosterone|'
+    r'kidney|renal|hydronephrosis|nephrolith|nephrectom|'
+    r'stone|calcul|urolithiasis|'
+    r'bladder|cystitis|cystoscop|hematuria|incontinen|overactive\s+bladder|'
+    r'\boab\b|urinary|\bluts\b|voiding|nocturia|frequency|urgency|dysuria|'
+    r'retention|urethr|stricture|'
+    r'testic|scrotum|orchi|varicocel|hydrocel|spermatocel|'
+    r'fertilit|infertilit|semen|sperm|'
+    r'penil|peyron|priapism|'
+    r'ureter|ureteral|stent|pyelo|turp|turbt|prostatect|'
+    r'urolog|\bgu\b|genitourinary|micturition|enuresis|urodynamic|uroflow|'
+    r'foley|catheter|'
+    r'circumcis|phimosis|paraphimosis|epididym|'
+    r'gross\s+hematuria|microscopic\s+hematuria|'
+    r'rising\s+psa|elevated\s+psa|psa\s+kinetics|'
+    r'bladder\s+cancer|kidney\s+cancer|prostate\s+cancer|testicular\s+cancer'
+    r')',
+    re.IGNORECASE,
+)
 
-    Per user requirements: Only use UROLOGY notes. Do not include non-urologic content.
+
+def _is_urologic_text(text: str) -> bool:
+    """True iff `text` contains any urologic keyword."""
+    return bool(text) and bool(UROLOGIC_KEYWORDS.search(text))
+
+
+# Primary diagnosis -> CC string, in priority order. Earlier entries take
+# precedence when multiple match (e.g. prostate-cancer + BPH -> prostate
+# cancer wins because the patient is being followed for the cancer).
+#
+# Each pattern matches BOTH word orderings VA charts use, e.g. both
+# "prostate cancer" AND "malignant neoplasm of prostate". The PMH list
+# routinely uses the ICD-style reversed phrasing.
+_DERIVED_CC_RULES = [
+    (re.compile(
+        r'\bprostat(?:e|ic)\s+(?:cancer|adenocarcinoma|carcinoma|malignan)'
+        r'|(?:malignant\s+)?neoplasm\s+of\s+(?:the\s+)?prostat'
+        r'|prostat(?:e|ic)\s+neoplasm',
+        re.I,
+     ),
+     "Follow-up for prostate cancer"),
+    (re.compile(
+        r'\bbladder\s+(?:cancer|carcinoma|urothelial|malignan)'
+        r'|(?:malignant\s+)?neoplasm\s+of\s+(?:the\s+)?bladder'
+        r'|urothelial\s+(?:carcinoma|cancer)',
+        re.I,
+     ),
+     "Follow-up for bladder cancer"),
+    (re.compile(
+        r'\b(?:renal|kidney)\s+(?:cell\s+)?(?:cancer|carcinoma|mass|tumor|malignan)'
+        r'|(?:malignant\s+)?neoplasm\s+of\s+(?:the\s+)?(?:kidney|renal)',
+        re.I,
+     ),
+     "Follow-up for kidney cancer"),
+    (re.compile(
+        r'\btesticular\s+(?:cancer|carcinoma|mass|tumor)'
+        r'|(?:malignant\s+)?neoplasm\s+of\s+(?:the\s+)?test(?:is|icle)',
+        re.I,
+     ),
+     "Follow-up for testicular cancer"),
+    (re.compile(
+        r'\bpenile\s+(?:cancer|carcinoma|malignan)'
+        r'|(?:malignant\s+)?neoplasm\s+of\s+(?:the\s+)?penis',
+        re.I,
+     ),
+     "Follow-up for penile cancer"),
+    (re.compile(r'\b(?:benign\s+prostatic\s+hyperplasia|BPH)\b', re.I),
+     "Follow-up for benign prostatic hyperplasia"),
+    (re.compile(r'\b(?:nephrolithiasis|urolithiasis|kidney\s+stones?|renal\s+calcul|ureteral\s+stone)\b', re.I),
+     "Follow-up for urolithiasis"),
+    (re.compile(r'\b(?:elevated|rising)\s+psa\b|\bpsa\b.*\bmonitor', re.I),
+     "Follow-up for elevated PSA"),
+    (re.compile(r'\b(?:gross|microscopic)?\s*hematuria\b', re.I),
+     "Follow-up for hematuria"),
+    (re.compile(r'\berectile\s+dysfunction\b|\bED\b', re.I),
+     "Follow-up for erectile dysfunction"),
+    (re.compile(r'\bhypogonad|low\s+testosterone', re.I),
+     "Follow-up for hypogonadism"),
+    (re.compile(r'\b(?:overactive\s+bladder|OAB|urge\s+incontinence)\b', re.I),
+     "Follow-up for overactive bladder"),
+    (re.compile(r'\b(?:stress\s+(?:urinary\s+)?incontinence|urinary\s+incontinence)\b', re.I),
+     "Follow-up for urinary incontinence"),
+    (re.compile(r'\b(?:LUTS|lower\s+urinary\s+tract\s+symptoms|voiding\s+symptoms)\b', re.I),
+     "Follow-up for lower urinary tract symptoms"),
+    (re.compile(r'\b(?:varicocele|hydrocele|spermatocele|epididymal\s+cyst)\b', re.I),
+     "Follow-up for scrotal condition"),
+    (re.compile(r'\b(?:peyronie|priapism|phimosis|paraphimosis)\b', re.I),
+     "Follow-up for penile condition"),
+    (re.compile(r'\b(?:urethral\s+stricture|urethral\s+narrowing)\b', re.I),
+     "Follow-up for urethral stricture"),
+    (re.compile(r'\b(?:male\s+infertility|infertility|low\s+sperm|azoospermia|oligospermia)\b', re.I),
+     "Follow-up for male infertility"),
+]
+
+
+def _derive_cc_from_context(
+    pmh: Optional[str],
+    pathology: Optional[str],
+    psa_data: Optional[str],
+) -> str:
+    """Derive a urologic CC from clinical context when no extracted CC works.
+
+    Searches PMH then pathology then PSA data for the highest-priority
+    urologic diagnosis. Returns a CC like "Follow-up for prostate cancer"
+    or, if nothing matches, the safe generic "Urology follow-up".
+    """
+    haystack = '\n'.join(s for s in (pmh, pathology, psa_data) if s)
+    if haystack:
+        for pat, cc in _DERIVED_CC_RULES:
+            if pat.search(haystack):
+                return cc
+    return "Urology follow-up"
+
+
+def _apply_terminology(cc_text: str) -> str:
+    """Standardize 'consult' → 'follow-up' and drop 'New patient' prefix."""
+    cc_text = re.sub(r'\bConsult\s+for\b', 'Follow-up for', cc_text, flags=re.IGNORECASE)
+    cc_text = re.sub(r'\bconsult\b', 'follow-up', cc_text, flags=re.IGNORECASE)
+    cc_text = re.sub(r'^\s*New\s+patient\s+', '', cc_text, flags=re.IGNORECASE)
+    return cc_text.strip()
+
+
+# Completed-treatment phrasings VA charts use. Each tuple is (regex,
+# canonical type). The first match wins; order matters only when a
+# single document could legitimately have more than one (e.g. salvage
+# RT after RP — but in that case the patient's *current* status is
+# what matters; the recency check below picks the most recent).
+_TREATMENT_PATTERNS = [
+    ('prostatectomy', re.compile(
+        r'\bs/?p\s+(?:radical\s+)?prostatectomy\b'
+        r'|\b(?:status\s+post|post)[-\s]+(?:radical\s+)?prostatectomy\b'
+        r'|\bunderwent\s+(?:robotic\s+|robotic[-\s]assisted\s+|open\s+|laparoscopic\s+)?(?:radical\s+)?prostatectomy\b'
+        r'|\b(?:robotic|RARP|RALP|RRP)\s+(?:radical\s+)?prostatectomy\b'
+        r'|\bprostatectomy\s+(?:on|completed|performed)\b'
+        r'|\bhad\s+(?:a\s+)?(?:radical\s+)?prostatectomy\b',
+        re.IGNORECASE,
+    )),
+    ('radiation', re.compile(
+        r'\bcompleted\s+(?:external\s+beam\s+)?(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
+        r'|\b(?:external\s+beam\s+)?(?:radiation|radiotherapy|EBRT|XRT|IMRT)\s+(?:therapy\s+)?(?:completed|finished|ended)\b'
+        r'|\bs/?p\s+(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
+        r'|\b(?:status\s+post|post)[-\s]+(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
+        r'|\b(?:underwent|received)\s+(?:definitive\s+)?(?:external\s+beam\s+)?(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
+        r'|\bdefinitive\s+(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b',
+        re.IGNORECASE,
+    )),
+    ('brachytherapy', re.compile(
+        r'\bs/?p\s+brachytherapy\b'
+        r'|\bcompleted\s+brachytherapy\b'
+        r'|\bunderwent\s+brachytherapy\b'
+        r'|\bseed\s+implant(?:ation)?\b'
+        r'|\b(?:status\s+post|post)[-\s]+brachytherapy\b',
+        re.IGNORECASE,
+    )),
+    ('focal therapy', re.compile(
+        r'\b(?:HIFU|high[-\s]?intensity\s+focused\s+ultrasound)\b'
+        r'|\bcryotherapy\b|\bcryoablation\b|\bfocal\s+therapy\b',
+        re.IGNORECASE,
+    )),
+]
+
+
+def _detect_treatment_history(
+    psh: Optional[str],
+    clinical_document: Optional[str],
+) -> Optional[Dict[str, str]]:
+    """Detect whether definitive treatment for prostate cancer was completed.
+
+    Returns {"type": <type>} when a completion marker is found, else None.
+    Search order is PSH first (most reliable), then the raw document.
+    """
+    for haystack in (psh, clinical_document):
+        if not haystack:
+            continue
+        for t_type, pat in _TREATMENT_PATTERNS:
+            if pat.search(haystack):
+                return {"type": t_type}
+    return None
+
+
+# Treatment-type → display label used in reframed CCs.
+_TREATMENT_LABEL = {
+    'radiation': 'radiation therapy',
+    'prostatectomy': 'prostatectomy',
+    'brachytherapy': 'brachytherapy',
+    'focal therapy': 'focal therapy',
+}
+
+
+def _assess_psa_trend(psa_data: Optional[str]) -> Dict[str, Optional[float]]:
+    """Parse a PSA curve / list and return {current, max, ratio, trend}.
+
+    Accepts the project's standard PSA-curve format
+    ("[r] MMM DD, YYYY HH:MM    VALUE [H]") plus plain "PSA TOTAL  N.NN"
+    lines. PSA curves in this codebase are stored reverse-chronological
+    so the first numeric is the most recent. The `ratio` field
+    (current / max) is what the reframer uses as a coarse "responding"
+    indicator; the `trend` is computed against the second-most-recent
+    value.
+    """
+    result: Dict[str, Optional[float]] = {
+        'current': None, 'max': None, 'min': None, 'ratio': None,
+        'trend': None,
+    }
+    if not psa_data:
+        return result
+
+    values: List[float] = []
+    for raw_line in psa_data.split('\n'):
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Skip "PSA CURVE:" header and similar non-data lines.
+        if not re.search(r'\d', line):
+            continue
+        # The PSA value is the LAST decimal number on the line. This
+        # robustly handles every format the codebase produces:
+        #   "[r] Dec 26, 2025 14:41    0.38"           (PSA curve)
+        #   "Dec 26, 2025 14:41: 0.38"                 (extract_psa output)
+        #   "PSA TOTAL  5.99 H  ng/mL  0.2 - 4.0"      (lab line — see filter below)
+        #   "5.79 H"                                    (bare value)
+        # Skip lines that look like a lab-reference range (the trailing
+        # numbers are the reference bounds, not the value); those lines
+        # show the PSA value as the FIRST number, so we extract differently.
+        is_lab_range_line = bool(re.search(
+            r'\bPSA\b.*?\d+(?:\.\d+)?\s*H?\b.*?\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?',
+            line, re.IGNORECASE,
+        ))
+        if is_lab_range_line:
+            # Take the first numeric value after "PSA"
+            m = re.search(
+                r'\bPSA\s*(?:TOTAL)?\s+(\d+(?:\.\d+)?)',
+                line, re.IGNORECASE,
+            )
+            if m:
+                try:
+                    values.append(float(m.group(1)))
+                except ValueError:
+                    pass
+            continue
+        # Default: last decimal number on the line.
+        nums = re.findall(r'\d+\.\d+', line)
+        if nums:
+            try:
+                values.append(float(nums[-1]))
+                continue
+            except ValueError:
+                pass
+        # Fall back to last integer (some entries lack a decimal point).
+        nums = re.findall(r'\b\d+\b', line)
+        if nums:
+            # Skip the obvious time/date components: 1-2 digit values that
+            # look like HH or DD aren't useful as PSA values.
+            last = int(nums[-1])
+            if last >= 0:
+                # Reject unrealistically high values (likely a year).
+                if last < 1000:
+                    values.append(float(last))
+
+    if not values:
+        return result
+
+    current = values[0]
+    max_v = max(values)
+    min_v = min(values)
+    result['current'] = current
+    result['max'] = max_v
+    result['min'] = min_v
+    result['ratio'] = (current / max_v) if max_v > 0 else None
+    if len(values) >= 2:
+        prev = values[1]
+        if prev > 0 and current < prev * 0.95:
+            result['trend'] = 'falling'
+        elif prev > 0 and current > prev * 1.05:
+            result['trend'] = 'rising'
+        else:
+            result['trend'] = 'stable'
+    return result
+
+
+# CC phrasings that become *stale* the moment definitive treatment has
+# been completed with a good biochemical response. "active surveillance"
+# is explicitly excluded — that's a valid management pattern, not stale.
+_STALE_CC_INDICATORS = re.compile(
+    r'\bpersistent\s+(?:prostate\s+)?(?:cancer|disease|malignancy|carcinoma|tumor)\b'
+    r'|\bactive\s+(?:prostate\s+)?(?:cancer|disease|malignancy|carcinoma|tumor)\b'
+    r'|\buntreated\s+(?:prostate\s+)?(?:cancer|disease|malignancy|carcinoma|tumor)\b'
+    r'|\brising\s+psa\b'
+    r'|\belevated\s+psa\b'
+    r'|\bconcerning\s+psa\b',
+    re.IGNORECASE,
+)
+
+
+def _is_biochemically_responding(
+    treatment_type: str,
+    psa: Dict[str, Optional[float]],
+) -> Optional[bool]:
+    """Coarse biochemical-response classifier.
+
+    Returns True (responding), False (likely recurrence), or None
+    (insufficient PSA data to decide). Thresholds:
+
+      - Post-prostatectomy: response = current < 0.2 ng/mL. Detectable
+        PSA after RP is the standard biochemical-recurrence threshold.
+
+      - Post-radiation / brachytherapy / focal therapy: Phoenix
+        criterion is PSA nadir + 2.0 ng/mL. We approximate the nadir
+        as the minimum PSA value in the series (which is correct as
+        long as the series spans treatment AND the patient at some
+        point reached their post-treatment nadir). If current PSA is
+        more than 2.0 above this approximated nadir, classify as
+        recurrence. Otherwise — and as a secondary check — accept
+        either ratio (current/max) < 0.5 OR absolute current < 2.0
+        ng/mL as evidence of response.
+    """
+    current = psa.get('current')
+    if current is None:
+        return None
+    if treatment_type == 'prostatectomy':
+        return current < 0.2
+
+    # Radiation / brachy / focal — Phoenix-like check first.
+    min_v = psa.get('min')
+    if min_v is not None and current - min_v > 2.0:
+        # PSA climbed >2.0 ng/mL above its observed nadir — recurrence.
+        return False
+
+    max_v = psa.get('max')
+    ratio = psa.get('ratio')
+    if max_v is None or max_v <= 0:
+        return current < 2.0
+    if ratio is not None and ratio < 0.5:
+        return True
+    return current < 2.0
+
+
+def _reframe_post_treatment_cc(
+    cc: str,
+    treatment: Optional[Dict[str, str]],
+    psa: Dict[str, Optional[float]],
+) -> str:
+    """Replace stale "persistent / rising PSA / elevated PSA" framing
+    with a clinically accurate post-treatment CC when the data supports
+    it. Returns the input unchanged when:
+      - no completed definitive treatment is detected, OR
+      - the CC has no stale framing markers, OR
+      - PSA data is insufficient to confirm response.
+
+    When the patient is post-treatment with biochemical response, the CC
+    becomes "Follow-up after <treatment> for prostate cancer". When the
+    PSA pattern looks like biochemical recurrence (post-treatment but
+    not responding by our coarse threshold), the CC becomes "Follow-up
+    for biochemical recurrence after <treatment> for prostate cancer".
+    """
+    if not cc or not treatment:
+        return cc
+    if not _STALE_CC_INDICATORS.search(cc):
+        return cc
+
+    t_type = treatment.get('type', '')
+    responding = _is_biochemically_responding(t_type, psa)
+    if responding is None:
+        # Can't confirm response from PSA — leave CC alone rather than
+        # risk a wrong reframe.
+        return cc
+
+    label = _TREATMENT_LABEL.get(t_type, t_type or 'treatment')
+    if responding:
+        return f"Follow-up after {label} for prostate cancer"
+    return f"Follow-up for biochemical recurrence after {label} for prostate cancer"
+
+
+def synthesize_cc(
+    gu_notes: List[Dict[str, str]],
+    non_gu_notes: List[Dict[str, str]],
+    document_pmh: Optional[str] = None,
+    document_pathology: Optional[str] = None,
+    document_psa: Optional[str] = None,
+    document_psh: Optional[str] = None,
+    clinical_document: Optional[str] = None,
+) -> str:
+    """Synthesize a urology Chief Complaint.
+
+    The CC must always be urologic and must reflect the patient's
+    *current* clinical state. Process:
+      1. Collect candidate CCs from GU notes (non-GU notes are excluded
+         per project policy — those CCs are about non-urologic issues).
+      2. Filter to CCs that contain at least one urologic keyword.
+      3. If 1 candidate survives, return it (with terminology cleanup).
+      4. If multiple survive, LLM-synthesize a single urologic CC.
+      5. If zero survive, derive a CC from the patient's PMH /
+         pathology / PSA data so the rendered note still has a sensible
+         urologic CC instead of an empty / "Unknown" placeholder.
+      6. POST-TREATMENT REFRAME (always last): if the resulting CC
+         contains stale framing like "persistent prostate cancer",
+         "rising PSA", or "elevated PSA" BUT the document shows that
+         definitive treatment was completed AND the PSA trend confirms
+         biochemical response, replace the CC with a clinically
+         accurate post-treatment CC. This prevents an outdated CC
+         carried forward from a pre-treatment visit ("persistent
+         prostate cancer") from contradicting the rest of the chart
+         (PSA 15.59 → 0.38 over 22 months post-XRT, for instance).
 
     Args:
-        gu_notes: List of GU note dictionaries
-        non_gu_notes: Not used - kept for compatibility
+        gu_notes: List of GU note dicts.
+        non_gu_notes: Unused — kept for API compatibility.
+        document_pmh: Past medical history text (document-level extract).
+        document_pathology: Pathology results text (document-level).
+        document_psa: PSA values block (document-level).
+        document_psh: Past surgical history (used to detect completed
+            radiation / prostatectomy / brachytherapy).
+        clinical_document: Full raw document, scanned for treatment-
+            completion phrases that aren't captured in PSH.
 
     Returns:
-        Synthesized CC text focused on urologic concerns
+        Non-empty urologic CC string. Never "" — falls back to
+        "Urology follow-up" as the final safety net.
     """
-    # Collect CCs from GU notes ONLY
-    all_ccs = []
+    # Pre-compute treatment + PSA signals once; the reframe step uses
+    # both regardless of which extraction path produced the CC.
+    treatment = _detect_treatment_history(document_psh, clinical_document)
+    psa_state = _assess_psa_trend(document_psa)
 
-    for note in gu_notes:
-        if note.get("CC"):
-            all_ccs.append(note["CC"])
+    # 1. Collect CC candidates from GU notes only.
+    all_ccs = [note["CC"] for note in gu_notes if note.get("CC")]
 
-    if not all_ccs:
-        return ""
+    # 2. Filter to urologic-containing CCs. Drop empties / pure
+    # non-urologic complaints ("annual physical", "back pain").
+    urologic_ccs = [cc for cc in all_ccs if _is_urologic_text(cc)]
 
-    # If only one CC, return it with terminology correction
-    if len(all_ccs) == 1:
-        cc_text = all_ccs[0]
-        # Replace "Consult for" with "Followup for" or "Follow-up for" (case-insensitive)
-        import re
-        cc_text = re.sub(r'\bConsult\s+for\b', 'Follow-up for', cc_text, flags=re.IGNORECASE)
-        cc_text = re.sub(r'\bconsult\b', 'follow-up', cc_text, flags=re.IGNORECASE)
-
-        # Remove "New patient" prefix (followup visits are not new patients)
-        cc_text = re.sub(r'^\s*New\s+patient\s+', '', cc_text, flags=re.IGNORECASE)
-        return cc_text
-
-    # Use LLM to combine CCs, focusing on urologic concerns
-    instructions = """
+    cc: str
+    if len(urologic_ccs) == 1:
+        # 3. Single urologic CC: clean.
+        cc = _apply_terminology(urologic_ccs[0])
+    elif len(urologic_ccs) > 1:
+        # 4. Multiple urologic CCs: LLM-combine.
+        instructions = """
 Focus on urologically relevant complaints only. Include:
 - Genitourinary symptoms (erectile dysfunction, BPH, urinary symptoms, etc.)
 - Prostate issues (elevated PSA, prostate cancer, etc.)
@@ -57,16 +479,34 @@ EXCLUDE non-urologic complaints (shoulder pain, general wellness visits, etc.) u
 Keep the final CC concise (1-2 lines).
 
 IMPORTANT TERMINOLOGY:
-- Replace "Consult for" with "Followup for" (this is a followup visit, not a new consult)
-- Replace "consult" with "followup" in all contexts
+- Replace "Consult for" with "Follow-up for" (this is a followup visit, not a new consult)
+- Replace "consult" with "follow-up" in all contexts
 
 CRITICAL: Provide ONLY the concise chief complaint. NO meta-commentary, NO explanations, NO preamble like "Here is" or "Based on". Just the chief complaint itself.
 """
+        synthesized = combine_sections_with_llm(
+            section_name="Chief Complaint",
+            section_instances=urologic_ccs,
+            instructions=instructions,
+        )
+        cleaned = _apply_terminology(clean_llm_commentary(synthesized))
+        if cleaned and _is_urologic_text(cleaned):
+            cc = cleaned
+        else:
+            # LLM output drifted off-topic — derive from context.
+            cc = _derive_cc_from_context(
+                document_pmh, document_pathology, document_psa,
+            )
+    else:
+        # 5. Zero urologic CCs — derive from context.
+        cc = _derive_cc_from_context(
+            document_pmh, document_pathology, document_psa,
+        )
 
-    synthesized_cc = combine_sections_with_llm(
-        section_name="Chief Complaint",
-        section_instances=all_ccs,
-        instructions=instructions
-    )
-
-    return clean_llm_commentary(synthesized_cc)
+    # 6. Post-treatment reframe. No-op when treatment isn't completed,
+    # the CC has no stale markers, or PSA data is insufficient. When
+    # all three conditions are met (stale CC + completed treatment +
+    # decisive PSA state), rewrites to "Follow-up after <treatment>
+    # for prostate cancer" or "Follow-up for biochemical recurrence
+    # after <treatment>..." as appropriate.
+    return _reframe_post_treatment_cc(cc, treatment, psa_state)

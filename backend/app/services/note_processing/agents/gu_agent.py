@@ -28,7 +28,7 @@ from ..extractors import (
 # Note: Assessment and Plan are NOT extracted in Stage 1 - they are Stage 2 only
 
 
-def process_gu_notes(gu_notes: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def process_gu_notes(gu_notes: List[Dict[str, str]], visit_date: str = "") -> List[Dict[str, str]]:
     """
     Process all GU (urology) notes and extract structured data.
 
@@ -79,10 +79,16 @@ def process_gu_notes(gu_notes: List[Dict[str, str]]) -> List[Dict[str, str]]:
         # Note: PE, ROS, Assessment, and Plan are NOT extracted in Stage 1
         #       - PE/ROS use static templates filled by provider during visit
         #       - Assessment/Plan are completed after the patient visit (Stage 2)
+        # The source note's date AND title are preserved so downstream
+        # agents (especially synthesize_hpi) can label per-note inputs
+        # as temporal snapshots — prior HPIs are from prior visits, not
+        # concurrent with today's encounter.
         gu_note = {
+            "_source_date": note.get("date", "") or "",
+            "_source_title": note.get("title", "") or "",
             "CC": extract_cc(note_content),
             "HPI": extract_hpi(note_content),
-            "IPSS": extract_ipss(note_content),
+            "IPSS": extract_ipss(note_content, visit_date=visit_date),
             "DHx": extract_diet(note_content),
             "PMH": extract_pmh_from_note(note_content),
             "PSH": extract_psh(note_content),
@@ -96,7 +102,7 @@ def process_gu_notes(gu_notes: List[Dict[str, str]]) -> List[Dict[str, str]]:
             "Allergies": extract_allergies(note_content),
             "Endocrine": extract_endocrine_labs(note_content),
             "Stone": extract_stone_labs(note_content),
-            "Labs": extract_labs(note_content),
+            "Labs": extract_labs(note_content, visit_date=visit_date),
             "Imaging": extract_imaging_from_note(note_content)
         }
 

@@ -32,8 +32,8 @@ cd vaucda
 # cd vaucda
 
 # Copy environment templates
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
+cp backend/.env backend/.env
+cp frontend/.env frontend/.env
 ```
 
 ### Step 2: Generate Secrets (30 seconds)

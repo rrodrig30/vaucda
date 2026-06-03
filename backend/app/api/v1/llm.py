@@ -11,6 +11,11 @@ import aiohttp
 from app.core.security import get_optional_user
 from app.database.sqlite_models import User
 from app.config import settings
+from app.services.llm_config_manager import (
+    MODEL_CONTEXT_SIZES,
+    DEFAULT_CONTEXT_SIZE,
+    get_model_context_size,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,41 @@ class OllamaModelsResponse(BaseModel):
     models: List[LLMModel]
 
 
+class ModelContextSizeResponse(BaseModel):
+    """Response describing a model's known/default input context window."""
+    model: str = Field(..., description="Model name as queried")
+    context_size: int = Field(..., description="Resolved context window in tokens (table value or DEFAULT_CONTEXT_SIZE)")
+    known: bool = Field(..., description="True if the model is in MODEL_CONTEXT_SIZES; False means context_size is DEFAULT_CONTEXT_SIZE")
+    default_size: int = Field(..., description="The default fallback used when a model is unknown")
+
+
+def is_embedding_model(model_name: str) -> bool:
+    """
+    Check if a model is an embedding-only model (not suitable for any generation).
+
+    These models cannot generate text at all and should be hidden from all dropdowns.
+    OCR and vision models ARE kept — they are valid choices for the OCR task dropdown.
+    """
+    model_lower = model_name.lower()
+
+    exclude_patterns = [
+        'embed',         # Embedding models (nomic-embed-text, etc.)
+        'embedding',     # Embedding models
+        'minilm',        # Embedding models (all-minilm)
+        'e5-',           # Embedding models
+        'bge-',          # Embedding models
+        'gte-',          # Embedding models
+        'clip',          # CLIP embedding models
+        'whisper',       # Audio transcription models (not text generation)
+    ]
+
+    for pattern in exclude_patterns:
+        if pattern in model_lower:
+            return True
+
+    return False
+
+
 @router.get("/providers", response_model=ProvidersResponse)
 async def get_providers(
     current_user: Optional[User] = Depends(get_optional_user)
@@ -60,6 +100,8 @@ async def get_providers(
     including which ones are enabled, available, and what models they have.
 
     Works without authentication (read-only endpoint).
+
+    Note: Filters out non-text-generation models (OCR, embedding, etc.)
     """
     try:
         providers = []
@@ -80,6 +122,13 @@ async def get_providers(
                         for model in data.get("models", []):
                             # Parse model name to extract details
                             model_name = model.get("name", "")
+
+                            # Filter out embedding models only — keep OCR/vision models
+                            # so they appear in the OCR dropdown on the Settings page
+                            if is_embedding_model(model_name):
+                                logger.debug(f"Filtering out embedding model: {model_name}")
+                                continue
+
                             size = model.get("size", 0)
 
                             # Extract parameter size from name (e.g., llama3.1:70b -> 70B)
@@ -186,10 +235,12 @@ async def get_ollama_models(
     current_user: Optional[User] = Depends(get_optional_user)
 ):
     """
-    Get available Ollama models.
+    Get available Ollama models for text generation.
 
     Queries the local Ollama server for all installed models and returns
     detailed information about each one.
+
+    Note: Filters out non-text-generation models (OCR, embedding, etc.)
     """
     try:
         models = []
@@ -209,6 +260,11 @@ async def get_ollama_models(
 
                 for model in data.get("models", []):
                     model_name = model.get("name", "")
+
+                    # Filter out non-text-generation models
+                    if not is_text_generation_model(model_name):
+                        continue
+
                     size = model.get("size", 0)
 
                     # Extract parameter size from name
@@ -228,7 +284,8 @@ async def get_ollama_models(
                         quantization=model.get("details", {}).get("quantization_level")
                     ))
 
-        logger.info(f"Retrieved {len(models)} Ollama models for user {current_user.user_id}")
+        user_id = current_user.user_id if current_user else "anonymous"
+        logger.info(f"Retrieved {len(models)} Ollama models for user {user_id}")
 
         return OllamaModelsResponse(models=models)
 
@@ -240,3 +297,45 @@ async def get_ollama_models(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get Ollama models: {str(e)}"
         )
+
+
+@router.get("/model-context-size", response_model=ModelContextSizeResponse)
+async def get_model_context_size_endpoint(
+    model: str,
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """
+    Look up the published training context window (n_ctx_train) for a model.
+
+    Used by the Settings UI to populate the per-task num_ctx input when the
+    user picks a model. Returns:
+      - context_size: lookup-table value if the model is known, else DEFAULT_CONTEXT_SIZE
+      - known: True iff the model is in MODEL_CONTEXT_SIZES (exact or family match)
+      - default_size: the unknown-model fallback (informational)
+
+    This endpoint does NOT consult user preferences. The frontend uses the
+    return value as a default that can be overridden by the user's input.
+    """
+    if not model or not model.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Query parameter 'model' is required"
+        )
+
+    model_name = model.strip()
+    # 'known' must reflect whether the lookup succeeded, not just exact match
+    resolved = get_model_context_size(model_name)
+    is_known = resolved != DEFAULT_CONTEXT_SIZE or model_name in MODEL_CONTEXT_SIZES
+
+    user_info = current_user.user_id if current_user else "anonymous"
+    logger.info(
+        f"Model context size lookup for '{model_name}' -> "
+        f"{resolved} (known={is_known}) by {user_info}"
+    )
+
+    return ModelContextSizeResponse(
+        model=model_name,
+        context_size=resolved,
+        known=is_known,
+        default_size=DEFAULT_CONTEXT_SIZE,
+    )

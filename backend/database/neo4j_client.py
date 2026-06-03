@@ -113,7 +113,7 @@ class Neo4jClient:
             result = await session.run("""
                 SHOW INDEXES
                 YIELD name, state, type
-                WHERE name IN ['document_embeddings', 'concept_embeddings']
+                WHERE name IN ['chunk_embeddings', 'concept_embeddings', 'community_embeddings']
                 RETURN name, state, type
             """)
 
@@ -147,21 +147,23 @@ class Neo4jClient:
             List of documents with similarity scores
         """
         query = """
-        CALL db.index.vector.queryNodes('document_embeddings', $k, $query_embedding)
-        YIELD node, score
+        CALL db.index.vector.queryNodes('chunk_embeddings', $k, $query_embedding)
+        YIELD node AS chunk, score
 
-        WHERE ($category IS NULL OR node.category = $category)
-          AND ($min_year IS NULL OR node.publication_date.year >= $min_year)
+        MATCH (chunk)-[:BELONGS_TO]->(doc:Document)
+        WHERE ($category IS NULL OR doc.category = $category)
+          AND ($min_year IS NULL OR doc.publication_date IS NULL OR doc.publication_date.year >= $min_year)
 
-        RETURN node.id AS doc_id,
-               node.title AS title,
-               node.content AS content,
-               node.summary AS summary,
-               node.source AS source,
-               node.category AS category,
-               node.version AS version,
-               node.publication_date AS publication_date,
-               score AS similarity_score
+        RETURN doc.id AS doc_id,
+               doc.title AS title,
+               chunk.content AS content,
+               doc.summary AS summary,
+               doc.source AS source,
+               doc.category AS category,
+               doc.version AS version,
+               doc.publication_date AS publication_date,
+               score AS similarity_score,
+               chunk.id AS chunk_id
         ORDER BY score DESC
         LIMIT $k
         """
@@ -202,12 +204,13 @@ class Neo4jClient:
         """
         Hybrid retrieval: Vector search + Graph traversal.
 
-        Retrieves documents via vector similarity, then enriches with:
+        Retrieves documents via vector similarity on Chunks, then enriches with:
+        - Parent document metadata
         - Related clinical concepts
         - Applicable calculators
 
         Args:
-            query_embedding: 768-dimensional query vector
+            query_embedding: 384-dimensional query vector (all-MiniLM-L6-v2)
             k: Number of results to return
             category: Filter by category
 
@@ -215,20 +218,24 @@ class Neo4jClient:
             List of enriched documents with graph context
         """
         query = """
-        CALL db.index.vector.queryNodes('document_embeddings', $k, $query_embedding)
-        YIELD node AS doc, score
+        CALL db.index.vector.queryNodes('chunk_embeddings', $k, $query_embedding)
+        YIELD node AS chunk, score
 
+        // Get parent document
+        MATCH (chunk)-[:BELONGS_TO]->(doc:Document)
         WHERE ($category IS NULL OR doc.category = $category)
 
-        // Graph traversal for context
-        MATCH (doc)-[:REFERENCES]->(concept:ClinicalConcept)
+        // Graph traversal for context (optional - may not exist)
+        OPTIONAL MATCH (doc)-[:REFERENCES]->(concept:ClinicalConcept)
         OPTIONAL MATCH (concept)<-[:APPLIES_TO]-(calc:Calculator)
 
-        RETURN doc.id AS document_id,
-               doc.title AS document_title,
-               doc.content AS content,
-               doc.summary AS summary,
+        RETURN coalesce(doc.filename, doc.source) AS document_id,
+               coalesce(doc.title, doc.filename) AS document_title,
+               chunk.content AS content,
+               doc.source AS summary,
                score AS vector_score,
+               doc.category AS category,
+               doc.author AS author,
                collect(DISTINCT concept.name) AS related_concepts,
                collect(DISTINCT calc.name) AS applicable_calculators
         ORDER BY score DESC
@@ -251,8 +258,10 @@ class Neo4jClient:
                     "content": record["content"],
                     "summary": record["summary"],
                     "vector_score": record["vector_score"],
-                    "related_concepts": record["related_concepts"],
-                    "applicable_calculators": record["applicable_calculators"]
+                    "category": record["category"],
+                    "author": record["author"],
+                    "related_concepts": record["related_concepts"] or [],
+                    "applicable_calculators": record["applicable_calculators"] or []
                 })
 
             return results
@@ -589,6 +598,236 @@ class Neo4jClient:
                 calculators.append(dict(record))
 
             return calculators
+
+    # =========================================================================
+    # GraphRAG Community Methods
+    # =========================================================================
+
+    async def execute_query(
+        self,
+        query: str,
+        parameters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Execute a Cypher query and return results as list of dictionaries.
+
+        Args:
+            query: Cypher query string
+            parameters: Query parameters
+
+        Returns:
+            List of result dictionaries
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, parameters or {})
+            records = []
+            async for record in result:
+                records.append(dict(record))
+            return records
+
+    async def create_community(
+        self,
+        community_id: str,
+        name: str,
+        description: str,
+        size: int,
+        tier: int,
+        key_terms: List[str],
+        embedding: Optional[List[float]] = None,
+        document_ids: Optional[List[str]] = None
+    ) -> str:
+        """
+        Create a Community node for GraphRAG.
+
+        Args:
+            community_id: Unique community identifier
+            name: Community name
+            description: Community description
+            size: Number of nodes in community
+            tier: Community tier (0=major, 1=medium, 2=minor)
+            key_terms: List of key terms
+            embedding: Community embedding vector
+            document_ids: List of document IDs to link
+
+        Returns:
+            Created community ID
+        """
+        query = """
+        MERGE (c:Community {id: $community_id})
+        SET c.name = $name,
+            c.description = $description,
+            c.size = $size,
+            c.tier = $tier,
+            c.key_terms = $key_terms,
+            c.embedding = $embedding,
+            c.created_at = datetime()
+        WITH c
+        UNWIND COALESCE($document_ids, []) AS doc_id
+        MATCH (d:Document {id: doc_id})
+        MERGE (d)-[:BELONGS_TO_COMMUNITY]->(c)
+        RETURN c.id AS id
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(
+                query,
+                community_id=community_id,
+                name=name,
+                description=description,
+                size=size,
+                tier=tier,
+                key_terms=key_terms,
+                embedding=embedding,
+                document_ids=document_ids or []
+            )
+            record = await result.single()
+            return record["id"] if record else community_id
+
+    async def get_community_by_id(self, community_id: str) -> Optional[Dict[str, Any]]:
+        """Get community by ID."""
+        query = """
+        MATCH (c:Community {id: $community_id})
+        OPTIONAL MATCH (d:Document)-[:BELONGS_TO_COMMUNITY]->(c)
+        RETURN c.id AS id,
+               c.name AS name,
+               c.description AS description,
+               c.size AS size,
+               c.tier AS tier,
+               c.key_terms AS key_terms,
+               c.embedding AS embedding,
+               collect(DISTINCT d.id) AS document_ids
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(query, community_id=community_id)
+            record = await result.single()
+            return dict(record) if record else None
+
+    async def get_communities_for_query(
+        self,
+        embedding: List[float],
+        limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Find communities matching a query embedding.
+
+        Args:
+            embedding: Query embedding vector
+            limit: Maximum number of communities to return
+
+        Returns:
+            List of matching communities with scores
+        """
+        query = """
+        CALL db.index.vector.queryNodes('community_embeddings', $limit, $embedding)
+        YIELD node, score
+        RETURN node.id AS id,
+               node.name AS name,
+               node.description AS description,
+               node.tier AS tier,
+               node.size AS size,
+               score AS relevance_score
+        ORDER BY score DESC
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(query, embedding=embedding, limit=limit)
+            communities = []
+            async for record in result:
+                communities.append(dict(record))
+            return communities
+
+    async def store_hierarchical_summary(
+        self,
+        summary_id: str,
+        entity_id: str,
+        entity_type: str,
+        level: int,
+        content: str,
+        key_phrases: List[str],
+        token_count: int,
+        model_used: str
+    ) -> str:
+        """
+        Store a hierarchical summary in Neo4j.
+
+        Args:
+            summary_id: Unique summary ID
+            entity_id: ID of entity being summarized
+            entity_type: Type of entity (chunk, document, community)
+            level: Hierarchy level (0=chunk, 1=document, 2=community)
+            content: Summary text
+            key_phrases: List of key phrases
+            token_count: Number of tokens in summary
+            model_used: LLM model used for generation
+
+        Returns:
+            Stored summary ID
+        """
+        query = """
+        MERGE (s:HierarchicalSummary {id: $summary_id})
+        SET s.entity_id = $entity_id,
+            s.entity_type = $entity_type,
+            s.level = $level,
+            s.content = $content,
+            s.key_phrases = $key_phrases,
+            s.token_count = $token_count,
+            s.model_used = $model_used,
+            s.created_at = datetime()
+        WITH s
+        OPTIONAL MATCH (e)
+        WHERE (e:Chunk AND e.id = $entity_id)
+           OR (e:Document AND e.id = $entity_id)
+           OR (e:Community AND e.id = $entity_id)
+        FOREACH (x IN CASE WHEN e IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (s)-[:SUMMARIZES]->(e)
+        )
+        RETURN s.id AS id
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(
+                query,
+                summary_id=summary_id,
+                entity_id=entity_id,
+                entity_type=entity_type,
+                level=level,
+                content=content,
+                key_phrases=key_phrases,
+                token_count=token_count,
+                model_used=model_used
+            )
+            record = await result.single()
+            return record["id"] if record else summary_id
+
+    async def get_summaries_for_community(
+        self,
+        community_id: str
+    ) -> List[Dict[str, Any]]:
+        """Get all hierarchical summaries for a community."""
+        query = """
+        MATCH (c:Community {id: $community_id})
+        OPTIONAL MATCH (s:HierarchicalSummary)-[:SUMMARIZES]->(c)
+        OPTIONAL MATCH (d:Document)-[:BELONGS_TO_COMMUNITY]->(c)
+        OPTIONAL MATCH (ds:HierarchicalSummary)-[:SUMMARIZES]->(d)
+        WHERE ds.level = 1
+        RETURN collect(DISTINCT {
+            id: s.id,
+            content: s.content,
+            level: s.level,
+            type: 'community'
+        }) + collect(DISTINCT {
+            id: ds.id,
+            content: ds.content,
+            level: ds.level,
+            type: 'document'
+        }) AS summaries
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(query, community_id=community_id)
+            record = await result.single()
+            return record["summaries"] if record else []
 
 
 # =============================================================================

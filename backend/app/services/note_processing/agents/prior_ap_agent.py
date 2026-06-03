@@ -131,6 +131,24 @@ def _extract_interventions_from_plan(plan: str) -> List[Dict[str, str]]:
         (r'(active\s+surveillance)', 'active surveillance'),
     ]
 
+    # Conditional / hypothetical markers. If any of these appears BETWEEN
+    # the procedure word and a candidate status keyword, the keyword is
+    # describing a hypothetical, not a completed fact. Example:
+    #   "...if prostate biopsy performed"   -> conditional, NOT completed
+    #   "...consider biopsy if indicated"   -> conditional, NOT scheduled
+    #   "...possible biopsy if needed"      -> conditional, NOT completed
+    # Without this guard the proximity heuristic tags the procedure as
+    # 'completed' and downstream plan generation hallucinates a
+    # pathology-review step against a biopsy that never happened.
+    CONDITIONAL_MARKERS = re.compile(
+        r'\b(?:if|when|whenever|consider(?:ed|ing)?|possible|possibly|'
+        r'potential(?:ly)?|may|might|would|could|should|shall|'
+        r'discuss(?:ed|ing)?|recommend(?:ed|ing)?|advise(?:d)?|'
+        r'threshold|future|next\s+visit|as\s+needed|prn|'
+        r'pending|awaiting|plan(?:ned|ning)?\s+to|propose(?:d)?)\b',
+        re.IGNORECASE,
+    )
+
     for pattern, proc_name in procedure_patterns:
         matches = re.finditer(pattern, plan_lower, re.IGNORECASE)
         for match in matches:
@@ -152,6 +170,7 @@ def _extract_interventions_from_plan(plan: str) -> List[Dict[str, str]]:
 
             # Find the closest status keyword to the procedure
             proc_pos = match.start() - start  # Position of procedure in context
+            proc_end_pos = match.end() - start
             best_status = 'recommended'
             best_distance = float('inf')
 
@@ -159,6 +178,25 @@ def _extract_interventions_from_plan(plan: str) -> List[Dict[str, str]]:
                 for keyword in keywords:
                     keyword_match = re.search(r'\b' + re.escape(keyword) + r'\b', context)
                     if keyword_match:
+                        # Skip 'completed'/'scheduled' promotions when a
+                        # conditional marker sits BETWEEN the procedure and
+                        # the keyword (or just before the procedure). Patient
+                        # decisions ('declined') are exempt — they reflect a
+                        # fact about the patient regardless of conditional
+                        # framing.
+                        if status_name in ('completed', 'scheduled'):
+                            kw_start = keyword_match.start()
+                            kw_end = keyword_match.end()
+                            span_lo = min(proc_pos, kw_start)
+                            span_hi = max(proc_end_pos, kw_end)
+                            # Look in the span between procedure and keyword,
+                            # plus a small lead-in before the procedure to
+                            # catch leading "if"/"consider" before the proc.
+                            scan_lo = max(0, span_lo - 12)
+                            between = context[scan_lo:span_hi]
+                            if CONDITIONAL_MARKERS.search(between):
+                                continue
+
                         # Calculate distance from procedure to status keyword
                         kw_pos = (keyword_match.start() + keyword_match.end()) // 2
                         distance = abs(kw_pos - proc_pos)
@@ -195,7 +233,8 @@ def synthesize_prior_ap_context(
     stage1_note: Optional[str] = None,
     patient_age: Optional[str] = None,
     patient_sex: Optional[str] = None,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    use_llm: bool = True
 ) -> Dict[str, Any]:
     """
     Synthesize structured context from prior assessments and plans.
@@ -213,6 +252,8 @@ def synthesize_prior_ap_context(
         patient_age: Patient age for context
         patient_sex: Patient sex for context
         model: LLM model to use for synthesis
+        use_llm: If True, use LLM for narrative synthesis (slower but richer).
+                 If False, use regex-only extraction (faster, for Stage 1 HPI).
 
     Returns:
         Dict with structured context:
@@ -271,8 +312,10 @@ def synthesize_prior_ap_context(
         elif interv['status'] == 'completed':
             result['patient_decisions'][interv['intervention']] = 'completed'
 
-    # Use LLM to synthesize clinical progression narrative
-    if (prior_assessments or prior_plans) and len(prior_assessments) + len(prior_plans) > 1:
+    # Use LLM to synthesize clinical progression narrative (only if use_llm=True)
+    # For Stage 1 HPI, use_llm=False for faster regex-only extraction
+    # For Stage 2 Assessment/Plan, use_llm=True for richer narrative synthesis
+    if use_llm and (prior_assessments or prior_plans) and len(prior_assessments) + len(prior_plans) > 1:
         context_parts = []
 
         if prior_assessments:

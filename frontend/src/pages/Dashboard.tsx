@@ -1,19 +1,12 @@
-import React, { useEffect } from 'react'
+import React from 'react'
 import { Link } from 'react-router-dom'
 import { Card } from '@/components/common/Card'
-import { Button } from '@/components/common/Button'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { fetchRecentNotes } from '@/store/slices/noteSlice'
+import { useAppSelector } from '@/store/hooks'
 import { FiFileText, FiTool, FiBook, FiArrowRight } from 'react-icons/fi'
 
 export const Dashboard: React.FC = () => {
-  const dispatch = useAppDispatch()
-  const { savedNotes } = useAppSelector((state) => state.note)
+  // HIPAA COMPLIANCE: No note history retrieval - notes are ephemeral only
   const { user } = useAppSelector((state) => state.auth)
-
-  useEffect(() => {
-    dispatch(fetchRecentNotes(5))
-  }, [dispatch])
 
   const quickActions = [
     {
@@ -77,37 +70,8 @@ export const Dashboard: React.FC = () => {
         ))}
       </div>
 
-      {/* Recent Notes */}
-      <Card title="Recent Notes" description="Your recently generated clinical notes">
-        {savedNotes.length === 0 ? (
-          <p className="text-gray-500 dark:text-gray-400 text-center py-8">
-            No recent notes. Generate your first note to get started!
-          </p>
-        ) : (
-          <div className="space-y-3">
-            {savedNotes.map((note) => (
-              <div
-                key={note.note_id}
-                className="p-4 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex-1">
-                    <p className="text-sm text-gray-600 dark:text-gray-400">
-                      {new Date(note.created_at).toLocaleString()}
-                    </p>
-                    <p className="text-sm text-gray-800 dark:text-gray-200 mt-1 line-clamp-2">
-                      {note.generated_note.substring(0, 150)}...
-                    </p>
-                  </div>
-                  <Button variant="outline" size="sm">
-                    View
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
+      {/* HIPAA COMPLIANCE: Recent Notes section removed - notes are ephemeral only
+          No note history or persistence to prevent cross-patient contamination */}
     </div>
   )
 }

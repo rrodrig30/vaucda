@@ -27,13 +27,17 @@ class TemplateManager:
     Provides templates for different note types and specialties.
     """
 
-    def __init__(self, template_dir: str = "/home/gulab/PythonProjects/VAUCDA"):
+    def __init__(self, template_dir: str = None):
         """
         Initialize template manager.
 
         Args:
             template_dir: Directory containing template files
         """
+        if template_dir is None:
+            from pathlib import Path
+            # Default to backend directory (project root)
+            template_dir = str(Path(__file__).parent.parent.parent)
         self.template_dir = template_dir
         self.templates: Dict[str, str] = {}
         self._load_templates()
@@ -74,8 +78,8 @@ CC:
 HPI:
 
 IPSS (if applicable):
-+---------------+--------+
-|        IPSS            |
++------------------------+
+|          IPSS          |
 +---------------+--------+
 | Symptom       | Score  |
 +---------------+--------+
@@ -88,7 +92,7 @@ IPSS (if applicable):
 | Nocturia      |   #    |
 +---------------+--------+
 | Total         | ##/35  |
-| BI            | #/6    |
+| BI            |  #/6   |
 +---------------+--------+
 
 PAST MEDICAL HISTORY:

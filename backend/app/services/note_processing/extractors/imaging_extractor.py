@@ -7,6 +7,116 @@ Extracts imaging reports from clinical documents.
 import re
 
 
+# Comprehensive list of imaging keywords used across all extraction functions
+# Includes: CT, MRI, Ultrasound (US, U/S, ULTRASOUND), X-ray, Bone Scan, Nuclear medicine
+IMAGING_KEYWORDS = (
+    r'(?:'
+    r'CT[\s,]|CT$|'                         # CT scan (CT ABDOMEN or CT, ABDOMEN)
+    r'MRI[\s,]|MRI$|MR[\s,]|'              # MRI (MRI PROSTATE or MRI, PROSTATE)
+    r'ULTRASOUND|'                          # Full ultrasound
+    r'\bUS[\s,]+[A-Z]|'                      # US abbreviation followed by body part (space or comma)
+    r'\bU/S\s|'                             # U/S abbreviation
+    r'SONOGRAM|SONO\s|'                    # Sonogram
+    r'X-RAY|XRAY|'                          # X-ray
+    r'RADIOGRAPH|'                          # Radiograph
+    r'PET\s|PET/CT|PET$|'                  # PET scan
+    r'BONE\s+SCAN|'                         # Bone scan
+    r'NM\s+|NUCLEAR\s+MEDICINE|NUCLEAR\s+|' # Nuclear medicine
+    r'SKELETAL\s+SCINTIGRAPHY|'            # Bone scan alternative name
+    r'WHOLE\s+BODY\s+BONE|'                # Whole body bone scan
+    r'RENAL\s+SCAN|'                        # Renal scan
+    r'MAG3|DTPA|'                           # Renal scan types
+    r'MAMMO|'                               # Mammogram
+    r'FLUORO|'                              # Fluoroscopy
+    r'DEXA|DXA|'                            # Bone density
+    r'ECHO|'                                # Echocardiogram
+    r'CYSTOGRAM|VCUG|'                     # Urologic imaging
+    r'RETROGRADE|'                          # Retrograde studies
+    r'IVP|IVU|'                             # IV pyelogram/urogram
+    r'KUB|'                                 # Kidney-Ureter-Bladder
+    r'ANGIOGRAM|ANGIO|'                    # Angiography
+    r'VENOGRAM|'                            # Venography
+    r'MYELOGRAM|'                           # Myelography
+    r'ARTHROGRAM'                           # Arthrography
+    r')'
+)
+
+
+# DXA / bone-density boilerplate patterns. These chunks repeat verbatim
+# (modulo whitespace and percentages) in every VA DXA impression and
+# contribute nothing to clinical decision making. See logs/dexa.txt for
+# the source text. Stripped via _strip_dexa_boilerplate() after extraction.
+#
+# Each pattern is whitespace-tolerant and case-insensitive. Order doesn't
+# matter — we apply them all as repeated subs.
+_DEXA_BOILERPLATE_PATTERNS = [
+    # FRAX 10-year probability sentence (percentages vary by patient)
+    re.compile(
+        r'\s*Based on the United States FRAX calculator,\s*'
+        r"the patient'?s\s*10[\s-]year probability of major osteoporotic "
+        r'fracture is\s*\d+(?:\.\d+)?\s*%\s*and\s*10[\s-]year probability of '
+        r'hip fracture is\s*\d+(?:\.\d+)?\s*%\.?\s*',
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # WHO osteoporosis / osteopenia diagnostic criteria paragraph
+    re.compile(
+        r'\s*According to the World Health Organization guidelines,?\s*'
+        r'osteoporosis may be diagnosed if the lowest T-score of the '
+        r'lumbar spine,\s*total hip or femoral neck is\s*-?\s*2\.5\s*or less\.\s*'
+        r'Low bone density \(osteopenia\) may be diagnosed if the T-score '
+        r'falls between\s*-?\s*1\.0\s*and\s*-?\s*2\.5\.\s*'
+        r'In certain circumstances the 33%\s*radius\s*'
+        r'\(also called 1/3rd radius\) may be utilized\.?\s*',
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # Men age 50 diagnostic threshold reminder
+    re.compile(
+        r'\s*Osteoporosis may be diagnosed in men age 50 and older if the '
+        r'T-score of the lumbar spine,\s*total hip or femoral neck is\s*'
+        r'-?\s*2\.5\s*or less\.?\s*',
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # RECOMMENDATIONS block — three numbered items running from "1. If
+    # therapy is contemplated..." through "...restore bone mass."
+    re.compile(
+        r'\s*RECOMMENDATIONS:?\s*'
+        r'1\.\s*If therapy is contemplated.*?'
+        r'2\.\s*The National Osteoporosis Foundation \(NOF\) guidelines.*?'
+        r'3\.\s*Patients with diagnosed cases of osteoporosis.*?'
+        r'restore bone mass\.?\s*',
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
+
+# Heuristic markers that identify a report as a DXA / bone-density study.
+# Only DXA reports get the boilerplate stripped — we don't want to touch
+# unrelated reports that happen to mention "T-score" in passing.
+_DEXA_HEADER_RE = re.compile(
+    r'\b(?:DXA|DEXA|DUAL[\s-]ENERGY|BONE\s+DENSIT(?:OMETRY|Y)|'
+    r'XRAY\s+ABSORPTION|X-RAY\s+ABSORPTION)\b',
+    re.IGNORECASE,
+)
+
+
+def _strip_dexa_boilerplate(report: str) -> str:
+    """Remove non-actionable FRAX/WHO/NOF boilerplate from DXA impressions.
+
+    No-op for non-DXA reports (gated on _DEXA_HEADER_RE matching anywhere
+    in the report's header line).
+    """
+    if not report or not _DEXA_HEADER_RE.search(report):
+        return report
+    cleaned = report
+    for pat in _DEXA_BOILERPLATE_PATTERNS:
+        cleaned = pat.sub(' ', cleaned)
+    # Collapse the whitespace runs the substitutions leave behind, but
+    # preserve the "STUDY (DATE):\nIMPRESSION: ..." line break.
+    head, sep, body = cleaned.partition('\n')
+    body = re.sub(r'[ \t]+', ' ', body)
+    body = re.sub(r'\s*\n\s*', '\n', body).strip()
+    return f'{head.rstrip()}{sep}{body}' if sep else head.rstrip()
+
+
 def extract_imaging(clinical_document: str) -> str:
     """
     Extract imaging reports from clinical documents.
@@ -38,6 +148,22 @@ def extract_imaging(clinical_document: str) -> str:
     if va_format_imaging:
         imaging_reports.extend(va_format_imaging)
 
+    # Fourth, extract external/non-VA facility imaging (BAMC, SAMC, etc.)
+    external_imaging = extract_external_imaging(clinical_document)
+    if external_imaging:
+        imaging_reports.extend(external_imaging)
+
+    # Fifth, extract CPRS report-verified format. Used by VistA CPRS exports
+    # where each study is a block of bareword headers
+    # ("Exam Date/Time", "Procedure Name", "Reason for Study",
+    #  "Clinical History", "Impression", "Report") each followed by an
+    # indented value. None of the prior four extractors match this layout
+    # because it lacks "===== IMAGING =====", "Detailed Report",
+    # "---- RADIOLOGY ----", or the short FACILITY-prefix bullet form.
+    cprs_imaging = extract_cprs_format_imaging(clinical_document)
+    if cprs_imaging:
+        imaging_reports.extend(cprs_imaging)
+
     if not imaging_reports:
         return ""
 
@@ -47,8 +173,15 @@ def extract_imaging(clinical_document: str) -> str:
     seen_study_dates = {}  # Key: (study_name_normalized, date_normalized) -> report
 
     for report in imaging_reports:
-        # Extract study name and date from report header
-        header_match = re.match(r'([^(]+)\s*\(([^)]+)\):', report)
+        # Extract study name and date from report header. The date is
+        # always the LAST parenthesized group on the header line (e.g.
+        # "(MAR 13, 2026):") — study names themselves may contain
+        # parentheses such as "XRAY ABSORPTION (DXA) AXIAL", so we can't
+        # anchor the date paren to the first one we see. A non-greedy
+        # `.+?` followed by `\(([^()]+)\)\s*:` lets the engine extend the
+        # study-name capture past any internal parens until it finds the
+        # final "(date):" right before the line break.
+        header_match = re.match(r'^(.+?)\s*\(([^()]+)\)\s*:', report)
         if header_match:
             study_name = header_match.group(1).strip()
             date_str = header_match.group(2).strip()
@@ -75,11 +208,47 @@ def extract_imaging(clinical_document: str) -> str:
             else:
                 seen_study_dates[key] = report
         else:
-            # No header match - keep as is
-            unique_reports.append(report)
+            # No "(date):" header — try a dateless fallback so reports
+            # like "MRI, PROSTATE W/O & W/CONTRAST:" (which some VA
+            # exports emit without a date paren) still dedup against
+            # other dateless copies of the same study. Key on
+            # (normalized_study_name, "") + a short content hash so
+            # reports with the same study name but genuinely different
+            # impressions don't collapse into one.
+            head_match = re.match(r'^(.+?)\s*:', report)
+            if head_match:
+                study_name = head_match.group(1).strip()
+                study_normalized = re.sub(r'\s+', ' ', study_name.upper())
+                study_normalized = re.sub(r'\s*W/O\s*&\s*W/\s*(?:IV\s*)?(?:CONTRAST)?', '', study_normalized)
+                study_normalized = re.sub(r'\s*(?:WITH|WITHOUT|W/O|W/)\s*(?:IV\s*)?CONTRAST', '', study_normalized)
+                study_normalized = re.sub(r'\s*(?:IV\s*)?CONTRAST', '', study_normalized)
+                study_normalized = re.sub(r'\s+', ' ', study_normalized).strip()
+                # First 80 chars of the body as a coarse content fingerprint
+                body_start = report.split('\n', 1)[1] if '\n' in report else ''
+                content_fp = re.sub(r'\s+', ' ', body_start)[:80].upper()
+                key = (study_normalized, '', content_fp)
+                if key in seen_study_dates:
+                    if len(report) > len(seen_study_dates[key]):
+                        seen_study_dates[key] = report
+                else:
+                    seen_study_dates[key] = report
+            else:
+                # Truly unparseable header — keep verbatim (last resort)
+                unique_reports.append(report)
 
     # Add all unique studies
     unique_reports.extend(seen_study_dates.values())
+
+    # Strip non-actionable boilerplate from DXA / bone-density studies.
+    # VA DXA impressions always tail with the same FRAX/WHO/NOF
+    # paragraphs and a generic RECOMMENDATIONS list — text that clutters
+    # the rendered note without changing clinical decision making.
+    unique_reports = [_strip_dexa_boilerplate(r) for r in unique_reports]
+
+    # Sort reverse chronologically — most recent study at the top of the
+    # IMAGING section. Reports with an unparseable / missing date sort
+    # LAST so they remain visible but don't push current imaging down.
+    unique_reports.sort(key=_imaging_report_sort_key, reverse=True)
 
     return '\n\n'.join(unique_reports)
 
@@ -89,32 +258,77 @@ def _normalize_date_for_comparison(date_str: str) -> str:
     Normalize date string for comparison (handles different formats).
 
     Examples:
-        "11/12/2019" -> "20191112"
-        "NOV 12, 2019" -> "20191112"
+        "11/12/2019"  -> "20191112"
+        "11/12/19"    -> "20191112"   (2-digit year, assume 2000+)
+        "NOV 12, 2019"-> "20191112"
+        "8/2017"      -> "20170801"   (month/year only — day defaults to 01)
 
     Args:
         date_str: Date string in various formats
 
     Returns:
-        Normalized date string
+        Normalized YYYYMMDD string sortable as text, or the raw input
+        uppercased if nothing parses.
     """
-    # Try numeric format: MM/DD/YYYY
-    numeric_match = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', date_str)
+    # Try numeric format: MM/DD/YYYY or MM/DD/YY
+    numeric_match = re.match(r'(\d{1,2})/(\d{1,2})/(\d{2,4})', date_str)
     if numeric_match:
         month, day, year = numeric_match.groups()
+        if len(year) == 2:
+            # 2-digit year — pivot at 50 (>=50 -> 19xx, <50 -> 20xx).
+            # All clinic notes here are recent (2000+) so the common case
+            # resolves to 20xx, but the pivot keeps legacy dates correct.
+            year = ('19' + year) if int(year) >= 50 else ('20' + year)
         return f"{year}{int(month):02d}{int(day):02d}"
 
+    # Try M/YYYY shorthand (no day) — assume day 01 for sortability.
+    my_match = re.match(r'(\d{1,2})/(\d{4})$', date_str)
+    if my_match:
+        month, year = my_match.groups()
+        return f"{year}{int(month):02d}01"
+
     # Try text format: MON DD, YYYY
-    text_match = re.match(r'([A-Z]{3})\s+(\d{1,2}),?\s+(\d{4})', date_str, re.IGNORECASE)
+    text_match = re.match(r'([A-Z]{3,9})\s+(\d{1,2}),?\s+(\d{4})', date_str, re.IGNORECASE)
     if text_match:
         month_name, day, year = text_match.groups()
         month_map = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
                      'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
-        month = month_map.get(month_name.upper(), 1)
+        month = month_map.get(month_name[:3].upper(), 1)
         return f"{year}{month:02d}{int(day):02d}"
 
     # Fallback: return as-is
     return date_str.upper()
+
+
+def _imaging_report_sort_key(report: str) -> str:
+    """Return a YYYYMMDD sort key for an imaging report block.
+
+    Looks for the date in the report's header line first
+    ("STUDY (DATE):"), falling back to any inline date if the header
+    has no date. Reports with no parseable date get '00000000' so they
+    sort to the bottom under descending sort.
+    """
+    if not report:
+        return '00000000'
+    header = report.split('\n', 1)[0]
+    # Last "(...)" group right before the trailing colon is the date.
+    paren = re.findall(r'\(([^()]+)\)', header)
+    if paren:
+        normalized = _normalize_date_for_comparison(paren[-1].strip())
+        if re.fullmatch(r'\d{8}', normalized):
+            return normalized
+    # Last resort: try any MM/DD/YYYY or "MON DD, YYYY" anywhere in the
+    # first line of the body in case the header is dateless but the
+    # body mentions one (e.g. embedded "Exm Date:" leakage).
+    body_first = report.split('\n', 2)[1] if '\n' in report else ''
+    for cand in re.findall(
+        r'(\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
+        body_first,
+    ):
+        normalized = _normalize_date_for_comparison(cand)
+        if re.fullmatch(r'\d{8}', normalized):
+            return normalized
+    return '00000000'
 
 
 def extract_detailed_report_imaging(clinical_document: str) -> list:
@@ -135,6 +349,8 @@ def extract_detailed_report_imaging(clinical_document: str) -> list:
     """
     imaging_reports = []
 
+    # Use module-level IMAGING_KEYWORDS constant
+
     # Look for "Detailed Report" followed by imaging study names
     detailed_reports = re.finditer(
         r'Detailed Report\s+(.*?)(?=Detailed Report|Facility:|Performing Lab|Printed at:|={30,}|$)',
@@ -146,18 +362,42 @@ def extract_detailed_report_imaging(clinical_document: str) -> list:
         content = match.group(1).strip()
 
         # Check if this contains imaging keywords
-        if not re.search(r'(?:CT|MRI|ULTRASOUND|X-RAY|XRAY|RADIOGRAPH)', content, re.IGNORECASE):
+        if not re.search(IMAGING_KEYWORDS, content, re.IGNORECASE):
             continue
 
-        # Extract study name (first line after "Detailed Report" containing imaging keyword)
-        # The study name is typically on the first line, may have leading whitespace
+        # Extract study name - look for the FULL study name line
+        # The study name is typically on the first non-empty line, may have leading whitespace
         lines = content.split('\n')
         study_name = "Imaging Study"
-        for line in lines[:5]:  # Check first 5 lines
-            if re.search(r'(?:CT|MRI|ULTRASOUND|X-RAY|XRAY|RADIOGRAPH)', line, re.IGNORECASE):
-                # Exclude lines with "Exm Date:", "Req Phys:", etc
-                if not re.search(r'(?:Exm Date:|Req Phys:|Pat Loc:|Service:|Img Loc:)', line, re.IGNORECASE):
-                    study_name = line.strip()
+        for line in lines[:8]:  # Check first 8 lines (increased from 5)
+            line = line.strip()
+            if not line:
+                continue
+
+            # Match imaging keywords - must contain keyword AND not be metadata
+            if re.search(IMAGING_KEYWORDS, line, re.IGNORECASE):
+                # Exclude lines with metadata markers
+                if not re.search(r'(?:Exm Date:|Req Phys:|Pat Loc:|Service:|Img Loc:|Provider:|Performed:)', line, re.IGNORECASE):
+                    # Strip department prefix (e.g., "GENERAL RADIOLOGY")
+                    # VA format uses 2+ spaces OR single space between dept and study
+                    # Strategy: try double-space split first, fall back to keyword position
+                    parts = re.split(r'\s{2,}', line.strip())
+                    if len(parts) > 1:
+                        # Take the last part that contains an imaging keyword
+                        for part in reversed(parts):
+                            if re.search(IMAGING_KEYWORDS, part.strip(), re.IGNORECASE):
+                                study_name = part.strip()
+                                break
+                        else:
+                            study_name = parts[-1].strip()
+                    else:
+                        # Single-space separated — find the imaging keyword and take from there
+                        # This strips "GENERAL RADIOLOGY " prefix from "GENERAL RADIOLOGY MRI PROSTATE"
+                        kw_match = re.search(IMAGING_KEYWORDS, line.strip(), re.IGNORECASE)
+                        if kw_match:
+                            study_name = line.strip()[kw_match.start():]
+                        else:
+                            study_name = line.strip()
                     break
 
         # Extract date
@@ -178,6 +418,47 @@ def extract_detailed_report_imaging(clinical_document: str) -> list:
         if impression_match:
             impression = impression_match.group(1).strip()
 
+            # Filter out reading physician metadata and patient contact info
+            # Pattern: "READING PHYSICIAN: Name ID DATE TIME Timezone VHA..."
+            impression = re.sub(
+                r'READING PHYSICIAN:.*?(?=\d{1,2}\.\s+|$)',
+                '',
+                impression,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+
+            # Filter out VHA teleradiology contact info
+            impression = re.sub(
+                r'VHA National Teleradiology Program.*?(?=\d{1,2}\.\s+|$)',
+                '',
+                impression,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+
+            # Filter out patient/veteran disclaimers
+            impression = re.sub(
+                r'\(For Medical Practitioner Use Only\).*',
+                '',
+                impression,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            impression = re.sub(
+                r'Attention Patients\s*/\s*Veterans:.*',
+                '',
+                impression,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            impression = re.sub(
+                r'If you have questions or concerns.*',
+                '',
+                impression,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+
+            # Filter out phone numbers and numeric IDs
+            impression = re.sub(r'\d{3}-\d{3}-\d{4}', '', impression)  # Phone numbers
+            impression = re.sub(r'-?\d{10,}', '', impression)  # Long numeric IDs
+
             # Clean up whitespace
             impression = re.sub(r'\s+', ' ', impression)
             impression = impression.strip()
@@ -185,6 +466,38 @@ def extract_detailed_report_imaging(clinical_document: str) -> list:
             # Skip if too short
             if len(impression) < 10:
                 continue
+
+            # CRITICAL: Extract stone measurements from findings (not just impression)
+            # Pattern: "calculus...5-6 mm" or "stone measuring X mm" or "X mm calculus"
+            stone_measurements = []
+            stone_patterns = [
+                r'((?:left|right)\s+kidney[^.]*calcul(?:us|i)[^.]*?(\d+(?:-\d+)?\s*(?:mm|cm)))',
+                r'(echogenic\s+calcul(?:us|i)[^.]*?(?:measur(?:es|ing)|is)\s*(\d+(?:-\d+)?\s*(?:mm|cm)))',
+                r'((?:left|right)\s+(?:renal|kidney)[^.]*stone[^.]*?(\d+(?:-\d+)?\s*(?:mm|cm)))',
+                r'((\d+(?:-\d+)?\s*(?:mm|cm))\s+(?:calcul(?:us|i)|stone|nephrolith))',
+                r'(By measurement,?\s*(?:it\s+is\s*)?(\d+(?:-\d+)?\s*(?:mm|cm)))',
+            ]
+
+            for pattern in stone_patterns:
+                stone_match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
+                if stone_match:
+                    size = stone_match.group(2).strip() if stone_match.lastindex >= 2 else stone_match.group(1).strip()
+                    # Normalize size
+                    size = re.sub(r'\s+', '', size)
+                    if size and size not in stone_measurements:
+                        stone_measurements.append(size)
+
+            # Extract kidney laterality for stone findings
+            kidney_side = ""
+            if re.search(r'left\s+kidney', content, re.IGNORECASE):
+                kidney_side = "left"
+            elif re.search(r'right\s+kidney', content, re.IGNORECASE):
+                kidney_side = "right"
+
+            # Append stone details to impression if found
+            if stone_measurements:
+                stone_detail = f"{kidney_side.title() + ' ' if kidney_side else ''}stone size: {', '.join(stone_measurements)}"
+                impression = f"{impression}. FINDINGS: {stone_detail}"
 
             # Also check for cyst findings in Kidneys section (important for stone workup)
             cyst_match = re.search(
@@ -197,7 +510,10 @@ def extract_detailed_report_imaging(clinical_document: str) -> list:
                 # Clean up whitespace
                 cyst_finding = re.sub(r'\s+', ' ', cyst_finding)
                 # Append to impression
-                impression = f"{impression}. FINDINGS: {cyst_finding}"
+                if 'FINDINGS:' not in impression:
+                    impression = f"{impression}. FINDINGS: {cyst_finding}"
+                else:
+                    impression = f"{impression}; {cyst_finding}"
 
             # Format report
             if date:
@@ -248,18 +564,20 @@ def extract_human_readable_imaging(clinical_document: str) -> list:
     # 6.7 cm posterior superior pole mildly complex fluid attenuating cyst...
 
     # Split into individual studies
-    # Each study starts with text (may include uppercase, lowercase, numbers) and has a date in parentheses
-    # Updated pattern to handle:
-    # - Mixed case study names like "CT Urogram"
-    # - Content with or without "IMPRESSION:" prefix
-    # - Multi-line content that ends at next study or section boundary
-    study_pattern = r'([A-Z][A-Za-z0-9\s/\(\)]+(?:\([0-9/]+\))):?\s*\n(?:IMPRESSION:?\s*)?(.*?)(?=\n[A-Z][A-Za-z]+(?:[A-Za-z0-9\s/]+)?\([0-9/]+\):|={30,}|$)'
+    # Each study starts with a study name line containing an imaging keyword
+    # followed by a date in parentheses, e.g.:
+    #   CT ABD & PELVIS W/O & W/ IV CONTRAST (11/12/2019):
+    #   MRI PROSTATE W/O & W/ IV CONTRAST (8/29/25):
+    #   US RENAL BILATERAL (3/15/25):
+    # Study names can contain: letters, digits, spaces, /, &, -, W/O, W/
+    # The date is always in parentheses: (M/D/YY) or (MM/DD/YYYY)
+    study_pattern = r'([A-Za-z][A-Za-z0-9\s/&\-,.\(\)]+?\(\d{1,2}/\d{1,2}/\d{2,4}\)):?\s*\n(?:IMPRESSION:?\s*)?(.*?)(?=\n[A-Za-z][A-Za-z0-9\s/&\-,.]+?\(\d{1,2}/\d{1,2}/\d{2,4}\):?|={30,}|$)'
 
     for match in re.finditer(study_pattern, imaging_content, re.DOTALL):
         study_line = match.group(1).strip()
         impression = match.group(2).strip()
 
-        # Parse study name and date
+        # Parse study name and date from the matched study line
         study_date_match = re.match(r'(.+?)\s*\((\d{1,2}/\d{1,2}/\d{2,4})\)', study_line)
         if study_date_match:
             study_name = study_date_match.group(1).strip()
@@ -269,10 +587,7 @@ def extract_human_readable_imaging(clinical_document: str) -> list:
             date = ""
 
         # Clean up impression
-        # Remove "IMPRESSION:" prefix if it appears
         impression = re.sub(r'^IMPRESSION:\s*', '', impression, flags=re.IGNORECASE)
-
-        # Clean up whitespace
         impression = re.sub(r'\s+', ' ', impression)
         impression = impression.strip()
 
@@ -281,8 +596,6 @@ def extract_human_readable_imaging(clinical_document: str) -> list:
             continue
 
         # Format report
-        # Note: Don't add "IMPRESSION:" prefix if the content doesn't already have it
-        # The extracted content is the full imaging results/impression
         if date:
             report = f"{study_name} ({date}):\n{impression}"
         else:
@@ -319,8 +632,8 @@ def extract_va_format_imaging(clinical_document: str) -> list:
         if re.search(r'(?:URINALYSIS|CHEMISTRY|HEMATOLOGY|CBC|CMP|BMP|URINE|CLEAN CATCH)', section, re.IGNORECASE):
             continue
 
-        # Only process if section contains actual imaging keywords
-        if not re.search(r'(?:CT|MRI|ULTRASOUND|X-RAY|XRAY|RADIOGRAPH|SCAN|IMPRESSION)', section, re.IGNORECASE):
+        # Only process if section contains actual imaging keywords (use module-level constant)
+        if not re.search(IMAGING_KEYWORDS, section, re.IGNORECASE):
             continue
 
         # Extract study name/type
@@ -409,8 +722,8 @@ def extract_imaging_from_note(note_content: str) -> str:
         if re.search(r'(?:URINALYSIS|CHEMISTRY|HEMATOLOGY|CBC|CMP|BMP|URINE|CLEAN CATCH)', imaging_text, re.IGNORECASE):
             return ""
 
-        # Only return if it contains actual imaging keywords
-        if not re.search(r'(?:CT|MRI|ULTRASOUND|X-RAY|XRAY|RADIOGRAPH|SCAN|IMPRESSION)', imaging_text, re.IGNORECASE):
+        # Only return if it contains actual imaging keywords (use module-level constant)
+        if not re.search(IMAGING_KEYWORDS, imaging_text, re.IGNORECASE):
             return ""
 
         # Clean up whitespace
@@ -419,6 +732,249 @@ def extract_imaging_from_note(note_content: str) -> str:
         return imaging_text
 
     return ""
+
+
+def extract_external_imaging(clinical_document: str) -> list:
+    """
+    Extract imaging from external/non-VA facilities (BAMC, SAMC, civilian hospitals).
+
+    These reports have a simpler format:
+    BAMC Prostate MRI
+    27 mL
+    Right anterior PIRADS 4
+
+    Or in note context:
+    Prostate MRI (BAMC):
+    - 27 mL
+    - Right anterior PIRADS 4
+
+    Returns:
+        List of imaging report strings
+    """
+    imaging_reports = []
+
+    # Pattern 1: "[FACILITY] [Study Type] MRI/CT/US" followed by findings
+    external_pattern = r'(?:^|\n)([A-Z]{2,5})\s+(Prostate|Kidney|Bladder|Renal)\s+(MRI|CT|US|Ultrasound)\s*\n((?:[^\n]+\n?){1,5}?)(?=\n\s*(?:PAST|MEDICATIONS|ALLERGIES|===|$)|\n\n)'
+
+    for match in re.finditer(external_pattern, clinical_document, re.IGNORECASE | re.MULTILINE):
+        facility = match.group(1).upper()
+        body_part = match.group(2).strip()
+        modality = match.group(3).upper()
+        findings_block = match.group(4).strip()
+
+        if not findings_block:
+            continue
+
+        # Parse findings
+        findings = []
+        for line in findings_block.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith('==='):
+                # Remove bullet markers
+                line = re.sub(r'^[-•]\s*', '', line)
+                if line:
+                    findings.append(line)
+
+        if not findings:
+            continue
+
+        # Build report
+        study_name = f"{facility} {body_part} {modality}"
+        findings_text = '; '.join(findings)
+        report = f"{study_name}:\n{findings_text}"
+
+        imaging_reports.append(report)
+
+    # Pattern 2: "Prostate MRI" within pathology section (BAMC format)
+    # Look for pattern after "Prostate Cancer Biopsy at [FACILITY]"
+    pathology_mri_pattern = r'(?:^|\n)([A-Z]{2,5})\s+Prostate\s+MRI\s*\n((?:[^\n]+\n?){1,3}?)(?=\n\s*(?:PAST|MEDICATIONS|$)|\n\n)'
+
+    for match in re.finditer(pathology_mri_pattern, clinical_document, re.IGNORECASE | re.MULTILINE):
+        facility = match.group(1).upper()
+        findings_block = match.group(2).strip()
+
+        if not findings_block:
+            continue
+
+        findings = []
+        for line in findings_block.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#'):
+                line = re.sub(r'^[-•]\s*', '', line)
+                if line:
+                    findings.append(line)
+
+        if findings:
+            study_name = f"{facility} Prostate MRI"
+            findings_text = '; '.join(findings)
+            report = f"{study_name}:\n{findings_text}"
+
+            # Avoid duplicates
+            if report not in imaging_reports:
+                imaging_reports.append(report)
+
+    return imaging_reports
+
+
+def extract_cprs_format_imaging(clinical_document: str) -> list:
+    """
+    Extract CPRS "report-verified" format imaging.
+
+    Layout (one study per block):
+
+        Exam Date/Time
+         05/07/2026 10:44
+        Procedure Name
+         MRI, PROSTATE W/O & W/CONTRAST
+        Reason for Study
+         Multiparametric study
+        Clinical History
+         Elevated PSA
+        Impression
+
+
+         Moderate transitional zone hypertrophy.  No suspicious prostate lesion (no
+         PI-RADS 3-5 lesion).
+
+         Signed by DASHARTHA HARSEWAK, MD on 5/12/2026 10:14 AM CDT
+        Report
+         EXAM: MRI, PROSTATE W/O & W/CONTRAST
+         ...
+
+    Each "header" is a bareword line (e.g. "Procedure Name"); the value
+    follows on one or more indented lines. The Impression block ends at
+    "Signed by", "Report", "Facility:", "Printed at:", a "====" divider,
+    or the start of the next study ("Exam Date/Time").
+
+    Returns:
+        List of imaging report strings (one per study).
+    """
+    imaging_reports: list = []
+
+    # Anchor on "Procedure Name" so we don't accidentally pick up sections
+    # that have "Exam Date/Time" but no procedure (lab specimens etc.).
+    # Capture (in order):
+    #   1. The procedure value (study name)
+    #   2. The optional Exam Date/Time block — looked up separately, since
+    #      it can appear BEFORE Procedure Name in this layout.
+    block_pat = re.compile(
+        r'^Procedure Name\s*\n'
+        r'(?P<study>[^\n]+(?:\n[ \t]+[^\n]+)*)\n'
+        r'(?P<rest>.*?)'
+        r'(?=^Procedure Name\s*$|^={30,}\s*$|^Facility:|^Printed at:|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+
+    impression_pat = re.compile(
+        r'^Impression\s*\n'
+        r'(?P<imp>.*?)'
+        r'(?=^Report\s*$|^Signed by |^Facility:|^Printed at:|^={30,}\s*$|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+
+    # Walk the document looking for blocks. For each block we also
+    # look BACK at the preceding ~10 lines for an "Exam Date/Time" header
+    # since CPRS places it just before Procedure Name.
+    for match in block_pat.finditer(clinical_document):
+        study_raw = match.group('study').strip()
+        # Collapse multi-line study name to a single line and strip CPRS's
+        # leading single-space indent.
+        study_name = re.sub(r'\s+', ' ', study_raw).strip()
+
+        # Must contain an imaging keyword — otherwise skip (filters out
+        # non-imaging procedures like dental extractions that share this
+        # bareword-header layout).
+        if not re.search(IMAGING_KEYWORDS, study_name, re.IGNORECASE):
+            continue
+
+        rest = match.group('rest')
+
+        # Date: look in the 400 chars BEFORE this "Procedure Name" line
+        # for a date in any of three layouts CPRS uses, in priority order:
+        #   1. "Exam Date/Time\n MM/DD/YYYY HH:MM"   (explicit label)
+        #   2. A bareword "MM/DD/YYYY[ HH:MM]" line  sitting on its own
+        #      immediately before "Procedure Name". Some VA exports skip
+        #      the label entirely and just stamp the date+time on a
+        #      single line above the block. Without this branch the
+        #      block emerges as an undated MRI in the rendered note.
+        #   3. "Exm Date:" / "Date Reported:" / "Date Verified:" inline
+        #      inside the rest block (last-ditch fallback).
+        block_start = match.start()
+        prefix = clinical_document[max(0, block_start - 400):block_start]
+        date_str = ""
+        prefix_match = re.search(
+            r'Exam Date/Time\s*\n[ \t]+(\d{1,2}/\d{1,2}/\d{2,4}(?:[ \t]+\d{1,2}:\d{2})?)',
+            prefix,
+        )
+        if prefix_match:
+            date_str = prefix_match.group(1).strip()
+        if not date_str:
+            # Bareword date line right before Procedure Name. Match
+            # against the TAIL of the prefix so we don't grab an
+            # earlier unrelated date elsewhere in the 400-char window.
+            bareword_match = re.search(
+                r'(?:^|\n)\s*'
+                r'(\d{1,2}/\d{1,2}/\d{2,4})'
+                r'(?:[ \t]+\d{1,2}:\d{2}(?:\s*(?:AM|PM))?)?'
+                r'\s*\n\s*\Z',
+                prefix,
+                re.IGNORECASE,
+            )
+            if bareword_match:
+                date_str = bareword_match.group(1).strip()
+        if not date_str:
+            inline_match = re.search(
+                r'(?:Exm Date|Date Reported|Date Verified):\s*'
+                r'([A-Z]{3}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})',
+                rest,
+                re.IGNORECASE,
+            )
+            if inline_match:
+                date_str = inline_match.group(1).strip()
+
+        # Normalize the date to just MM/DD/YYYY (strip the time component
+        # if present) so the downstream dedupe key matches other formats.
+        if date_str:
+            date_only = re.match(r'(\d{1,2}/\d{1,2}/\d{2,4})', date_str)
+            if date_only:
+                date_str = date_only.group(1)
+
+        # Impression: find the impression block within `rest`.
+        imp_match = impression_pat.search(rest)
+        if not imp_match:
+            continue
+        impression = imp_match.group('imp')
+
+        # Strip CPRS's per-line leading space and collapse blank-line runs.
+        impression_lines = [ln.strip() for ln in impression.split('\n')]
+        # Drop trailing "Signed by ..." that may have leaked past the lookahead.
+        impression_lines = [
+            ln for ln in impression_lines if not ln.startswith('Signed by ')
+        ]
+        impression = ' '.join(ln for ln in impression_lines if ln).strip()
+
+        # Filter out boilerplate that occasionally bleeds in.
+        impression = re.sub(
+            r'\(For Medical Practitioner Use Only\).*', '', impression,
+            flags=re.IGNORECASE,
+        )
+        impression = re.sub(
+            r'Attention Patients\s*/\s*Veterans:.*', '', impression,
+            flags=re.IGNORECASE,
+        )
+        impression = re.sub(r'\s+', ' ', impression).strip()
+
+        if len(impression) < 10:
+            continue
+
+        if date_str:
+            report = f"{study_name} ({date_str}):\nIMPRESSION: {impression}"
+        else:
+            report = f"{study_name}:\nIMPRESSION: {impression}"
+
+        imaging_reports.append(report)
+
+    return imaging_reports
 
 
 def validate_imaging_completeness(impression_text: str, study_name: str = "") -> tuple:

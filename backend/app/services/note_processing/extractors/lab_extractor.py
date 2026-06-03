@@ -5,6 +5,16 @@ Extracts general laboratory results from clinical documents.
 """
 
 import re
+from datetime import datetime, timedelta
+from typing import Optional
+
+from .temporal_lab_filter import (
+    extract_date_from_lab_line,
+    parse_lab_date,
+)
+
+
+GENERAL_LABS_WINDOW_MONTHS = 6
 
 
 # Lab filtering configuration
@@ -119,15 +129,22 @@ def _is_reasonable_lab_value(test_name: str, lab_line: str) -> bool:
     return True  # Value is reasonable or test not in sanity check list
 
 
-def extract_labs(clinical_document: str) -> str:
+def extract_labs(clinical_document: str, visit_date: str = "") -> str:
     """
     Extract general lab results from clinical documents.
 
     Extracts lab values with collection dates while filtering VA administrative metadata.
     Supports both VA format and human-readable format.
 
+    Applies a 6-month recency window relative to ``visit_date`` (or now() when
+    no visit_date is supplied). The recency window applies ONLY to general
+    LABS — not to ENDOCRINE, PSA, Pathology, Stone, or other dedicated
+    sections, which are extracted by their own extractors.
+
     Args:
         clinical_document: Full clinical document
+        visit_date: Reference date for recency filtering (e.g. "07/07/2025").
+                    If empty, current date is used.
 
     Returns:
         Clean lab results with dates, or "" if not found
@@ -149,20 +166,98 @@ def extract_labs(clinical_document: str) -> str:
     if not lab_lines:
         return ""
 
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_labs = []
-    for line in lab_lines:
-        # Create a normalized key for deduplication
-        normalized = line.lower().strip()
-        if normalized not in seen:
-            seen.add(normalized)
+    # Remove duplicates while preserving order and prioritizing entries WITH dates
+    # Key: normalized lab name/value (without date)
+    # Value: full line (prefer line with date)
+    lab_dict = {}
 
-            # Filter out non-lab lines (medications, patient IDs, etc.)
-            if _is_valid_lab_line(line):
-                unique_labs.append(line)
+    for line in lab_lines:
+        # Filter out non-lab lines (medications, patient IDs, etc.)
+        if not _is_valid_lab_line(line):
+            continue
+
+        # Extract the lab test name for deduplication
+        # Remove dates from the key to group similar entries
+        date_stripped = re.sub(r'\s*\([A-Za-z]{3}\s+\d{1,2},\s+\d{4}\)\s*$', '', line)
+        date_stripped = re.sub(r'\s*-\s*[A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s*$', '', date_stripped)
+        normalized_key = date_stripped.lower().strip()
+
+        # Check if this line has a date
+        has_date = bool(re.search(r'\([A-Za-z]{3}\s+\d{1,2},\s+\d{4}\)', line) or
+                       re.search(r'-\s*[A-Za-z]{3}\s+\d{1,2},\s+\d{4}', line))
+
+        # If we haven't seen this lab before, or if this version has a date and old one doesn't
+        if normalized_key not in lab_dict:
+            lab_dict[normalized_key] = line
+        elif has_date:
+            # Check if existing entry has a date
+            existing = lab_dict[normalized_key]
+            existing_has_date = bool(re.search(r'\([A-Za-z]{3}\s+\d{1,2},\s+\d{4}\)', existing) or
+                                    re.search(r'-\s*[A-Za-z]{3}\s+\d{1,2},\s+\d{4}', existing))
+            if not existing_has_date:
+                # Replace dateless entry with dated one
+                lab_dict[normalized_key] = line
+
+    # Return unique labs preserving approximate input order
+    unique_labs = list(lab_dict.values())
+
+    # Apply 6-month recency filter for general LABS (does not affect
+    # endocrine, PSA, pathology, or other sections — those have their own
+    # extractors). Lines without parseable dates are kept (assumed recent).
+    unique_labs = _filter_labs_to_recent(unique_labs, visit_date)
 
     return '\n'.join(unique_labs) if unique_labs else ""
+
+
+def _parse_visit_date(visit_date: str) -> Optional[datetime]:
+    """Parse a visit_date string in common formats."""
+    if not visit_date:
+        return None
+    visit_date = visit_date.strip()
+    formats = [
+        '%m/%d/%Y', '%m/%d/%y',
+        '%Y-%m-%d',
+        '%b %d, %Y', '%B %d, %Y', '%b %d %Y',
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(visit_date, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _filter_labs_to_recent(lab_lines: list, visit_date: str = "") -> list:
+    """
+    Drop lab lines older than GENERAL_LABS_WINDOW_MONTHS (6 months) from
+    the supplied visit_date. Lines without parseable dates are kept.
+
+    Visit_date is parsed using common clinical formats (M/D/YYYY etc.).
+    If visit_date cannot be parsed, current date is used.
+    """
+    reference = _parse_visit_date(visit_date) or datetime.now()
+    cutoff = reference - timedelta(days=GENERAL_LABS_WINDOW_MONTHS * 30)
+
+    filtered = []
+    for line in lab_lines:
+        date_str = extract_date_from_lab_line(line)
+        # Many human-readable lines also have inline 'Panel (M/D/YY): ...'
+        # patterns that extract_date_from_lab_line may not catch — try the
+        # leading panel prefix as a fallback.
+        if not date_str:
+            panel_match = re.match(
+                r'^[A-Za-z][A-Za-z0-9 ]+\(([^)]+)\):',
+                line
+            )
+            if panel_match:
+                date_str = panel_match.group(1).strip()
+        lab_date = parse_lab_date(date_str) if date_str else None
+        if lab_date is None:
+            filtered.append(line)
+            continue
+        if lab_date >= cutoff:
+            filtered.append(line)
+    return filtered
 
 
 def _is_valid_lab_line(line: str) -> bool:
@@ -177,14 +272,28 @@ def _is_valid_lab_line(line: str) -> bool:
     """
     line_upper = line.upper().strip()
 
-    # Filter out medication names (end with dosage forms)
-    medication_endings = [
+    # Filter out medication names (contain dosage forms)
+    # Check for these patterns ANYWHERE in the line, not just endings
+    medication_indicators = [
         'TAB', 'CAP', 'CAPSULE', 'TABLET', 'MG TAB', 'MG CAP',
         'OINT', 'CREAM', 'GEL', 'PATCH', 'SOLUTION', 'SYRUP',
-        'INJ', 'INJECTION', 'SUSP', 'SUSPENSION'
+        'INJ', 'INJECTION', 'SUSP', 'SUSPENSION', 'INHL', 'INHALER',
+        'OUTPT', 'OUTPATIENT',  # VA medication prefixes
+        'STATUS = EXPIRED', 'STATUS = ACTIVE', 'STATUS = DISCONTINUED',  # Medication status
+        'RX#', 'REFILLS', 'QTY/DAYS'  # Prescription details
     ]
-    for ending in medication_endings:
-        if line_upper.endswith(ending):
+    for indicator in medication_indicators:
+        if indicator in line_upper:
+            return False
+
+    # Filter out non-lab sections
+    non_lab_patterns = [
+        'MEDICATION', 'PRESCRIPTION', 'TAKE ', 'APPLY ', 'INSTILL ',
+        'SPRAY ', 'FOR PAIN', 'FOR ALLERGIES', 'FOR HIGH BLOOD',
+        'DAILY', 'TWICE A DAY', 'EVERY DAY'
+    ]
+    for pattern in non_lab_patterns:
+        if pattern in line_upper:
             return False
 
     # Filter out patient identifiers (SSN patterns, Age/Sex info)
@@ -195,14 +304,31 @@ def _is_valid_lab_line(line: str) -> bool:
     if re.match(r'^[A-Z]+,[A-Z\s]+\s+\d{3}-\d{2}-\d{4}', line):  # Name with SSN
         return False
 
+    # Filter out VA administrative lines
+    va_admin_patterns = [
+        'ISSUE:', 'LAST :', 'EXPR :', 'INDICATION:',
+        'NON-VA MEDS', 'REMOTE AND LOCAL', 'DISCLAIMER'
+    ]
+    for pattern in va_admin_patterns:
+        if pattern in line_upper:
+            return False
+
+    # Filter out ENDOCRINE LABS - these should appear in ENDOCRINE LABS section, not general LABS
+    # This prevents duplication with endocrine_extractor.py
+    endocrine_markers = [
+        'TESTOSTERONE', 'ESTROGEN', 'PROLACTIN', 'CORTISOL', 'ALDOSTERONE',
+        'METANEPHRINE', 'EPINEPHRINE', 'NOREPINEPHRINE', 'C-PEPTIDE',
+        'GAD65', 'GLUTAMIC ACID DECARBOXYLASE',
+        'LH ', 'FSH ', 'LUTEINIZING', 'FOLLICLE-STIMULATING',
+        'ALPHA FETOPROTEIN', 'AFP ', 'HUMAN CHORIONIC', 'HCG ',
+        'LDH ', 'LACTATE DEHYDROGENASE'
+    ]
+    for marker in endocrine_markers:
+        if marker in line_upper:
+            return False
+
     # Valid lab lines typically contain numbers and units
     has_number = re.search(r'\d+\.?\d*', line)
-
-    # REMOVED: Overly aggressive date requirement
-    # The extraction functions (extract_human_readable_labs, extract_va_format_labs)
-    # already handle date formatting and attach dates to lab results.
-    # Requiring a date here was filtering out all labs because the date pattern
-    # didn't match the various date formats returned by extraction functions.
 
     # If no number, it's probably not a lab result
     if not has_number:
@@ -327,6 +453,55 @@ def extract_human_readable_labs(clinical_document: str) -> list:
         values = re.sub(r'\s+', ' ', values)
 
         lab_results.append(f"{panel_name} ({date}): {values}")
+
+    # Pattern 2b: Panel format with MMM D, YYYY date "Panel (Nov 6, 2025): VALUES"
+    # Matches: "CBC (Nov 6, 2025): WBC 6.3, Hgb 16.2"
+    panel_pattern_mmm = r'([A-Z][A-Za-z0-9]+(?:\s+[A-Za-z0-9]+)*)\s*\(([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\):\s*([^\n]+)'
+
+    for match in re.finditer(panel_pattern_mmm, labs_content):
+        panel_name = match.group(1).strip()
+        date = match.group(2).strip()
+        values = match.group(3).strip()
+
+        # Clean up line breaks and excessive whitespace
+        values = re.sub(r'\s+', ' ', values)
+
+        # Skip endocrine markers (they go in ENDOCRINE section)
+        panel_upper = panel_name.upper()
+        if any(marker in panel_upper for marker in endocrine_markers):
+            continue
+
+        result_str = f"{panel_name} ({date}): {values}"
+        if result_str not in lab_results:
+            lab_results.append(result_str)
+
+    # Pattern 2c: Lab with date at end "TEST: value (DATE)" or "TEST: value - DATE"
+    # Matches: "HbA1c: 6.0% (Nov 6, 2025)" or "Vitamin D: 29.3 (L) (Nov 6, 2025)"
+    lab_with_date_pattern = r'^([A-Za-z][A-Za-z0-9 ]+):\s*(.+?)\s*\(([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\)\s*$'
+
+    for line in labs_content.split('\n'):
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
+        match = re.match(lab_with_date_pattern, line_stripped, re.MULTILINE)
+        if match:
+            test_name = match.group(1).strip()
+            value = match.group(2).strip()
+            date = match.group(3).strip()
+
+            # Skip endocrine markers
+            test_name_upper = test_name.upper()
+            if any(marker in test_name_upper for marker in endocrine_markers):
+                continue
+
+            # Skip PSA (handled separately)
+            if 'PSA' in test_name_upper:
+                continue
+
+            result_str = f"{test_name}: {value} ({date})"
+            if result_str not in lab_results:
+                lab_results.append(result_str)
 
     # Pattern 3: Urinalysis format "Urinalysis (DATE): VALUES"
     urinalysis_pattern = r'(Urinalysis)\s*\((\d{1,2}/\d{1,2}/\d{2,4})\):\s*([^\n]+(?:\n(?!\d{1,2}/\d{1,2}/|[A-Z][a-z]+ panel|Urinalysis)[^\n]+)*)'

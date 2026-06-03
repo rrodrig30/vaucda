@@ -147,34 +147,35 @@ class RAGRetriever:
         query_embedding = self.embedder.generate_embedding(query)
 
         # Execute hybrid search in Neo4j
-        # This uses both vector index and full-text index
+        # This uses vector index on chunks
         neo4j_query = """
-        // Vector search
-        CALL db.index.vector.queryNodes('document_embeddings', $k * 2, $query_embedding)
-        YIELD node AS doc_vector, score AS vector_score
+        // Vector search on chunks
+        CALL db.index.vector.queryNodes('chunk_embeddings', $k * 2, $query_embedding)
+        YIELD node AS chunk, score AS vector_score
 
-        // Keyword search using full-text index
-        CALL db.index.fulltext.queryNodes('document_fulltext', $query_text)
-        YIELD node AS doc_keyword, score AS keyword_score
+        // Get parent document
+        MATCH (chunk)-[:BELONGS_TO]->(doc:Document)
+        WHERE ($category IS NULL OR doc.category = $category)
 
-        // Combine results
-        WITH doc_vector, vector_score, doc_keyword, keyword_score
-        WHERE doc_vector.id = doc_keyword.id
-          AND ($category IS NULL OR doc_vector.category = $category)
+        // Apply keyword boost if query text matches content
+        WITH doc, chunk, vector_score,
+             CASE WHEN toLower(chunk.content) CONTAINS toLower($query_text)
+                  THEN 0.1 ELSE 0.0 END AS keyword_boost
 
         // Compute hybrid score
-        WITH doc_vector AS doc,
-             ($vector_weight * vector_score + $keyword_weight * keyword_score) AS hybrid_score
+        WITH doc, chunk,
+             ($vector_weight * vector_score + $keyword_weight * keyword_boost) AS hybrid_score
 
-        RETURN doc.id AS doc_id,
+        RETURN DISTINCT doc.id AS doc_id,
                doc.title AS title,
-               doc.content AS content,
+               chunk.content AS content,
                doc.summary AS summary,
                doc.source AS source,
                doc.category AS category,
                doc.version AS version,
                doc.publication_date AS publication_date,
-               hybrid_score AS similarity_score
+               hybrid_score AS similarity_score,
+               chunk.id AS chunk_id
         ORDER BY hybrid_score DESC
         LIMIT $k
         """

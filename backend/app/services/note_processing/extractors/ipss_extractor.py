@@ -7,7 +7,7 @@ Extracts IPSS scoring tables from clinical notes.
 import re
 
 
-def extract_ipss(note_content: str) -> str:
+def extract_ipss(note_content: str, visit_date: str = "") -> str:
     """
     Extract IPSS table from a clinical note.
 
@@ -39,8 +39,23 @@ def extract_ipss(note_content: str) -> str:
         # No IPSS section found
         return ""
 
-    # Start searching from the IPSS header
+    # Extract date from the IPSS header line if present
+    # e.g., "IPSS Scores (2/18/25):" or "IPSS (02/18/2025):"
     search_start = ipss_section_match.start()
+    header_line = note_content[search_start:search_start + 200].split('\n')[0]
+    ipss_date = ""
+    date_in_header = re.search(r'\((\d{1,2}/\d{1,2}(?:/\d{2,4})?)\)', header_line)
+    if date_in_header:
+        ipss_date = date_in_header.group(1)
+
+    # Fallback: use visit_date parameter, then look for VISIT DATE: in text
+    if not ipss_date and visit_date:
+        ipss_date = visit_date
+    if not ipss_date:
+        visit_date_match = re.search(r'VISIT DATE:\s*(\S+)', note_content)
+        if visit_date_match:
+            ipss_date = visit_date_match.group(1)
+
     remaining_content = note_content[search_start:]
 
     # Find first "+" after IPSS header
@@ -82,5 +97,9 @@ def extract_ipss(note_content: str) -> str:
 
     # Join the table lines
     ipss_table = '\n'.join(table_lines).strip()
+
+    # Prepend the date if found
+    if ipss_date and ipss_table:
+        ipss_table = f"IPSS Date: {ipss_date}\n{ipss_table}"
 
     return ipss_table

@@ -43,7 +43,7 @@ LLM Providers:
 cd /home/gulab/PythonProjects/VAUCDA/backend
 
 # Copy environment template
-cp .env.example .env
+cp .env .env
 
 # Edit .env file with your configuration
 nano .env
@@ -265,7 +265,7 @@ alembic history
 
 1. **Configure Environment**
    ```bash
-   cp .env.example .env
+   cp .env .env
    # Edit .env with production values
    ```
 

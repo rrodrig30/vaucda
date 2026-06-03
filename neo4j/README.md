@@ -8,7 +8,7 @@ Production-ready Neo4j database architecture for VAUCDA's hybrid graph + vector 
 
 ```bash
 # Copy environment template
-cp .env.example .env
+cp .env .env
 
 # Edit with your secure password
 nano .env

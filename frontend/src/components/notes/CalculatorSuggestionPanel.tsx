@@ -399,28 +399,81 @@ export const CalculatorSuggestionPanel: React.FC<CalculatorSuggestionPanelProps>
                   {/* Expanded Details */}
                   {isExpanded && (
                     <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 space-y-3">
-                      {/* Detected Values */}
+                      {/* Detected Values - Now Editable */}
                       {suggestion.available_inputs.length > 0 && (
                         <div>
                           <h5 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                            Detected Values:
+                            Detected Values <span className="text-xs font-normal text-gray-500">(click to edit)</span>:
                           </h5>
                           <div className="grid grid-cols-2 gap-2">
-                            {suggestion.available_inputs.map(input => (
-                              <div
-                                key={input}
-                                className="p-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded text-sm"
-                              >
-                                <div className="font-medium text-gray-700 dark:text-gray-300">
-                                  {input.replace(/_/g, ' ')}
+                            {suggestion.available_inputs.map(input => {
+                              // Check if user has overridden this value
+                              const hasOverride = additionalInputs[input] !== undefined
+                              const displayValue = hasOverride
+                                ? additionalInputs[input]
+                                : suggestion.detected_entities[input]
+                              const inputMeta = inputSchemas[suggestion.calculator_id]?.find(
+                                meta => meta.field_name === input
+                              )
+                              const isBoolean = inputMeta?.input_type === 'boolean' ||
+                                typeof displayValue === 'boolean'
+                              const isNumeric = inputMeta?.input_type === 'numeric' ||
+                                typeof displayValue === 'number'
+
+                              return (
+                                <div
+                                  key={input}
+                                  className={clsx(
+                                    'p-2 border rounded text-sm',
+                                    hasOverride
+                                      ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800'
+                                      : 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800'
+                                  )}
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <div className="font-medium text-gray-700 dark:text-gray-300">
+                                      {input.replace(/_/g, ' ')}
+                                    </div>
+                                    {hasOverride && (
+                                      <span className="text-xs text-blue-600 dark:text-blue-400">edited</span>
+                                    )}
+                                  </div>
+                                  <div className="mt-1">
+                                    {isBoolean ? (
+                                      <select
+                                        value={displayValue === true ? 'true' : displayValue === false ? 'false' : ''}
+                                        onChange={(e) => {
+                                          const val = e.target.value === 'true' ? true : e.target.value === 'false' ? false : undefined
+                                          onAdditionalInputChange(input, val)
+                                        }}
+                                        className="w-full px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary focus:border-transparent"
+                                      >
+                                        <option value="true">Yes</option>
+                                        <option value="false">No</option>
+                                      </select>
+                                    ) : isNumeric ? (
+                                      <input
+                                        type="number"
+                                        value={displayValue ?? ''}
+                                        onChange={(e) => {
+                                          const val = e.target.value ? parseFloat(e.target.value) : undefined
+                                          onAdditionalInputChange(input, val)
+                                        }}
+                                        className="w-full px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary focus:border-transparent"
+                                        step="any"
+                                      />
+                                    ) : (
+                                      <input
+                                        type="text"
+                                        value={displayValue !== undefined ? String(displayValue) : ''}
+                                        onChange={(e) => onAdditionalInputChange(input, e.target.value)}
+                                        className="w-full px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary focus:border-transparent"
+                                      />
+                                    )}
+                                  </div>
                                 </div>
-                                <div className="text-gray-900 dark:text-white font-semibold">
-                                  {suggestion.detected_entities[input] !== undefined
-                                    ? String(suggestion.detected_entities[input])
-                                    : '-'}
-                                </div>
-                              </div>
-                            ))}
+                              )
+                            })}
                           </div>
                         </div>
                       )}

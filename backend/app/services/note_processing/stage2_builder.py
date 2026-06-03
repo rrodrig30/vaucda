@@ -11,12 +11,18 @@ Stage 2 leverages:
 - Ambient listening transcript (real-time conversation)
 - Calculator results (44 specialized urologic calculators)
 - RAG content (evidence-based guidelines from Neo4j)
+- Active RAG/GraphRAG retrieval based on clinical context
+- Task-specific LLM configuration
 """
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, TYPE_CHECKING
 import logging
+import re
 from .agents.assessment_agent import synthesize_assessment
 from .agents.plan_agent import synthesize_plan
+
+if TYPE_CHECKING:
+    from app.services.llm_config_manager import LLMTaskConfig
 from .agents.prior_ap_agent import (
     synthesize_prior_ap_context,
     format_prior_ap_for_assessment,
@@ -32,6 +38,199 @@ from .extractors.specialty_urologic_scanner import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# NOTE: RAG RETRIEVAL ARCHITECTURE
+# =============================================================================
+# RAG retrieval currently happens in the API layer (notes.py), NOT in this module.
+# The API layer uses rag_query_builder.py for query generation, then passes
+# the retrieved rag_content to build_stage2_note() as a parameter.
+#
+# The functions below (build_targeted_rag_queries, retrieve_active_rag_context)
+# are ASYNC utilities that can be used for future active RAG implementations
+# if needed. They are not currently invoked in the production flow.
+# =============================================================================
+
+
+async def build_targeted_rag_queries(
+    stage1_note: str,
+    chief_complaint: Optional[str] = None,
+    max_queries: int = 3
+) -> List[str]:
+    """
+    Build targeted RAG queries from Stage 1 note clinical content.
+
+    NOTE: This async function is currently NOT used in production.
+    RAG queries are built in notes.py using rag_query_builder.py (sync version).
+    This function is available for future active RAG implementations.
+
+    Analyzes the Stage 1 note to extract key clinical concepts for RAG retrieval.
+
+    Args:
+        stage1_note: Complete Stage 1 note
+        chief_complaint: Extracted chief complaint (if already parsed)
+        max_queries: Maximum number of queries to generate
+
+    Returns:
+        List of targeted query strings for RAG retrieval
+    """
+    queries = []
+
+    # 1. Extract Chief Complaint for primary query
+    if chief_complaint:
+        cc = chief_complaint
+    else:
+        cc_match = re.search(r'CC:\s*(.+?)(?:\n|$)', stage1_note, re.IGNORECASE)
+        cc = cc_match.group(1).strip() if cc_match else None
+
+    if cc:
+        # Create query focused on management guidelines
+        cc_clean = cc.lower().replace('followup', '').replace('follow-up', '').replace('follow up', '').strip()
+        if cc_clean:
+            queries.append(f"{cc_clean} management guidelines AUA NCCN")
+
+    # 2. Extract cancer diagnoses for treatment guidelines
+    cancer_patterns = [
+        r'(?:prostate\s+)?(?:adenocarcinoma|carcinoma)\s+(?:gleason|grade\s+group)',
+        r'bladder\s+(?:cancer|carcinoma|tumor)',
+        r'urothelial\s+(?:cancer|carcinoma)',
+        r'renal\s+(?:cell\s+)?(?:cancer|carcinoma)',
+        r'kidney\s+(?:cancer|tumor|mass)',
+        r'testicular\s+(?:cancer|tumor|mass)',
+    ]
+
+    for pattern in cancer_patterns:
+        match = re.search(pattern, stage1_note, re.IGNORECASE)
+        if match and len(queries) < max_queries:
+            cancer_type = match.group(0).strip()
+            queries.append(f"{cancer_type} treatment options NCCN guidelines")
+            break
+
+    # 3. Extract BPH/LUTS for medical management
+    if re.search(r'\b(?:BPH|LUTS|IPSS)\b', stage1_note, re.IGNORECASE):
+        if len(queries) < max_queries:
+            queries.append("BPH LUTS management AUA guidelines medical therapy")
+
+    # 4. Extract stone disease
+    if re.search(r'\b(?:kidney\s+stone|renal\s+calcul|urolithiasis|nephrolithiasis)\b', stage1_note, re.IGNORECASE):
+        if len(queries) < max_queries:
+            queries.append("kidney stone nephrolithiasis management AUA guidelines")
+
+    # 5. Extract PSA surveillance queries
+    if re.search(r'PSA\s+(?:surveillance|monitoring|followup)', stage1_note, re.IGNORECASE):
+        if len(queries) < max_queries:
+            queries.append("PSA surveillance prostate cancer monitoring guidelines")
+
+    # 6. Extract hematuria
+    if re.search(r'\bhematuria\b', stage1_note, re.IGNORECASE):
+        if len(queries) < max_queries:
+            queries.append("hematuria workup evaluation AUA guidelines")
+
+    # Ensure at least one query
+    if not queries:
+        # Generic urology query based on note content
+        queries.append("urology clinical guidelines evidence-based management")
+
+    logger.info(f"Generated {len(queries)} targeted RAG queries")
+    return queries[:max_queries]
+
+
+async def retrieve_active_rag_context(
+    stage1_note: str,
+    rag_pipeline,
+    task_config: Optional["LLMTaskConfig"] = None,
+    max_queries: int = 3
+) -> tuple[str, List[Dict[str, str]]]:
+    """
+    Actively retrieve RAG context based on clinical content in Stage 1 note.
+
+    NOTE: This async function is currently NOT used in production.
+    RAG retrieval happens in notes.py and the resulting rag_content is passed
+    to build_stage2_note(). This function is available for future active RAG
+    implementations that require retrieval within the stage2_builder module.
+
+    This performs ACTIVE retrieval by:
+    1. Analyzing the Stage 1 note to identify key clinical concepts
+    2. Building targeted queries for each concept
+    3. Retrieving relevant guidelines via RAG/GraphRAG
+    4. Assembling context for Assessment & Plan synthesis
+
+    Args:
+        stage1_note: Complete Stage 1 note
+        rag_pipeline: Initialized RAG pipeline instance
+        task_config: LLMTaskConfig with RAG settings (use_rag, use_graphrag, rag_top_k)
+        max_queries: Maximum number of queries to generate
+
+    Returns:
+        Tuple of (assembled context string, list of sources)
+    """
+    # Get RAG settings from task_config or use defaults
+    use_rag = True
+    use_graphrag = True
+    rag_top_k = 5
+
+    if task_config:
+        use_rag = getattr(task_config, 'use_rag', True)
+        use_graphrag = getattr(task_config, 'use_graphrag', True)
+        rag_top_k = getattr(task_config, 'rag_top_k', 5)
+
+    if not use_rag and not use_graphrag:
+        logger.info("RAG/GraphRAG disabled in task config, skipping retrieval")
+        return "", []
+
+    # Generate targeted queries
+    queries = await build_targeted_rag_queries(
+        stage1_note=stage1_note,
+        max_queries=max_queries
+    )
+
+    all_context_parts = []
+    all_sources = []
+    seen_doc_ids = set()
+    max_context_length = 4000
+
+    for query in queries:
+        try:
+            # Determine search strategy
+            if use_graphrag:
+                search_strategy = "graphrag"
+            else:
+                search_strategy = "hybrid"
+
+            # Execute retrieval
+            rag_result = await rag_pipeline.retrieve_and_augment(
+                query=query,
+                k=rag_top_k,
+                search_strategy=search_strategy
+            )
+
+            if rag_result.has_context:
+                # Add context, avoiding duplicates
+                for doc in rag_result.documents:
+                    if doc.doc_id not in seen_doc_ids:
+                        seen_doc_ids.add(doc.doc_id)
+                        all_context_parts.append(
+                            f"[{doc.source}] {doc.title}\n{doc.content[:500]}"
+                        )
+
+                # Add sources
+                for source in rag_result.sources:
+                    if source not in all_sources:
+                        all_sources.append(source)
+
+        except Exception as e:
+            logger.warning(f"RAG retrieval failed for query '{query}': {e}")
+            continue
+
+    # Assemble context with length limit
+    context = "\n\n---\n\n".join(all_context_parts)
+    if len(context) > max_context_length:
+        context = context[:max_context_length] + "\n[Context truncated for length]"
+
+    logger.info(f"Active RAG retrieval: {len(context)} chars from {len(all_sources)} sources")
+
+    return context, all_sources
 
 
 def extract_prior_assessments_and_plans(
@@ -102,7 +301,8 @@ def build_stage2_note(
     model: Optional[str] = None,
     note_type: str = "clinic_note",
     patient_name: Optional[str] = None,
-    ssn_last4: Optional[str] = None
+    ssn_last4: Optional[str] = None,
+    task_config: Optional["LLMTaskConfig"] = None
 ) -> str:
     """
     Complete the clinical note by adding Assessment and Plan (Stage 2).
@@ -116,15 +316,18 @@ def build_stage2_note(
         non_gu_notes: List of non-GU note dictionaries for cross-specialty scanning (optional)
         ambient_transcript: Real-time provider-patient conversation transcript (optional)
         calculator_results: Results from 44 specialized calculators (optional)
-        rag_content: Evidence-based guidelines from Neo4j RAG (optional)
-        model: LLM model to use for synthesis
+        rag_content: Evidence-based guidelines from Neo4j RAG (optional, for backwards compatibility)
+        model: LLM model to use for synthesis (ignored if task_config provided)
         note_type: Type of note ('clinic_note', 'consult', etc.)
         patient_name: Patient full name for header
         ssn_last4: Last 4 digits of SSN for header
+        task_config: LLMTaskConfig for Stage 2 LLM settings (provider, model, temperature, RAG settings)
 
     Returns:
         Complete clinical note with Assessment and Plan sections added
     """
+    # Use task_config model if provided, otherwise use model parameter
+    effective_model = task_config.model if task_config else model
     print("\n" + "="*80)
     print("STAGE 2: COMPLETING CLINICAL NOTE (POST-VISIT)")
     print("="*80)
@@ -146,7 +349,7 @@ def build_stage2_note(
             prior_assessments=prior_assessments,
             prior_plans=prior_plans,
             stage1_note=stage1_note,
-            model=model
+            model=effective_model
         )
         prior_ap_context_for_assessment = format_prior_ap_for_assessment(prior_ap_context)
         prior_ap_context_for_plan = format_prior_ap_for_plan(prior_ap_context)
@@ -171,7 +374,7 @@ def build_stage2_note(
         visit_progression = analyze_visit_progression_stage2(
             prior_plans=prior_plans,
             stage1_note=stage1_note,
-            model=model,
+            model=effective_model,
             all_notes=all_notes_for_detection
         )
         if visit_progression:
@@ -204,7 +407,8 @@ def build_stage2_note(
         ambient_transcript=ambient_transcript,
         calculator_results=calculator_results,
         rag_content=rag_content,
-        model=model,
+        model=effective_model,
+        task_config=task_config,  # Pass full task_config for multi-provider LLM support
         visit_progression=visit_progression,
         cross_specialty_context=cross_specialty_context,
         prior_ap_context=prior_ap_context_for_assessment
@@ -249,7 +453,8 @@ def build_stage2_note(
         ambient_transcript=ambient_transcript,
         calculator_results=calculator_results,
         rag_content=rag_content,
-        model=model,
+        model=effective_model,
+        task_config=task_config,  # Pass full task_config for multi-provider LLM support
         visit_progression=visit_progression,
         cross_specialty_context=cross_specialty_context,
         prior_ap_context=prior_ap_context_for_plan
@@ -287,7 +492,9 @@ def build_stage2_note(
     print("STAGE 2 COMPLETE - FINAL CLINICAL NOTE READY")
     print("="*80)
 
-    return complete_note
+    # ASCII-safety pass for VistA paste. See text_normalizer.py.
+    from .text_normalizer import to_vista_ascii
+    return to_vista_ascii(complete_note)
 
 
 def assemble_complete_note(
@@ -337,4 +544,12 @@ def assemble_complete_note(
     if time_template:
         note_parts.append(f"\n{time_template}")
 
-    return '\n'.join(note_parts)
+    final = '\n'.join(note_parts)
+
+    # Post-processing: Format "Problem #N" as "\nPROBLEM #N" for visual separation
+    import re
+    final = re.sub(r'\n?Problem\s*#', '\n\nPROBLEM #', final, flags=re.IGNORECASE)
+    # Clean up any triple+ newlines created above
+    final = re.sub(r'\n{3,}', '\n\n', final)
+
+    return final

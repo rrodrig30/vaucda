@@ -112,7 +112,10 @@ class NoteGenerator:
             FileNotFoundError: If template file not found (fail-fast approach)
             IOError: If template file cannot be read
         """
-        template_path = "/home/gulab/PythonProjects/VAUCDA/urology_prompt.txt"
+        # Use path relative to project root (backend directory)
+        from pathlib import Path
+        backend_dir = Path(__file__).parent.parent.parent
+        template_path = str(backend_dir / "urology_prompt.txt")
 
         if not os.path.exists(template_path):
             raise FileNotFoundError(
@@ -145,7 +148,10 @@ class NoteGenerator:
         Returns:
             Prompt string
         """
-        prompt_path = f"/home/gulab/PythonProjects/VAUCDA/backend/prompts/{filename}"
+        # Use path relative to project root (backend directory)
+        from pathlib import Path
+        backend_dir = Path(__file__).parent.parent.parent
+        prompt_path = str(backend_dir / "prompts" / filename)
 
         try:
             with open(prompt_path, 'r', encoding='utf-8') as f:
@@ -706,7 +712,7 @@ class NoteGenerator:
                 task_type=TaskType.DATA_EXTRACTION,
                 temperature=0.1,  # Lower temperature for factual extraction
                 max_tokens=max_tokens,
-                model="llama3.1:8b"  # Use fast Ollama model
+                model=None  # Uses configured default model from .env/user settings
             )
 
             organized_data = stage1_response.content
@@ -745,7 +751,7 @@ class NoteGenerator:
                 task_type=TaskType.NOTE_GENERATION,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                provider="ollama"  # Will use llama3.1:70b based on TaskType
+                provider=None  # Uses configured default provider from .env/user settings
             )
 
             final_note = stage2_response.content

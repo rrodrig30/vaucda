@@ -37,6 +37,10 @@ export const login = createAsyncThunk(
     try {
       const response = await authApi.login(credentials)
       localStorage.setItem('access_token', response.access_token)
+      // Store refresh_token for token renewal (required for long upload sessions)
+      if (response.refresh_token) {
+        localStorage.setItem('refresh_token', response.refresh_token)
+      }
 
       // Get user profile
       const user = await authApi.getCurrentUser()
@@ -51,6 +55,8 @@ export const login = createAsyncThunk(
 
 export const logout = createAsyncThunk('auth/logout', async () => {
   await authApi.logout()
+  // Clear refresh_token on logout
+  localStorage.removeItem('refresh_token')
 })
 
 export const getCurrentUser = createAsyncThunk(

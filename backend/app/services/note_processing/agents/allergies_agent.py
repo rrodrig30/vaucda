@@ -1,78 +1,110 @@
 """
 Allergies Agent
 
-Combines allergy information from all notes.
+Combines allergy information from document-level extraction and individual notes.
+Prioritizes document-level extraction (which captures VA allergy tables and headers)
+over individual note-level extraction.
 """
 
-from typing import List, Dict
-from ..llm_helper import combine_sections_with_llm
+from typing import List, Dict, Optional
 
 
-def synthesize_allergies(gu_notes: List[Dict[str, str]], non_gu_notes: List[Dict[str, str]]) -> str:
+def synthesize_allergies(
+    gu_notes: List[Dict[str, str]],
+    non_gu_notes: List[Dict[str, str]],
+    document_allergies: Optional[str] = None
+) -> str:
     """
-    Synthesize allergies from all notes.
+    Synthesize allergies from document-level extraction and individual notes.
+
+    Priority order:
+    1. Document-level extraction (from VA allergy tables, headers, ADR sections)
+    2. Note-level extraction (from individual GU/non-GU notes)
+
+    Document-level extraction is preferred because allergy data in VA documents
+    often appears in dedicated sections (e.g., "ALLERGIES REMOTE AND LOCAL REVIEW"
+    tables, "Allergies/ADRs:" headers) that are NOT part of any individual note.
 
     Args:
         gu_notes: List of GU note dictionaries
         non_gu_notes: List of non-GU note dictionaries
+        document_allergies: Allergies extracted from full clinical document
 
     Returns:
-        Synthesized, enumerated allergies list
+        Synthesized allergy list, or "No known drug allergies (NKDA)"
     """
-    # Collect all allergy entries
+    # Priority 1: Document-level allergies (most comprehensive source)
+    if document_allergies:
+        return document_allergies
+
+    # Priority 2: Note-level allergies
     all_allergies = []
 
     for note in gu_notes:
         if note.get("Allergies"):
-            all_allergies.append(note["Allergies"])
+            allergy_text = note["Allergies"].strip()
+            if allergy_text and not _is_nkda(allergy_text):
+                all_allergies.append(allergy_text)
 
     for note in non_gu_notes:
         if note.get("Allergies"):
-            all_allergies.append(note["Allergies"])
+            allergy_text = note["Allergies"].strip()
+            if allergy_text and not _is_nkda(allergy_text):
+                all_allergies.append(allergy_text)
 
     if not all_allergies:
+        # Check if any note explicitly states NKDA
+        for note in gu_notes + non_gu_notes:
+            if note.get("Allergies") and _is_nkda(note["Allergies"]):
+                return "No known drug allergies (NKDA)"
         return "No known drug allergies (NKDA)"
 
-    # If only one instance, return it
-    if len(all_allergies) == 1:
-        return all_allergies[0]
+    # Deduplicate allergies across notes
+    seen = set()
+    unique_allergies = []
+    for allergy_text in all_allergies:
+        # Split by common delimiters
+        for allergen in _split_allergens(allergy_text):
+            allergen_normalized = allergen.strip().lower()
+            if allergen_normalized and allergen_normalized not in seen:
+                seen.add(allergen_normalized)
+                unique_allergies.append(allergen.strip())
 
-    # Use LLM to combine and deduplicate allergies
-    instructions = """
-Combine these allergy lists into a single, deduplicated list.
-- Remove duplicate allergies
-- Include the allergen name and reaction type
-- Format as a simple list (one allergy per line)
-- If all entries say "no allergies" or "NKDA", return "No known drug allergies (NKDA)"
-"""
+    if not unique_allergies:
+        return "No known drug allergies (NKDA)"
 
-    synthesized_allergies = combine_sections_with_llm(
-        section_name="Allergies",
-        section_instances=all_allergies,
-        instructions=instructions
-    )
+    return ', '.join(unique_allergies)
 
-    # Clean up LLM meta-commentary and enumerate
-    if synthesized_allergies and not synthesized_allergies.lower().startswith("no known"):
-        # Remove LLM meta-commentary
-        import re
-        synthesized_allergies = re.sub(r'^(After reviewing|Here is|Here are|I have|I removed|Note:).*?\n', '', synthesized_allergies, flags=re.MULTILINE | re.IGNORECASE)
-        synthesized_allergies = re.sub(r'\n(Note:|I corrected|The entry).*$', '', synthesized_allergies, flags=re.DOTALL | re.IGNORECASE)
 
-        lines = [line.strip() for line in synthesized_allergies.split('\n') if line.strip()]
-        # Remove any numbering, bullets, or * formatting
-        cleaned_lines = []
-        for line in lines:
-            # Remove leading markers
-            line = re.sub(r'^[\d\.\-\*\)]+\s*', '', line)
-            # Remove * bullets
-            line = line.lstrip('* ')
-            if line and not line.lower().startswith(('after', 'here', 'note', 'i have', 'i removed')):
-                cleaned_lines.append(line)
+def _is_nkda(text: str) -> bool:
+    """Check if text indicates no known drug allergies."""
+    text_lower = text.lower().strip()
+    nkda_indicators = [
+        'no known drug allergies',
+        'no known allergies',
+        'nkda',
+        'nka',
+        'none known',
+        'no allergies',
+    ]
+    return any(indicator in text_lower for indicator in nkda_indicators)
 
-        if cleaned_lines:
-            # Re-number
-            enumerated_allergies = '\n'.join([f"{i}. {line}" for i, line in enumerate(cleaned_lines, 1)])
-            return enumerated_allergies
 
-    return synthesized_allergies
+def _split_allergens(text: str) -> list:
+    """Split allergy text into individual allergens."""
+    # Handle numbered lists (1. Drug1\n2. Drug2)
+    import re
+    lines = text.split('\n')
+    allergens = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Remove numbering
+        line = re.sub(r'^\d+\.\s*', '', line)
+        # Split by comma
+        for part in line.split(','):
+            part = part.strip()
+            if part:
+                allergens.append(part)
+    return allergens

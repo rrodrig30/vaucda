@@ -1,10 +1,10 @@
 import { createSlice, createAsyncThunk, PayloadAction } from '@reduxjs/toolkit'
 import { notesApi } from '@/api'
-import type { NoteGenerationRequest, NoteGenerationResponse, SavedNote } from '@/types/api.types'
+import type { NoteGenerationRequest, NoteGenerationResponse } from '@/types/api.types'
 
 interface NoteState {
   currentNote: NoteGenerationResponse | null
-  savedNotes: SavedNote[]
+  // HIPAA COMPLIANCE: No savedNotes array - notes are ephemeral only
   isGenerating: boolean
   streamingContent: string
   streamingProgress: number
@@ -13,7 +13,7 @@ interface NoteState {
 
 const initialState: NoteState = {
   currentNote: null,
-  savedNotes: [],
+  // HIPAA COMPLIANCE: No note persistence
   isGenerating: false,
   streamingContent: '',
   streamingProgress: 0,
@@ -45,17 +45,8 @@ export const fetchNote = createAsyncThunk(
   }
 )
 
-export const fetchRecentNotes = createAsyncThunk(
-  'note/fetchRecent',
-  async (limit: number = 10, { rejectWithValue }) => {
-    try {
-      const response = await notesApi.getRecentNotes(limit)
-      return response
-    } catch (error: any) {
-      return rejectWithValue(error.detail || 'Failed to fetch recent notes')
-    }
-  }
-)
+// HIPAA COMPLIANCE: fetchRecentNotes removed - notes are ephemeral only
+// No note persistence or history retrieval to prevent cross-contamination
 
 const noteSlice = createSlice({
   name: 'note',
@@ -118,10 +109,7 @@ const noteSlice = createSlice({
           },
         }
       })
-      // Fetch recent notes
-      .addCase(fetchRecentNotes.fulfilled, (state, action) => {
-        state.savedNotes = action.payload
-      })
+      // HIPAA COMPLIANCE: No recent notes functionality - notes are ephemeral only
   },
 })
 

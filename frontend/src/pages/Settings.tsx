@@ -6,7 +6,7 @@ import { Select } from '@/components/common/Select'
 import { Modal } from '@/components/common/Modal'
 import { Textarea } from '@/components/common/Textarea'
 import { settingsApi, llmApi, ragApi } from '@/api'
-import { FiSave, FiRefreshCw, FiLock, FiEye, FiEyeOff, FiCheckCircle, FiEdit3 } from 'react-icons/fi'
+import { FiSave, FiRefreshCw, FiLock, FiEye, FiEyeOff, FiCheckCircle, FiEdit3, FiAlertCircle } from 'react-icons/fi'
 import { useAuth } from '@/hooks/useAuth'
 import type { UpdateSettingsRequest } from '@/types/api.types'
 
@@ -42,7 +42,59 @@ export const Settings: React.FC = () => {
     highlight_abnormal_values: true,
   })
 
+  // Task-specific LLM configuration
+  // Initial values are placeholders - actual values loaded from API/database
+  // num_ctx (input context window): null/undefined means "use lookup table or 125K default"
+  const [taskLLMConfig, setTaskLLMConfig] = useState({
+    // OCR Processing - defaults from backend environment
+    ocr_llm_provider: 'ollama',
+    ocr_llm_model: '',  // Loaded from backend
+    ocr_llm_temperature: 0.1,
+    ocr_llm_max_tokens: 4096,
+    ocr_llm_num_ctx: undefined as number | undefined,
+    // Stage 1: Note Generation - defaults from backend environment
+    stage1_llm_provider: 'ollama',
+    stage1_llm_model: '',  // Loaded from backend
+    stage1_llm_temperature: 0.1,
+    stage1_llm_max_tokens: 8192,
+    stage1_llm_num_ctx: undefined as number | undefined,
+    // Stage 2: Assessment & Plan - defaults from backend environment
+    stage2_llm_provider: 'ollama',
+    stage2_llm_model: '',  // Loaded from backend
+    stage2_llm_temperature: 0.0,
+    stage2_llm_max_tokens: 8192,
+    stage2_llm_num_ctx: undefined as number | undefined,
+    stage2_use_rag: true,
+    stage2_use_graphrag: true,
+    stage2_rag_top_k: 5,
+  })
+
+  // Per-task "model max" hints from /llm/model-context-size, displayed under each input
+  const [modelContextHints, setModelContextHints] = useState<{
+    ocr?: { context_size: number; known: boolean }
+    stage1?: { context_size: number; known: boolean }
+    stage2?: { context_size: number; known: boolean }
+  }>({})
+
   const [availableModels, setAvailableModels] = useState<string[]>([])
+
+  // Models available per provider (for dropdowns)
+  const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({
+    ollama: [],
+    anthropic: [],
+    openai: [],
+  })
+
+  // Settings verification state
+  const [saveVerification, setSaveVerification] = useState<{
+    verified: boolean;
+    message: string;
+    details: Record<string, { saved: string; loaded: string; match: boolean }>;
+  } | null>(null)
+
+  // Model loading state
+  const [modelLoadingError, setModelLoadingError] = useState<string | null>(null)
+  const [isLoadingModels, setIsLoadingModels] = useState(false)
 
   const [showPasswordModal, setShowPasswordModal] = useState(false)
   const [passwordForm, setPasswordForm] = useState({
@@ -72,6 +124,7 @@ export const Settings: React.FC = () => {
   useEffect(() => {
     loadSettings()
     loadSystemPrompt()
+    loadAllProviderModels()  // Load models for all providers on mount
   }, [])
 
   useEffect(() => {
@@ -80,23 +133,66 @@ export const Settings: React.FC = () => {
     }
   }, [formData.default_llm])
 
+  // Load models for all providers (for task-specific dropdowns)
+  const loadAllProviderModels = async () => {
+    setIsLoadingModels(true)
+    setModelLoadingError(null)
+    try {
+      const providers = await llmApi.getProviders()
+      const newModelsByProvider: Record<string, string[]> = {
+        ollama: [],
+        anthropic: [],
+        openai: [],
+      }
+
+      for (const provider of providers) {
+        const providerName = provider.name.toLowerCase()
+        if (provider.models && provider.models.length > 0) {
+          newModelsByProvider[providerName] = provider.models.map(m => m.name)
+        }
+      }
+
+      setModelsByProvider(newModelsByProvider)
+
+      // Auto-select first model for any task that has empty model selection
+      setTaskLLMConfig(prev => ({
+        ...prev,
+        ocr_llm_model: prev.ocr_llm_model || newModelsByProvider[prev.ocr_llm_provider]?.[0] || '',
+        stage1_llm_model: prev.stage1_llm_model || newModelsByProvider[prev.stage1_llm_provider]?.[0] || '',
+        stage2_llm_model: prev.stage2_llm_model || newModelsByProvider[prev.stage2_llm_provider]?.[0] || '',
+      }))
+
+      // Check if any provider has no models
+      const emptyProviders = Object.entries(newModelsByProvider)
+        .filter(([_, models]) => models.length === 0)
+        .map(([name]) => name)
+
+      if (emptyProviders.length === Object.keys(newModelsByProvider).length) {
+        setModelLoadingError('No LLM models available. Ensure Ollama is running and models are installed.')
+      } else if (emptyProviders.length > 0) {
+        setModelLoadingError(`No models available for: ${emptyProviders.join(', ')}`)
+      }
+    } catch (error: any) {
+      console.error('Error loading provider models:', error)
+      setModelLoadingError(
+        `Failed to load LLM models: ${error.message || 'Please check Ollama connection and try again.'}`
+      )
+    } finally {
+      setIsLoadingModels(false)
+    }
+  }
+
   const loadSettings = async () => {
     try {
       setIsLoading(true)
 
-      // Try loading from localStorage first
-      const savedSettings = localStorage.getItem('vaucda_settings')
-      let settingsData
+      // API/database is the source of truth - always load from API first
+      // localStorage is only used as fallback for unauthenticated users
+      const settingsData = await settingsApi.getSettings()
 
-      if (savedSettings) {
-        const parsed = JSON.parse(savedSettings)
-        settingsData = {
-          ...await settingsApi.getSettings(),
-          ...parsed  // Override API defaults with localStorage values
-        }
-      } else {
-        settingsData = await settingsApi.getSettings()
-      }
+      // Clear stale localStorage to prevent confusion
+      // Settings are now properly persisted in database
+      localStorage.removeItem('vaucda_settings')
 
       setFormData({
         default_llm: settingsData.default_llm,
@@ -111,6 +207,45 @@ export const Settings: React.FC = () => {
         display_calculation_breakdown: settingsData.display_preferences?.display_calculation_breakdown ?? true,
         highlight_abnormal_values: settingsData.display_preferences?.highlight_abnormal_values ?? true,
       })
+
+      // Load task-specific LLM settings
+      // Note: Model names are loaded from backend API, never hardcoded
+      // Empty model string means "use first available model from selected provider"
+      if (settingsData.ocr_llm) {
+        setTaskLLMConfig(prev => ({
+          ...prev,
+          ocr_llm_provider: settingsData.ocr_llm.provider || 'ollama',
+          ocr_llm_model: settingsData.ocr_llm.model || '',  // Will be set from available models
+          ocr_llm_temperature: settingsData.ocr_llm.temperature ?? 0.1,
+          ocr_llm_max_tokens: settingsData.ocr_llm.max_tokens ?? 8192,
+          ocr_llm_num_ctx: settingsData.ocr_llm.num_ctx ?? undefined,
+          stage1_llm_provider: settingsData.stage1_llm?.provider || 'ollama',
+          stage1_llm_model: settingsData.stage1_llm?.model || '',  // Will be set from available models
+          stage1_llm_temperature: settingsData.stage1_llm?.temperature ?? 0.1,
+          stage1_llm_max_tokens: settingsData.stage1_llm?.max_tokens ?? 8192,
+          stage1_llm_num_ctx: settingsData.stage1_llm?.num_ctx ?? undefined,
+          stage2_llm_provider: settingsData.stage2_llm?.provider || 'ollama',
+          stage2_llm_model: settingsData.stage2_llm?.model || '',  // Will be set from available models
+          stage2_llm_temperature: settingsData.stage2_llm?.temperature ?? 0.0,
+          stage2_llm_max_tokens: settingsData.stage2_llm?.max_tokens ?? 8192,
+          stage2_llm_num_ctx: settingsData.stage2_llm?.num_ctx ?? undefined,
+          stage2_use_rag: settingsData.stage2_llm?.use_rag ?? true,
+          stage2_use_graphrag: settingsData.stage2_llm?.use_graphrag ?? true,
+          stage2_rag_top_k: settingsData.stage2_llm?.rag_top_k ?? 5,
+        }))
+
+        // Populate the "Model max" hints once for whatever model the user
+        // already had selected. We do NOT overwrite user-set num_ctx here.
+        if (settingsData.ocr_llm.model) {
+          fetchAndApplyModelContextSize('ocr', settingsData.ocr_llm.model)
+        }
+        if (settingsData.stage1_llm?.model) {
+          fetchAndApplyModelContextSize('stage1', settingsData.stage1_llm.model)
+        }
+        if (settingsData.stage2_llm?.model) {
+          fetchAndApplyModelContextSize('stage2', settingsData.stage2_llm.model)
+        }
+      }
 
       await loadModelsForProvider(settingsData.default_llm)
 
@@ -141,6 +276,31 @@ export const Settings: React.FC = () => {
     }
   }
 
+  // Fetch the model's training context window from the backend lookup table
+  // and pre-populate the per-task num_ctx input only if the user has not set it.
+  // task is one of: 'ocr' | 'stage1' | 'stage2'
+  const fetchAndApplyModelContextSize = async (task: 'ocr' | 'stage1' | 'stage2', model: string) => {
+    if (!model) return
+    try {
+      const data = await llmApi.getModelContextSize(model)
+      setModelContextHints(prev => ({
+        ...prev,
+        [task]: { context_size: data.context_size, known: data.known },
+      }))
+      const fieldName = `${task}_llm_num_ctx` as
+        'ocr_llm_num_ctx' | 'stage1_llm_num_ctx' | 'stage2_llm_num_ctx'
+      setTaskLLMConfig(prev => {
+        // Only seed the input if the user has not entered anything
+        if (prev[fieldName] !== undefined && prev[fieldName] !== null) {
+          return prev
+        }
+        return { ...prev, [fieldName]: data.context_size }
+      })
+    } catch (err) {
+      console.error(`Failed to fetch model context size for ${model}:`, err)
+    }
+  }
+
   const loadSystemPrompt = async () => {
     try {
       setIsLoadingPrompt(true)
@@ -166,7 +326,7 @@ export const Settings: React.FC = () => {
 
     try {
       setIsSavingPrompt(true)
-      const response = await ragApi.updateSystemPrompt(systemPrompt)
+      await ragApi.updateSystemPrompt(systemPrompt)
       alert('System prompt updated successfully! A backup was created.')
       // Reload to get updated timestamp
       await loadSystemPrompt()
@@ -181,6 +341,7 @@ export const Settings: React.FC = () => {
   const handleSaveSettings = async () => {
     try {
       setIsSaving(true)
+      setSaveVerification(null)
 
       const updateRequest: UpdateSettingsRequest = {
         default_llm: formData.default_llm,
@@ -196,46 +357,172 @@ export const Settings: React.FC = () => {
           include_guideline_citations: formData.include_guideline_citations,
           display_calculation_breakdown: formData.display_calculation_breakdown,
           highlight_abnormal_values: formData.highlight_abnormal_values,
-        }
+        },
+        // Task-specific LLM settings
+        ocr_llm_provider: taskLLMConfig.ocr_llm_provider,
+        ocr_llm_model: taskLLMConfig.ocr_llm_model,
+        ocr_llm_temperature: taskLLMConfig.ocr_llm_temperature,
+        ocr_llm_max_tokens: taskLLMConfig.ocr_llm_max_tokens,
+        ocr_llm_num_ctx: taskLLMConfig.ocr_llm_num_ctx,
+        stage1_llm_provider: taskLLMConfig.stage1_llm_provider,
+        stage1_llm_model: taskLLMConfig.stage1_llm_model,
+        stage1_llm_temperature: taskLLMConfig.stage1_llm_temperature,
+        stage1_llm_max_tokens: taskLLMConfig.stage1_llm_max_tokens,
+        stage1_llm_num_ctx: taskLLMConfig.stage1_llm_num_ctx,
+        stage2_llm_provider: taskLLMConfig.stage2_llm_provider,
+        stage2_llm_model: taskLLMConfig.stage2_llm_model,
+        stage2_llm_temperature: taskLLMConfig.stage2_llm_temperature,
+        stage2_llm_max_tokens: taskLLMConfig.stage2_llm_max_tokens,
+        stage2_llm_num_ctx: taskLLMConfig.stage2_llm_num_ctx,
+        stage2_use_rag: taskLLMConfig.stage2_use_rag,
+        stage2_use_graphrag: taskLLMConfig.stage2_use_graphrag,
+        stage2_rag_top_k: taskLLMConfig.stage2_rag_top_k,
       }
 
       await settingsApi.updateSettings(updateRequest)
 
-      // Also save to localStorage for persistence without authentication
-      localStorage.setItem('vaucda_settings', JSON.stringify({
-        default_llm: formData.default_llm,
-        default_model: formData.default_model,
-        default_template: formData.default_template,
-        temperature: formData.temperature,
-        max_tokens: formData.max_tokens,
-      }))
+      // Database is source of truth - no need for localStorage
+      // Clear any stale localStorage to prevent confusion
+      localStorage.removeItem('vaucda_settings')
 
-      alert('Settings saved successfully')
+      // ===== VERIFICATION: Re-load settings from server and compare =====
+      const verifiedSettings = await settingsApi.getSettings()
 
-      await loadSettings()
+      // Helper to compare numbers with tolerance for floating point
+      const numMatch = (saved: number, loaded: number, tolerance = 0.001) =>
+        Math.abs(saved - loaded) < tolerance
+
+      // Helper to format number for display
+      const numStr = (n: number | undefined) => n !== undefined ? n.toString() : '(undefined)'
+
+      const verificationDetails: Record<string, { saved: string; loaded: string; match: boolean }> = {
+        // OCR Settings
+        'OCR Provider': {
+          saved: taskLLMConfig.ocr_llm_provider,
+          loaded: verifiedSettings.ocr_llm?.provider || '',
+          match: taskLLMConfig.ocr_llm_provider === (verifiedSettings.ocr_llm?.provider || '')
+        },
+        'OCR Model': {
+          saved: taskLLMConfig.ocr_llm_model,
+          loaded: verifiedSettings.ocr_llm?.model || '',
+          match: taskLLMConfig.ocr_llm_model === (verifiedSettings.ocr_llm?.model || '')
+        },
+        'OCR Temperature': {
+          saved: numStr(taskLLMConfig.ocr_llm_temperature),
+          loaded: numStr(verifiedSettings.ocr_llm?.temperature),
+          match: numMatch(taskLLMConfig.ocr_llm_temperature, verifiedSettings.ocr_llm?.temperature ?? 0)
+        },
+        // Stage 1 Settings
+        'Stage 1 Provider': {
+          saved: taskLLMConfig.stage1_llm_provider,
+          loaded: verifiedSettings.stage1_llm?.provider || '',
+          match: taskLLMConfig.stage1_llm_provider === (verifiedSettings.stage1_llm?.provider || '')
+        },
+        'Stage 1 Model': {
+          saved: taskLLMConfig.stage1_llm_model,
+          loaded: verifiedSettings.stage1_llm?.model || '',
+          match: taskLLMConfig.stage1_llm_model === (verifiedSettings.stage1_llm?.model || '')
+        },
+        'Stage 1 Temperature': {
+          saved: numStr(taskLLMConfig.stage1_llm_temperature),
+          loaded: numStr(verifiedSettings.stage1_llm?.temperature),
+          match: numMatch(taskLLMConfig.stage1_llm_temperature, verifiedSettings.stage1_llm?.temperature ?? 0)
+        },
+        // Stage 2 Settings
+        'Stage 2 Provider': {
+          saved: taskLLMConfig.stage2_llm_provider,
+          loaded: verifiedSettings.stage2_llm?.provider || '',
+          match: taskLLMConfig.stage2_llm_provider === (verifiedSettings.stage2_llm?.provider || '')
+        },
+        'Stage 2 Model': {
+          saved: taskLLMConfig.stage2_llm_model,
+          loaded: verifiedSettings.stage2_llm?.model || '',
+          match: taskLLMConfig.stage2_llm_model === (verifiedSettings.stage2_llm?.model || '')
+        },
+        'Stage 2 Temperature': {
+          saved: numStr(taskLLMConfig.stage2_llm_temperature),
+          loaded: numStr(verifiedSettings.stage2_llm?.temperature),
+          match: numMatch(taskLLMConfig.stage2_llm_temperature, verifiedSettings.stage2_llm?.temperature ?? 0)
+        },
+        // RAG Settings
+        'Use RAG': {
+          saved: taskLLMConfig.stage2_use_rag ? 'enabled' : 'disabled',
+          loaded: verifiedSettings.stage2_llm?.use_rag ? 'enabled' : 'disabled',
+          match: taskLLMConfig.stage2_use_rag === (verifiedSettings.stage2_llm?.use_rag ?? false)
+        },
+        'Use GraphRAG': {
+          saved: taskLLMConfig.stage2_use_graphrag ? 'enabled' : 'disabled',
+          loaded: verifiedSettings.stage2_llm?.use_graphrag ? 'enabled' : 'disabled',
+          match: taskLLMConfig.stage2_use_graphrag === (verifiedSettings.stage2_llm?.use_graphrag ?? false)
+        },
+        'RAG Top-K': {
+          saved: numStr(taskLLMConfig.stage2_rag_top_k),
+          loaded: numStr(verifiedSettings.stage2_llm?.rag_top_k),
+          match: taskLLMConfig.stage2_rag_top_k === (verifiedSettings.stage2_llm?.rag_top_k ?? 0)
+        },
+      }
+
+      const allMatch = Object.values(verificationDetails).every(v => v.match)
+
+      setSaveVerification({
+        verified: allMatch,
+        message: allMatch
+          ? 'All settings saved and verified successfully!'
+          : 'Warning: Some settings may not have saved correctly.',
+        details: verificationDetails
+      })
+
+      if (allMatch) {
+        // Clear verification after 5 seconds on success
+        setTimeout(() => setSaveVerification(null), 5000)
+      }
+
     } catch (error: any) {
       console.error('Error saving settings:', error)
-      alert(`Failed to save settings: ${error.response?.data?.detail || error.message}`)
+      // More robust error message extraction
+      // Note: API client rejects with { detail, error_code, errors } object, not standard Error
+      let errorMessage = 'Unknown error'
+      if (error.detail) {
+        // Error from API client interceptor
+        errorMessage = error.detail
+      } else if (error.response?.data?.detail) {
+        // Raw axios error with response
+        errorMessage = error.response.data.detail
+      } else if (error.message) {
+        // Standard Error object
+        errorMessage = error.message
+      } else if (error.response?.status) {
+        errorMessage = `HTTP ${error.response.status}: ${error.response.statusText || 'Server error'}`
+      } else if (typeof error === 'string') {
+        errorMessage = error
+      } else {
+        // Last resort: stringify the error
+        try {
+          errorMessage = JSON.stringify(error)
+        } catch {
+          errorMessage = 'Unable to parse error'
+        }
+      }
+      setSaveVerification({
+        verified: false,
+        message: `Failed to save settings: ${errorMessage}`,
+        details: {}
+      })
     } finally {
       setIsSaving(false)
     }
   }
 
-  const handleResetDefaults = () => {
-    if (confirm('Reset all settings to defaults?')) {
-      setFormData({
-        default_llm: 'ollama',
-        default_model: '',
-        default_template: 'clinic_note',
-        temperature: 0.3,
-        max_tokens: 4000,
-        rag_enabled: true,
-        rag_top_k: 5,
-        show_confidence_intervals: true,
-        include_guideline_citations: true,
-        display_calculation_breakdown: true,
-        highlight_abnormal_values: true,
-      })
+  const handleResetDefaults = async () => {
+    if (confirm('Reset all settings to defaults? This will reload settings from the server.')) {
+      try {
+        // Reload settings from server to get backend defaults
+        await loadSettings()
+        alert('Settings reset to defaults successfully')
+      } catch (error) {
+        console.error('Error resetting settings:', error)
+        alert('Failed to reset settings to defaults')
+      }
     }
   }
 
@@ -380,6 +667,310 @@ export const Settings: React.FC = () => {
                   onChange={(e) => setFormData({ ...formData, max_tokens: parseInt(e.target.value, 10) })}
                   helpText="Maximum response length"
                 />
+              </div>
+            </div>
+          </Card>
+
+          <Card title="Task-Specific LLM Configuration" description="Configure LLM settings for each processing stage">
+            <div className="space-y-6">
+              {/* Model Loading Status */}
+              {isLoadingModels && (
+                <div className="flex items-center gap-2 text-sm text-gray-500">
+                  <span className="animate-spin">&#9696;</span> Loading available models...
+                </div>
+              )}
+              {modelLoadingError && (
+                <div className="p-3 rounded-lg bg-error-50 dark:bg-error-900/20 border border-error text-error flex items-center gap-2">
+                  <FiAlertCircle />
+                  <span>{modelLoadingError}</span>
+                </div>
+              )}
+
+              {/* OCR Processing */}
+              <div className="border-b border-gray-200 dark:border-gray-700 pb-4">
+                <h3 className="text-lg font-semibold mb-3 text-primary">OCR Processing</h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+                  LLM used for document OCR (vision model for scanned documents)
+                </p>
+                <div className="grid grid-cols-2 gap-4">
+                  <Select
+                    label="Provider"
+                    value={taskLLMConfig.ocr_llm_provider}
+                    onChange={(e) => {
+                      const newProvider = e.target.value
+                      const models = modelsByProvider[newProvider] || []
+                      setTaskLLMConfig({
+                        ...taskLLMConfig,
+                        ocr_llm_provider: newProvider,
+                        // Auto-select first model when provider changes
+                        ocr_llm_model: models.length > 0 ? models[0] : ''
+                      })
+                    }}
+                    options={LLM_PROVIDERS}
+                  />
+                  <Select
+                    label="Model"
+                    value={taskLLMConfig.ocr_llm_model}
+                    onChange={(e) => {
+                      const newModel = e.target.value
+                      setTaskLLMConfig({ ...taskLLMConfig, ocr_llm_model: newModel })
+                      fetchAndApplyModelContextSize('ocr', newModel)
+                    }}
+                    options={(modelsByProvider[taskLLMConfig.ocr_llm_provider] || []).map(m => ({ value: m, label: m }))}
+                    disabled={(modelsByProvider[taskLLMConfig.ocr_llm_provider] || []).length === 0}
+                    helpText={(modelsByProvider[taskLLMConfig.ocr_llm_provider] || []).length === 0 ? 'No models available' : ''}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4 mt-3">
+                  <Input
+                    label="Temperature"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    value={taskLLMConfig.ocr_llm_temperature}
+                    onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, ocr_llm_temperature: parseFloat(e.target.value) })}
+                  />
+                  <Input
+                    label="Max Tokens (output)"
+                    type="number"
+                    min="100"
+                    max="16384"
+                    step="100"
+                    value={taskLLMConfig.ocr_llm_max_tokens}
+                    onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, ocr_llm_max_tokens: parseInt(e.target.value, 10) })}
+                    helpText="Output tokens generated (Ollama num_predict)"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4 mt-3">
+                  <Input
+                    label="Context Window (num_ctx)"
+                    type="number"
+                    min="512"
+                    max="2000000"
+                    step="1024"
+                    value={taskLLMConfig.ocr_llm_num_ctx ?? ''}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setTaskLLMConfig({
+                        ...taskLLMConfig,
+                        ocr_llm_num_ctx: v === '' ? undefined : parseInt(v, 10),
+                      })
+                    }}
+                    helpText={
+                      `Total tokens the model can read (input + output). 125000 = 125K. Default for unknown models.` +
+                      (modelContextHints.ocr
+                        ? ` Model max for ${taskLLMConfig.ocr_llm_model || 'selected model'}: ${modelContextHints.ocr.context_size} (${modelContextHints.ocr.known ? 'known' : 'default'}).`
+                        : '')
+                    }
+                  />
+                </div>
+              </div>
+
+              {/* Stage 1: Note Generation */}
+              <div className="border-b border-gray-200 dark:border-gray-700 pb-4">
+                <h3 className="text-lg font-semibold mb-3 text-primary">Stage 1: Note Generation</h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+                  LLM used for initial clinical note extraction and generation
+                </p>
+                <div className="grid grid-cols-2 gap-4">
+                  <Select
+                    label="Provider"
+                    value={taskLLMConfig.stage1_llm_provider}
+                    onChange={(e) => {
+                      const newProvider = e.target.value
+                      const models = modelsByProvider[newProvider] || []
+                      setTaskLLMConfig({
+                        ...taskLLMConfig,
+                        stage1_llm_provider: newProvider,
+                        stage1_llm_model: models.length > 0 ? models[0] : ''
+                      })
+                    }}
+                    options={LLM_PROVIDERS}
+                  />
+                  <Select
+                    label="Model"
+                    value={taskLLMConfig.stage1_llm_model}
+                    onChange={(e) => {
+                      const newModel = e.target.value
+                      setTaskLLMConfig({ ...taskLLMConfig, stage1_llm_model: newModel })
+                      fetchAndApplyModelContextSize('stage1', newModel)
+                    }}
+                    options={(modelsByProvider[taskLLMConfig.stage1_llm_provider] || []).map(m => ({ value: m, label: m }))}
+                    disabled={(modelsByProvider[taskLLMConfig.stage1_llm_provider] || []).length === 0}
+                    helpText={(modelsByProvider[taskLLMConfig.stage1_llm_provider] || []).length === 0 ? 'No models available' : ''}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4 mt-3">
+                  <Input
+                    label="Temperature"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    value={taskLLMConfig.stage1_llm_temperature}
+                    onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, stage1_llm_temperature: parseFloat(e.target.value) })}
+                  />
+                  <Input
+                    label="Max Tokens (output)"
+                    type="number"
+                    min="100"
+                    max="32000"
+                    step="100"
+                    value={taskLLMConfig.stage1_llm_max_tokens}
+                    onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, stage1_llm_max_tokens: parseInt(e.target.value, 10) })}
+                    helpText="Output tokens generated (Ollama num_predict)"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4 mt-3">
+                  <Input
+                    label="Context Window (num_ctx)"
+                    type="number"
+                    min="512"
+                    max="2000000"
+                    step="1024"
+                    value={taskLLMConfig.stage1_llm_num_ctx ?? ''}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setTaskLLMConfig({
+                        ...taskLLMConfig,
+                        stage1_llm_num_ctx: v === '' ? undefined : parseInt(v, 10),
+                      })
+                    }}
+                    helpText={
+                      `Total tokens the model can read (input + output). 125000 = 125K. Default for unknown models.` +
+                      (modelContextHints.stage1
+                        ? ` Model max for ${taskLLMConfig.stage1_llm_model || 'selected model'}: ${modelContextHints.stage1.context_size} (${modelContextHints.stage1.known ? 'known' : 'default'}).`
+                        : '')
+                    }
+                  />
+                </div>
+              </div>
+
+              {/* Stage 2: Assessment & Plan */}
+              <div>
+                <h3 className="text-lg font-semibold mb-3 text-primary">Stage 2: Assessment & Plan</h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+                  LLM used for Assessment and Plan generation with RAG/GraphRAG retrieval
+                </p>
+                <div className="grid grid-cols-2 gap-4">
+                  <Select
+                    label="Provider"
+                    value={taskLLMConfig.stage2_llm_provider}
+                    onChange={(e) => {
+                      const newProvider = e.target.value
+                      const models = modelsByProvider[newProvider] || []
+                      setTaskLLMConfig({
+                        ...taskLLMConfig,
+                        stage2_llm_provider: newProvider,
+                        stage2_llm_model: models.length > 0 ? models[0] : ''
+                      })
+                    }}
+                    options={LLM_PROVIDERS}
+                  />
+                  <Select
+                    label="Model"
+                    value={taskLLMConfig.stage2_llm_model}
+                    onChange={(e) => {
+                      const newModel = e.target.value
+                      setTaskLLMConfig({ ...taskLLMConfig, stage2_llm_model: newModel })
+                      fetchAndApplyModelContextSize('stage2', newModel)
+                    }}
+                    options={(modelsByProvider[taskLLMConfig.stage2_llm_provider] || []).map(m => ({ value: m, label: m }))}
+                    disabled={(modelsByProvider[taskLLMConfig.stage2_llm_provider] || []).length === 0}
+                    helpText={(modelsByProvider[taskLLMConfig.stage2_llm_provider] || []).length === 0 ? 'No models available' : ''}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4 mt-3">
+                  <Input
+                    label="Temperature"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    value={taskLLMConfig.stage2_llm_temperature}
+                    onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, stage2_llm_temperature: parseFloat(e.target.value) })}
+                    helpText="0.0 recommended for clinical accuracy"
+                  />
+                  <Input
+                    label="Max Tokens (output)"
+                    type="number"
+                    min="100"
+                    max="32000"
+                    step="100"
+                    value={taskLLMConfig.stage2_llm_max_tokens}
+                    onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, stage2_llm_max_tokens: parseInt(e.target.value, 10) })}
+                    helpText="Output tokens generated (Ollama num_predict)"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4 mt-3">
+                  <Input
+                    label="Context Window (num_ctx)"
+                    type="number"
+                    min="512"
+                    max="2000000"
+                    step="1024"
+                    value={taskLLMConfig.stage2_llm_num_ctx ?? ''}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setTaskLLMConfig({
+                        ...taskLLMConfig,
+                        stage2_llm_num_ctx: v === '' ? undefined : parseInt(v, 10),
+                      })
+                    }}
+                    helpText={
+                      `Total tokens the model can read (input + output). 125000 = 125K. Default for unknown models.` +
+                      (modelContextHints.stage2
+                        ? ` Model max for ${taskLLMConfig.stage2_llm_model || 'selected model'}: ${modelContextHints.stage2.context_size} (${modelContextHints.stage2.known ? 'known' : 'default'}).`
+                        : '')
+                    }
+                  />
+                </div>
+
+                {/* RAG Settings */}
+                <div className="mt-4 p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
+                  <h4 className="font-medium mb-3">RAG/GraphRAG Settings</h4>
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="stage2-use-rag"
+                        checked={taskLLMConfig.stage2_use_rag}
+                        onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, stage2_use_rag: e.target.checked })}
+                        className="rounded"
+                      />
+                      <label htmlFor="stage2-use-rag" className="text-sm">
+                        Enable RAG (Retrieval-Augmented Generation)
+                      </label>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="stage2-use-graphrag"
+                        checked={taskLLMConfig.stage2_use_graphrag}
+                        onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, stage2_use_graphrag: e.target.checked })}
+                        className="rounded"
+                        disabled={!taskLLMConfig.stage2_use_rag}
+                      />
+                      <label htmlFor="stage2-use-graphrag" className="text-sm">
+                        Enable GraphRAG (Knowledge Graph Retrieval)
+                      </label>
+                    </div>
+
+                    {taskLLMConfig.stage2_use_rag && (
+                      <Input
+                        label="RAG Top-K Results"
+                        type="number"
+                        min="1"
+                        max="20"
+                        value={taskLLMConfig.stage2_rag_top_k}
+                        onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, stage2_rag_top_k: parseInt(e.target.value, 10) })}
+                        helpText="Number of knowledge base results to retrieve"
+                      />
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           </Card>
@@ -593,6 +1184,41 @@ export const Settings: React.FC = () => {
               >
                 Reset to Defaults
               </Button>
+
+              {/* Save Verification Status */}
+              {saveVerification && (
+                <div className={`mt-4 p-4 rounded-lg border ${
+                  saveVerification.verified
+                    ? 'bg-success-50 dark:bg-success-900/20 border-success text-success'
+                    : 'bg-error-50 dark:bg-error-900/20 border-error text-error'
+                }`}>
+                  <div className="flex items-center gap-2 mb-2">
+                    {saveVerification.verified ? <FiCheckCircle /> : <FiAlertCircle />}
+                    <span className="font-semibold">{saveVerification.message}</span>
+                  </div>
+
+                  {Object.keys(saveVerification.details).length > 0 && (
+                    <div className="text-xs space-y-1 mt-2">
+                      {Object.entries(saveVerification.details).map(([key, value]) => (
+                        <div key={key} className="flex justify-between">
+                          <span>{key}:</span>
+                          <span className={value.match ? '' : 'font-bold'}>
+                            {value.match ? (
+                              <span className="flex items-center gap-1">
+                                <FiCheckCircle className="text-success" /> {value.loaded || '(default)'}
+                              </span>
+                            ) : (
+                              <span className="flex items-center gap-1">
+                                <FiAlertCircle /> Sent: {value.saved}, Got: {value.loaded || '(empty)'}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </Card>
 

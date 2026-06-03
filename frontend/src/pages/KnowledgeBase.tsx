@@ -135,10 +135,11 @@ export const KnowledgeBase: React.FC = () => {
 
   const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      // Filter for PDF, DOCX, and TXT files only
+      // Filter for PDF, DOCX, TXT, and Excel files
+      // Excel files (.xlsx) are used to provide metadata for the PDFs in the folder
       const supportedFiles = Array.from(e.target.files).filter(file => {
         const ext = file.name.toLowerCase()
-        return ext.endsWith('.pdf') || ext.endsWith('.docx') || ext.endsWith('.txt')
+        return ext.endsWith('.pdf') || ext.endsWith('.docx') || ext.endsWith('.txt') || ext.endsWith('.xlsx') || ext.endsWith('.xls')
       })
       setSelectedFiles(supportedFiles)
     }
@@ -212,14 +213,17 @@ export const KnowledgeBase: React.FC = () => {
             />
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                Select Files or Folder (PDF, DOCX, TXT)
+                Select Files or Folder (PDF, DOCX, TXT, XLSX for metadata)
               </label>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+                Include an Excel file (.xlsx) with columns: filename, title, author, journal, year, doi, pmid, abstract, keywords
+              </p>
               <div className="flex gap-2">
                 <input
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept=".pdf,.docx,.txt"
+                  accept=".pdf,.docx,.txt,.xlsx,.xls"
                   onChange={handleFileSelect}
                   className="hidden"
                 />
@@ -253,21 +257,25 @@ export const KnowledgeBase: React.FC = () => {
           {selectedFiles.length > 0 && (
             <div className="space-y-2">
               <p className="text-sm font-medium">Selected Files ({selectedFiles.length}):</p>
-              {selectedFiles.map((file, index) => (
-                <div key={index} className="flex items-center justify-between p-2 bg-gray-50 dark:bg-gray-800 rounded">
-                  <div className="flex items-center gap-2">
-                    <FiFile className="text-gray-500" />
-                    <span className="text-sm">{file.name}</span>
-                    <span className="text-xs text-gray-500">({(file.size / 1024).toFixed(1)} KB)</span>
+              {selectedFiles.map((file, index) => {
+                const isExcel = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls')
+                return (
+                  <div key={index} className={`flex items-center justify-between p-2 rounded ${isExcel ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700' : 'bg-gray-50 dark:bg-gray-800'}`}>
+                    <div className="flex items-center gap-2">
+                      <FiFile className={isExcel ? 'text-blue-500' : 'text-gray-500'} />
+                      <span className="text-sm">{file.name}</span>
+                      <span className="text-xs text-gray-500">({(file.size / 1024).toFixed(1)} KB)</span>
+                      {isExcel && <span className="text-xs bg-blue-100 dark:bg-blue-800 text-blue-700 dark:text-blue-300 px-2 py-0.5 rounded">Metadata</span>}
+                    </div>
+                    <button
+                      onClick={() => removeFile(index)}
+                      className="text-red-500 hover:text-red-700"
+                    >
+                      <FiX />
+                    </button>
                   </div>
-                  <button
-                    onClick={() => removeFile(index)}
-                    className="text-red-500 hover:text-red-700"
-                  >
-                    <FiX />
-                  </button>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
 
@@ -290,10 +298,18 @@ export const KnowledgeBase: React.FC = () => {
                   <p className="font-semibold text-green-800 dark:text-green-300">
                     {uploadResults.message}
                   </p>
+                  {uploadResults.excel_files_parsed > 0 && (
+                    <p className="mt-2 text-sm text-blue-700 dark:text-blue-400">
+                      📊 Parsed {uploadResults.excel_metadata_entries} metadata entries from {uploadResults.excel_files_parsed} Excel file(s)
+                    </p>
+                  )}
                   {uploadResults.processed.length > 0 && (
                     <ul className="mt-2 text-sm text-green-700 dark:text-green-400 space-y-1">
                       {uploadResults.processed.map((file: any, idx: number) => (
-                        <li key={idx}>✓ {file.filename} - {file.chunks_created} chunks created</li>
+                        <li key={idx}>
+                          ✓ {file.filename} - {file.chunks_created} chunks
+                          {file.metadata_from_excel && <span className="text-blue-600 dark:text-blue-400"> (with Excel metadata)</span>}
+                        </li>
                       ))}
                     </ul>
                   )}

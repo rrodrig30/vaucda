@@ -59,18 +59,18 @@ class LLMManager:
             "redundant_providers": os.getenv("LLM_REDUNDANT_PROVIDERS", "anthropic,openai").split(","),
             "ollama": {
                 "base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-                "model": os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
-                "timeout": int(os.getenv("OLLAMA_TIMEOUT", "600")),  # 10 minutes for large context/complex notes
+                "model": os.getenv("OLLAMA_DEFAULT_MODEL", "llama3.1:8b"),
+                "timeout": int(os.getenv("OLLAMA_TIMEOUT", "3600")),  # 1 hour for complex note generation
             },
             "anthropic": {
                 "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
-                "model": os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
-                "timeout": int(os.getenv("ANTHROPIC_TIMEOUT", "120")),
+                "model": os.getenv("ANTHROPIC_DEFAULT_MODEL", "claude-3-5-sonnet-20241022"),
+                "timeout": int(os.getenv("ANTHROPIC_TIMEOUT", "3600")),  # 1 hour for complex note generation
             },
             "openai": {
                 "api_key": os.getenv("OPENAI_API_KEY", ""),
-                "model": os.getenv("OPENAI_MODEL", "gpt-4o"),
-                "timeout": int(os.getenv("OPENAI_TIMEOUT", "120")),
+                "model": os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o"),
+                "timeout": int(os.getenv("OPENAI_TIMEOUT", "3600")),  # 1 hour for complex note generation
                 "organization": os.getenv("OPENAI_ORGANIZATION", ""),
             },
         }
@@ -108,39 +108,22 @@ class LLMManager:
         """
         Select appropriate model based on task type.
 
+        NOTE: Model selection is now controlled by user settings in the database.
+        This method returns None to use the provider's configured default model,
+        which comes from environment variables (set by user preferences).
+
+        No hardcoded models - all model selection respects user configuration.
+
         Args:
             task_type: Type of task
             provider: Provider name
 
         Returns:
-            Model name or None to use default
+            None to use provider default (from environment/user settings)
         """
-        # Model selection strategy based on task complexity
-        if provider == "ollama":
-            if task_type == TaskType.NOTE_GENERATION:
-                return "llama3.1:70b"  # Large model for complex notes
-            elif task_type == TaskType.SIMPLE_NOTE:
-                return "llama3.1:8b"  # Smaller model for simple notes
-            elif task_type == TaskType.CALCULATOR:
-                return "phi3:medium"  # Fast model for calculator interpretation
-            elif task_type == TaskType.DATA_EXTRACTION:
-                return "qwen3-coder:30b"  # Code-oriented model for structured data extraction
-            else:
-                return "llama3.1:8b"  # Default
-
-        elif provider == "anthropic":
-            if task_type == TaskType.NOTE_GENERATION:
-                return "claude-3-5-sonnet-20241022"  # Best model for complex tasks
-            else:
-                return "claude-3-haiku-20240307"  # Fast/cheap for simple tasks
-
-        elif provider == "openai":
-            if task_type == TaskType.NOTE_GENERATION:
-                return "gpt-4o"  # Best model for complex tasks
-            else:
-                return "gpt-4o-mini"  # Fast/cheap for simple tasks
-
-        return None  # Use provider default
+        # Return None to use the default model configured for this provider
+        # User settings take precedence via OLLAMA_DEFAULT_MODEL, etc.
+        return None
 
     async def generate(
         self,

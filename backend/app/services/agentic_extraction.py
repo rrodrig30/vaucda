@@ -316,7 +316,7 @@ def _filter_urologic_relevance(hpi_text: str) -> str:
                             task_type=TaskType.DATA_EXTRACTION,
                             temperature=0.2,
                             max_tokens=250,
-                            model="llama3.1:8b"
+                            model=None  # Uses configured default model from .env/user settings
                         )
                     return new_loop.run_until_complete(_gen())
                 finally:
@@ -454,7 +454,7 @@ Output ONLY the HPI text, starting directly with the content (no "HPI:" header).
                         task_type=TaskType.DATA_EXTRACTION,
                         temperature=0.2,
                         max_tokens=1000,
-                        model="llama3.1:8b"
+                        model=None  # Uses configured default model from .env/user settings
                     )
                 return new_loop.run_until_complete(_gen())
             finally:
@@ -651,7 +651,7 @@ SYNTHESIZED {section_display_name.upper()}:"""
                 task_type=TaskType.DATA_EXTRACTION,
                 temperature=0.2,  # Low temperature for factual synthesis
                 max_tokens=2000,
-                model="llama3.1:8b"
+                model=None  # Uses configured default model from .env/user settings
             )
 
         # Handle different event loop scenarios

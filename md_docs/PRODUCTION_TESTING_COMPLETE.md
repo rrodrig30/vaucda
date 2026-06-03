@@ -293,8 +293,8 @@ python setup_test_users.py cleanup
 vim docker-compose.yml  # Update GPU config
 
 # 2. Create production .env files
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
+cp backend/.env backend/.env
+cp frontend/.env frontend/.env
 # Edit with production values
 
 # 3. Start all services

@@ -5,8 +5,98 @@ Splits clinical documents into GU and non-GU notes based on STANDARD TITLE marke
 """
 
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import datetime
+
+
+# Date patterns tried in priority order. The first one that matches wins.
+# The captured group should yield the date string we want to store. Order
+# reflects reliability: the VA "DATE OF NOTE:" stamp is the canonical
+# date associated with a STANDARD TITLE block, so try that first.
+_NOTE_DATE_PATTERNS = [
+    # 1. "DATE OF NOTE: DEC 03, 2025@10:48" — canonical VA stamp.
+    re.compile(
+        r'DATE\s+OF\s+NOTE:\s*'
+        r'([A-Za-z]{3,9}\s+\d{1,2}\s*,?\s*\d{4})'
+        r'(?:@\d{1,2}:\d{2})?',
+        re.IGNORECASE,
+    ),
+    # 2. "ENTRY DATE: DEC 03, 2025" — VA's secondary timestamp.
+    re.compile(
+        r'ENTRY\s+DATE:\s*'
+        r'([A-Za-z]{3,9}\s+\d{1,2}\s*,?\s*\d{4})'
+        r'(?:@\d{1,2}:\d{2}(?::\d{2})?)?',
+        re.IGNORECASE,
+    ),
+    # 3. "Signed: 12/03/2025 11:14" — signature line (numeric date).
+    re.compile(
+        r'(?:^|\n)\s*Signed:\s*'
+        r'(\d{1,2}/\d{1,2}/\d{2,4})'
+        r'(?:\s+\d{1,2}:\d{2})?',
+    ),
+    # 4. "Date Signed: ..." / "Date/Time: ..." / "Date: ..." (numeric).
+    re.compile(
+        r'Date(?:\s+Signed|\s*[:/]\s*Time)?:\s*'
+        r'(\d{1,2}/\d{1,2}/\d{2,4})'
+        r'(?:\s+\d{1,2}:\d{2})?',
+        re.IGNORECASE,
+    ),
+    # 5. "Date Signed: MON DD, YYYY" (text-month variant).
+    re.compile(
+        r'Date\s+Signed:\s*'
+        r'([A-Za-z]{3,9}\s+\d{1,2}\s*,?\s*\d{4})',
+        re.IGNORECASE,
+    ),
+    # 6. "Date Reported:" / "Report Released Date:" / "Date Verified:".
+    re.compile(
+        r'(?:Date\s+Reported|Report\s+Released\s+Date(?:/Time)?|Date\s+Verified):\s*'
+        r'([A-Za-z]{3,9}\s+\d{1,2}\s*,?\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4})',
+        re.IGNORECASE,
+    ),
+]
+
+
+def _normalize_note_date(raw: str) -> str:
+    """Normalize a captured date to "MON DD, YYYY" for consistent display.
+
+    Accepts the formats matched by _NOTE_DATE_PATTERNS:
+        "DEC 03, 2025"     -> "Dec 03, 2025"
+        "12/03/2025"       -> "Dec 03, 2025"
+        "12/03/25"         -> "Dec 03, 2025"  (2-digit year, pivot 50)
+        "December 3, 2025" -> "Dec 03, 2025"
+    Returns the raw input on parse failure so the note still has SOME
+    date string rather than silently dropping it.
+    """
+    raw = raw.strip()
+    if not raw:
+        return ""
+    for fmt_in, fmt_out in (
+        ('%m/%d/%Y', '%b %d, %Y'),
+        ('%m/%d/%y', '%b %d, %Y'),
+        ('%b %d, %Y', '%b %d, %Y'),
+        ('%b %d %Y', '%b %d, %Y'),
+        ('%B %d, %Y', '%b %d, %Y'),
+        ('%B %d %Y', '%b %d, %Y'),
+    ):
+        try:
+            dt = datetime.strptime(raw.replace(',', ', ').replace('  ', ' '), fmt_in)
+            return dt.strftime(fmt_out)
+        except ValueError:
+            continue
+    # Last-ditch: collapse internal whitespace and return uppercase as-is.
+    return ' '.join(raw.split())
+
+
+def _extract_note_date(section: str) -> str:
+    """Pull the most reliable date out of a STANDARD TITLE section.
+
+    Tries `_NOTE_DATE_PATTERNS` in order; returns "" if none match.
+    """
+    for pat in _NOTE_DATE_PATTERNS:
+        m = pat.search(section)
+        if m:
+            return _normalize_note_date(m.group(1))
+    return ""
 
 
 def identify_notes(clinical_document: str) -> Dict[str, List[Dict[str, str]]]:
@@ -93,12 +183,18 @@ def identify_notes(clinical_document: str) -> Dict[str, List[Dict[str, str]]]:
 
         title = title_match.group(1).strip()
 
-        # Extract date if present
-        # Common VA formats: "Date Signed: 10/17/2025", "Date/Time: 10/17/2025 14:30"
-        date = ""
-        date_match = re.search(r'Date(?:\s+Signed|\s*[:/]\s*Time)?:\s*(\d{1,2}/\d{1,2}/\d{4}(?:\s+\d{1,2}:\d{2})?)', section, re.IGNORECASE)
-        if date_match:
-            date = date_match.group(1).strip()
+        # Extract date. The VA "DATE OF NOTE: MON DD, YYYY@HH:MM"
+        # stamp is the canonical timestamp for a STANDARD TITLE block
+        # — every clinic/consult note has one, and it's the date the
+        # encounter actually occurred (vs the date the note was signed,
+        # which can be days later). The helper tries that first, then
+        # falls back through ENTRY DATE, Signed:, Date Signed:, etc.
+        # Previous regex only matched MM/DD/YYYY numeric dates, so the
+        # MON-DD-YYYY format that VA actually emits was silently
+        # dropped — every note ended up with date="". Downstream HPI
+        # synthesis then couldn't differentiate prior-visit snapshots
+        # by time.
+        date = _extract_note_date(section)
 
         # Create note object
         note = {

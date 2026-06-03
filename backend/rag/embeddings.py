@@ -58,9 +58,15 @@ class EmbeddingGenerator:
         else:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load model
-        logger.info(f"Loading embedding model: {model_name} on {self.device}")
-        self.model = SentenceTransformer(model_name, device=self.device)
+        # Load model. local_files_only=True prevents HuggingFace Hub
+        # revision-check HEAD requests that can hang on stale CloudFront
+        # connections and freeze worker threads.
+        logger.info(f"Loading embedding model: {model_name} on {self.device} (local_files_only)")
+        self.model = SentenceTransformer(
+            model_name,
+            device=self.device,
+            local_files_only=True,
+        )
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
         logger.info(f"Model loaded. Embedding dimension: {self.embedding_dim}")
 

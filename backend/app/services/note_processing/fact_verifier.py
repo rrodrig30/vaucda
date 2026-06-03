@@ -26,8 +26,14 @@ def get_sentence_transformer():
     if _sentence_transformer is None:
         try:
             from sentence_transformers import SentenceTransformer
-            _sentence_transformer = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("Loaded sentence-transformers model: all-MiniLM-L6-v2")
+            # local_files_only=True prevents HuggingFace Hub HEAD requests
+            # (which can hang on stale CloudFront connections, freezing
+            # the worker for hours).
+            _sentence_transformer = SentenceTransformer(
+                'all-MiniLM-L6-v2',
+                local_files_only=True,
+            )
+            logger.info("Loaded sentence-transformers model: all-MiniLM-L6-v2 (local_files_only)")
         except ImportError:
             logger.warning("sentence-transformers not installed. Vector verification disabled.")
             _sentence_transformer = False

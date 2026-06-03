@@ -111,7 +111,7 @@ pip install -r requirements.txt
 
 ```bash
 # Copy template
-cp .env.example .env
+cp .env .env
 
 # Edit configuration
 nano .env

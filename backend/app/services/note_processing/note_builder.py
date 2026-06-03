@@ -5,15 +5,29 @@ Orchestrates the entire note processing pipeline:
 1. Identify notes (GU and non-GU)
 2. Extract data from notes
 3. Extract document-level data
-4. Synthesize all sections
+4. Synthesize all sections (PARALLEL execution for performance)
 5. Assemble final urology clinic note
+
+Supports task-specific LLM configuration via LLMTaskConfig.
+Stage 1 primarily uses regex extraction with minimal LLM use.
+
+Performance optimizations:
+- Independent synthesis agents run in parallel using ThreadPoolExecutor
+- Reduces total processing time from sequential sum to max single agent time
 """
 
 from pathlib import Path
+from typing import Optional, TYPE_CHECKING, Dict, Any, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+if TYPE_CHECKING:
+    from app.services.llm_config_manager import LLMTaskConfig
+
 from .note_identifier import identify_notes
 from .agents.gu_agent import process_gu_notes
 from .agents.non_gu_agent import process_non_gu_notes
-from .extractors import extract_pmh, extract_medications, extract_pathology, extract_imaging, extract_allergies_from_document
+from .extractors import extract_pmh, extract_medications, extract_pathology, extract_imaging, extract_allergies_from_document, extract_sexual
 from .extractors.psh_extractor import extract_psh
 from .extractors.consult_request_extractor import (
     extract_consult_request,
@@ -22,7 +36,8 @@ from .extractors.consult_request_extractor import (
 )
 from .extractors.provider_note_scanner import scan_provider_notes_for_urologic_content
 from .extractors.psa_extractor import extract_psa
-from .extractors.lab_extractor import extract_labs, extract_stone_labs, extract_calcium_series
+from .extractors.lab_extractor import extract_labs, extract_calcium_series
+from .extractors.stone_extractor import extract_stone_labs
 from .extractors.endocrine_extractor import extract_endocrine_labs
 from .extractors.social_extractor import extract_social, extract_social_with_change_detection
 from .extractors.family_extractor import extract_family
@@ -34,6 +49,7 @@ from .extractors.specialty_urologic_scanner import (
     format_cross_specialty_context
 )
 from .visit_progression_analyzer import analyze_visit_progression
+from .llm_helper import set_current_task_config
 
 # Import synthesis agents
 from .agents.cc_agent import synthesize_cc
@@ -131,20 +147,42 @@ documenting the encounter.
 """
 
 
-def build_urology_note(clinical_document: str) -> str:
+def build_urology_note(
+    clinical_text: str,
+    task_config: Optional["LLMTaskConfig"] = None
+) -> str:
     """
     Build a comprehensive urology clinic note from a clinical document.
 
     This is the main entry point for the new agent-based architecture.
 
     Args:
-        clinical_document: Full clinical document text
+        clinical_text: Full clinical document text (aliased from clinical_document)
+        task_config: Optional LLMTaskConfig for Stage 1 LLM settings
 
     Returns:
         Formatted urology clinic note
+
+    Note:
+        Stage 1 primarily uses regex-based extraction for speed.
+        LLM is used sparingly for synthesis where needed.
+        The task_config is set globally for all agent LLM calls.
     """
+    # Set the task config for all agents to use via thread-local storage
+    # This ensures all synthesize_with_llm calls use the user's configured model
+    set_current_task_config(task_config)
+
+    clinical_document = clinical_text  # Alias for backward compatibility
+
+    # Extract visit date if prepended to document (from batch processing)
+    import re as _re
+    _visit_date_match = _re.match(r'^VISIT DATE:\s*(\S+)\s*\n', clinical_document)
+    _visit_date = _visit_date_match.group(1) if _visit_date_match else ""
+
     print("\n" + "="*80)
     print("BUILDING UROLOGY NOTE - New Agent-Based Architecture")
+    if _visit_date:
+        print(f"VISIT DATE: {_visit_date}")
     print("="*80)
 
     # Step 1: Identify notes
@@ -160,7 +198,7 @@ def build_urology_note(clinical_document: str) -> str:
 
     # Step 2: Extract data from notes
     print("\n[2/5] Extracting data from notes...")
-    gu_notes = process_gu_notes(notes_dict["gu_notes"])
+    gu_notes = process_gu_notes(notes_dict["gu_notes"], visit_date=_visit_date)
     non_gu_notes = process_non_gu_notes(notes_dict["non_gu_notes"])
     print(f"      Processed {len(gu_notes)} GU note dictionaries")
     print(f"      Processed {len(non_gu_notes)} non-GU note dictionaries")
@@ -215,12 +253,13 @@ def build_urology_note(clinical_document: str) -> str:
     document_pathology = extract_pathology(clinical_document)
     document_imaging = extract_imaging(clinical_document)
     document_psa = extract_psa(clinical_document)
-    document_labs = extract_labs(clinical_document)
+    document_labs = extract_labs(clinical_document, visit_date=_visit_date)
     document_stone_labs = extract_stone_labs(clinical_document)
     document_calcium = extract_calcium_series(clinical_document)
     document_endocrine = extract_endocrine_labs(clinical_document)
     document_dietary = extract_diet(clinical_document)
     document_allergies = extract_allergies_from_document(clinical_document)
+    document_sexual = extract_sexual(clinical_document)
 
     print(f"      PMH: {len(document_pmh.split(chr(10)) if document_pmh else [])} diagnoses")
     print(f"      Medications: {len(document_medications.split(chr(10)) if document_medications else [])} meds")
@@ -235,6 +274,7 @@ def build_urology_note(clinical_document: str) -> str:
     print(f"      Family: {'Found' if document_family else 'None'}")
     print(f"      Dietary: {'Found' if document_dietary else 'None'}")
     print(f"      Allergies: {'Found' if document_allergies else 'None'}")
+    print(f"      Sexual: {'Found' if document_sexual else 'None'}")
 
     # Step 4: Synthesize all sections
     print("\n[4/5] Synthesizing sections...")
@@ -266,6 +306,72 @@ def build_urology_note(clinical_document: str) -> str:
         patient_age = demographics.get('age')
         patient_sex = demographics.get('sex')
         patient_race = demographics.get('race')
+
+    # Calculate accurate age from DOB and Date of Service. Computed age
+    # ALWAYS wins over chart-text age when DOB is available — the
+    # chart-text age comes from "most common Age:" markers across the
+    # source notes, which may be stale (from prior visits where the
+    # patient was younger). When visit_date is missing, today's date is
+    # the date of service (this is what's being documented right now).
+    from datetime import datetime
+    # Try multiple DOB formats commonly seen in VA charts:
+    #   "DOB: 03/09/1950", "Date of Birth: 03-09-1950", "DOB:1950-03-09",
+    #   "DOB MMM DD,YYYY".
+    dob = None
+    dob_str_found = None
+    dob_match = _re.search(
+        r'(?:DOB|Date\s+of\s+[Bb]irth)\s*[:=]\s*'
+        r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}'
+        r'|\d{4}[/-]\d{1,2}[/-]\d{1,2}'
+        r'|[A-Za-z]{3}\s+\d{1,2}\s*,?\s*\d{4})',
+        clinical_document,
+    )
+    if dob_match:
+        dob_str_found = dob_match.group(1).strip()
+        for fmt in (
+            '%m/%d/%Y', '%m/%d/%y',
+            '%m-%d-%Y', '%m-%d-%y',
+            '%Y-%m-%d', '%Y/%m/%d',
+            '%b %d, %Y', '%b %d %Y', '%B %d, %Y',
+        ):
+            try:
+                dob = datetime.strptime(dob_str_found.replace('-', '/').replace(',', ''),
+                                        fmt.replace('-', '/').replace(',', ''))
+                break
+            except ValueError:
+                continue
+
+    visit_dt = None
+    if _visit_date:
+        for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m/%d/%y'):
+            try:
+                visit_dt = datetime.strptime(_visit_date, fmt)
+                break
+            except ValueError:
+                continue
+    if visit_dt is None:
+        # Fall back to today as the date of service. The note we're
+        # generating reflects TODAY's visit, so today is the correct
+        # default when no explicit visit_date was provided.
+        visit_dt = datetime.now()
+
+    if dob:
+        age_at_visit = visit_dt.year - dob.year
+        if (visit_dt.month, visit_dt.day) < (dob.month, dob.day):
+            age_at_visit -= 1
+        if age_at_visit != patient_age:
+            print(
+                f"      Age corrected: chart-text age={patient_age!r} -> "
+                f"computed age={age_at_visit} from DOB {dob_str_found} + "
+                f"DOS {visit_dt.strftime('%Y-%m-%d')}"
+            )
+        patient_age = str(age_at_visit)
+    elif patient_age:
+        print(
+            f"      WARNING: Age {patient_age!r} taken from chart text "
+            f"(no DOB found). May be stale if the source contains old "
+            f"notes; verify against patient banner."
+        )
 
     if patient_name or patient_ssn or patient_age:
         print(f"      Patient: {patient_name} (SSN: {patient_ssn}, Age: {patient_age}, Sex: {patient_sex}, Race: {patient_race})")
@@ -324,9 +430,12 @@ def build_urology_note(clinical_document: str) -> str:
             if not patient_race and consult_data.get('race'):
                 patient_race = consult_data.get('race')
 
-    # Use consult CC/HPI if available, otherwise synthesize from notes
-    cc = consult_cc if consult_cc else synthesize_cc(gu_notes, non_gu_notes)
-    print(f"      CC: {len(cc) if cc else 0} chars")
+    # CC + HPI synthesis is deferred into the parallel-synthesis block
+    # below (see synthesis_tasks['cc']/['hpi']) so the LLM call(s) run
+    # concurrently with the other ~18 agents instead of sequentially
+    # before them. With cloud thinking models this saves 30-90s of wall
+    # time on note generation. The fast-path values (consult_cc,
+    # consult_hpi) are still used directly when present.
 
     # Analyze visit progression (what changed since last urology visit)
     # This is for followup visits - skip for consults (new patients)
@@ -364,11 +473,14 @@ def build_urology_note(clinical_document: str) -> str:
                 prior_plans.append(plan)
 
         if prior_assessments or prior_plans:
+            # use_llm=False for Stage 1 - faster regex-only extraction
+            # Full LLM synthesis happens in Stage 2 for Assessment/Plan
             prior_ap_context = synthesize_prior_ap_context(
                 prior_assessments=prior_assessments,
                 prior_plans=prior_plans,
                 patient_age=patient_age,
-                patient_sex=patient_sex
+                patient_sex=patient_sex,
+                use_llm=False  # Skip LLM call in Stage 1 for performance
             )
             prior_ap_context_for_hpi = format_prior_ap_for_hpi(prior_ap_context)
             if prior_ap_context_for_hpi:
@@ -378,101 +490,260 @@ def build_urology_note(clinical_document: str) -> str:
         else:
             print("      No prior assessments or plans found in GU notes")
 
-    # For consults, synthesize comprehensive HPI from all available data
-    # Per instructions.txt workflow:
-    # 1. Initial HPI from Reason for Request + Reason for Consult Request
-    # 2. Combine with urologic content from provider notes
-    # 3. Synthesize comprehensive HPI
-    if is_consult and consult_hpi:
-        # Get Reason For Request (separate from Reason for Consult Request)
-        reason_for_request = consult_data.get('reason_for_request', '') if consult_data else ''
+    # HPI synthesis is also deferred into the parallel block — see
+    # synthesis_tasks['hpi'] below. The branch logic (consult vs.
+    # clinic) is captured inside the closure so the dispatch happens at
+    # task-execution time.
 
-        # Use enhanced consult HPI synthesis with provider context
-        # Pass PSA, pathology, and labs so HPI reflects current clinical status
-        hpi = synthesize_consult_hpi(
-            consult_reason=consult_hpi,
-            patient_name=patient_name,
-            patient_age=patient_age,
-            patient_sex=patient_sex,  # NEW: from TELEPHONE NOTE demographics
-            pmh=document_pmh,
-            psh=None,  # Will be synthesized later
-            medications=document_medications,
-            imaging=document_imaging,
-            pcp_note_data=pcp_data if is_consult and pcp_note_content else None,
-            provider_urologic_context=provider_urologic_context,  # NEW: from provider note scanning
-            reason_for_request=reason_for_request,  # NEW: additional request details
-            psa_data=document_psa,
-            pathology_data=document_pathology,
-            labs_data=document_labs
+    # =========================================================================
+    # PARALLEL SYNTHESIS EXECUTION
+    # All remaining synthesis agents are independent and can run concurrently
+    # This reduces total time from sequential sum to ~max single agent time
+    # =========================================================================
+    print("      Running parallel synthesis agents...")
+    parallel_start = time.time()
+
+    # Define synthesis tasks as lambdas to capture current context
+    # Each task returns (key, result) tuple for easy result collection
+    synthesis_tasks: Dict[str, Callable] = {}
+
+    # CC + HPI deferred to the parallel block (2026-05-06 perf change).
+    # Both LLM calls were previously sequential before this block, adding
+    # 30-90s of wall time on cloud thinking models. The branch logic
+    # (consult vs. clinic) is captured inside the closures so dispatch
+    # happens at task-execution time.
+    _consult_cc_val = consult_cc
+    _consult_hpi_val = consult_hpi
+    _is_consult_val = is_consult
+    _consult_data_val = consult_data
+    _patient_name_val = patient_name
+    _patient_age_val = patient_age
+    _patient_sex_val = patient_sex
+    _doc_pmh = document_pmh
+    _doc_psa = document_psa
+    _doc_path = document_pathology
+    _doc_labs = document_labs
+    _doc_imaging = document_imaging
+    _doc_meds = document_medications
+    _pcp_note_content = pcp_note_content
+    _pcp_data = pcp_data
+    _prov_uro_context = provider_urologic_context
+    _cross_specialty_context = cross_specialty_context
+    _visit_progression = visit_progression
+    _prior_ap_for_hpi = prior_ap_context_for_hpi
+
+    _doc_psh_cc = document_psh
+    _clinical_doc_cc = clinical_document
+
+    def _build_cc():
+        if _consult_cc_val:
+            return _consult_cc_val
+        # Pass urologic clinical context so synthesize_cc can:
+        #   - derive a CC from PMH / pathology / PSA when no GU-note CC
+        #     is available (or all extracted CCs are non-urologic), and
+        #   - reframe stale "persistent / rising PSA / elevated PSA"
+        #     CCs to "Follow-up after <treatment> for prostate cancer"
+        #     when PSH or the raw document shows definitive treatment
+        #     was completed AND the PSA trend confirms biochemical
+        #     response. Without document_psh + clinical_document the
+        #     reframe path can't see treatment history at all.
+        return synthesize_cc(
+            gu_notes,
+            non_gu_notes,
+            document_pmh=_doc_pmh,
+            document_pathology=_doc_path,
+            document_psa=_doc_psa,
+            document_psh=_doc_psh_cc,
+            clinical_document=_clinical_doc_cc,
         )
-        print(f"      HPI synthesized from consult + provider context + clinical data")
-    else:
-        # Pass PSA, pathology, labs, and imaging so HPI reflects current clinical status
-        # Also pass cross-specialty context, visit progression, and prior A&P context for temporal awareness
-        hpi = synthesize_hpi(
+
+    def _build_hpi():
+        if _is_consult_val and _consult_hpi_val:
+            reason_for_request = (
+                _consult_data_val.get('reason_for_request', '')
+                if _consult_data_val else ''
+            )
+            return synthesize_consult_hpi(
+                consult_reason=_consult_hpi_val,
+                patient_name=_patient_name_val,
+                patient_age=_patient_age_val,
+                patient_sex=_patient_sex_val,
+                pmh=_doc_pmh,
+                psh=None,
+                medications=_doc_meds,
+                imaging=_doc_imaging,
+                pcp_note_data=_pcp_data if _is_consult_val and _pcp_note_content else None,
+                provider_urologic_context=_prov_uro_context,
+                reason_for_request=reason_for_request,
+                psa_data=_doc_psa,
+                pathology_data=_doc_path,
+                labs_data=_doc_labs,
+            )
+        return synthesize_hpi(
             gu_notes, non_gu_notes,
-            psa_data=document_psa,
-            pathology_data=document_pathology,
-            labs_data=document_labs,
-            imaging_data=document_imaging,
-            cross_specialty_context=cross_specialty_context,
-            visit_progression=visit_progression,
-            prior_ap_context=prior_ap_context_for_hpi
+            psa_data=_doc_psa,
+            pathology_data=_doc_path,
+            labs_data=_doc_labs,
+            imaging_data=_doc_imaging,
+            cross_specialty_context=_cross_specialty_context,
+            visit_progression=_visit_progression,
+            prior_ap_context=_prior_ap_for_hpi,
+            patient_name=_patient_name_val,
+            patient_age=_patient_age_val,
+            patient_sex=_patient_sex_val,
         )
-    print(f"      HPI: {len(hpi) if hpi else 0} chars")
 
-    ipss = synthesize_ipss(gu_notes)
-    print(f"      IPSS: {len(ipss) if ipss else 0} chars")
+    synthesis_tasks['cc'] = _build_cc
+    synthesis_tasks['hpi'] = _build_hpi
 
-    # For dietary, prefer document-level extraction, then GU notes
-    dhx = document_dietary if document_dietary else synthesize_diet(gu_notes)
-    pmh = synthesize_pmh(document_pmh, gu_notes, non_gu_notes)
-    # For consults, use document-level PSH if available
+    # IPSS synthesis
+    # Capture _visit_date in closure
+    _vd = _visit_date
+    synthesis_tasks['ipss'] = lambda: synthesize_ipss(gu_notes, visit_date=_vd)
+
+    # Dietary - prefer document-level extraction, then GU notes
+    if document_dietary:
+        synthesis_tasks['dhx'] = lambda: document_dietary
+    else:
+        synthesis_tasks['dhx'] = lambda: synthesize_diet(gu_notes)
+
+    # PMH synthesis
+    synthesis_tasks['pmh'] = lambda: synthesize_pmh(document_pmh, gu_notes, non_gu_notes)
+
+    # PSH synthesis - consult vs clinic logic
     if is_consult and document_psh:
-        psh = synthesize_psh([{"PSH": document_psh}], [])
+        synthesis_tasks['psh'] = lambda: synthesize_psh([{"PSH": document_psh}], [])
     else:
-        psh = synthesize_psh(gu_notes, non_gu_notes)
+        synthesis_tasks['psh'] = lambda: synthesize_psh(gu_notes, non_gu_notes)
 
-    # For consults, prefer document-level data (labs are in full document, not GU notes)
+    # Social/Family - consult prefers document-level data
     if is_consult:
-        social = document_social if document_social else synthesize_social(gu_notes, non_gu_notes)
-        family = document_family if document_family else synthesize_family(gu_notes, non_gu_notes)
-        # For consults, always prefer document-level PSA (comes from lab results)
-        # Pass through PSA agent for proper formatting ([r] prefix, spacing)
-        if document_psa:
-            psa = synthesize_psa([{"PSA": document_psa}])
+        if document_social:
+            synthesis_tasks['social'] = lambda: document_social
         else:
-            psa = synthesize_psa(gu_notes)
-        endocrine = document_endocrine if document_endocrine else synthesize_endocrine_labs(gu_notes)
-        labs = document_labs if document_labs else synthesize_general_labs(gu_notes)
-        # Use stone labs directly from document extraction
-        stone = document_stone_labs if document_stone_labs else synthesize_stone_labs(gu_notes)
-        # Don't append calcium series to general labs - it should only show if abnormal (via filtering) or in STONE LABS section
+            synthesis_tasks['social'] = lambda: synthesize_social(gu_notes, non_gu_notes)
+        if document_family:
+            synthesis_tasks['family'] = lambda: document_family
+        else:
+            synthesis_tasks['family'] = lambda: synthesize_family(gu_notes, non_gu_notes)
     else:
-        social = synthesize_social(gu_notes, non_gu_notes)
-        family = synthesize_family(gu_notes, non_gu_notes)
-        # For clinic notes, ALSO prefer document-level PSA from lab results if available
-        # PSA lab values may be in lab sections, not within GU note text itself
-        if document_psa:
-            psa = synthesize_psa([{"PSA": document_psa}])
-        else:
-            psa = synthesize_psa(gu_notes)
-        endocrine = synthesize_endocrine_labs(gu_notes)
-        labs = synthesize_general_labs(gu_notes)
-        stone = document_stone_labs if document_stone_labs else synthesize_stone_labs(gu_notes)
-        # Don't append calcium series to general labs - it should only show if abnormal (via filtering) or in STONE LABS section
+        synthesis_tasks['social'] = lambda: synthesize_social(gu_notes, non_gu_notes)
+        synthesis_tasks['family'] = lambda: synthesize_family(gu_notes, non_gu_notes)
 
-    sexual = synthesize_sexual(gu_notes, non_gu_notes)
-    pathology = synthesize_pathology(document_pathology, gu_notes)
-    testosterone = synthesize_testosterone(gu_notes)
-    medications = synthesize_medications(document_medications, gu_notes)
-    allergies = synthesize_allergies(gu_notes, non_gu_notes, document_allergies=document_allergies)
-    imaging = synthesize_imaging(document_imaging, gu_notes)
-    ros = synthesize_ros(gu_notes, non_gu_notes)
-    pe = synthesize_pe(gu_notes, non_gu_notes, patient_sex=patient_sex)
+    # PSA synthesis - prefer document-level
+    if document_psa:
+        # Need to capture document_psa in closure properly
+        _doc_psa = document_psa
+        synthesis_tasks['psa'] = lambda: synthesize_psa([{"PSA": _doc_psa}])
+    else:
+        synthesis_tasks['psa'] = lambda: synthesize_psa(gu_notes)
+
+    # Lab-related synthesis
+    if is_consult:
+        if document_endocrine:
+            synthesis_tasks['endocrine'] = lambda: document_endocrine
+        else:
+            synthesis_tasks['endocrine'] = lambda: synthesize_endocrine_labs(gu_notes)
+        if document_labs:
+            synthesis_tasks['labs'] = lambda: document_labs
+        else:
+            synthesis_tasks['labs'] = lambda: synthesize_general_labs(gu_notes)
+        if document_stone_labs:
+            synthesis_tasks['stone'] = lambda: document_stone_labs
+        else:
+            synthesis_tasks['stone'] = lambda: synthesize_stone_labs(gu_notes)
+    else:
+        if document_endocrine:
+            synthesis_tasks['endocrine'] = lambda: document_endocrine
+        else:
+            synthesis_tasks['endocrine'] = lambda: synthesize_endocrine_labs(gu_notes)
+        if document_labs:
+            synthesis_tasks['labs'] = lambda: document_labs
+        else:
+            synthesis_tasks['labs'] = lambda: synthesize_general_labs(gu_notes)
+        if document_stone_labs:
+            synthesis_tasks['stone'] = lambda: document_stone_labs
+        else:
+            synthesis_tasks['stone'] = lambda: synthesize_stone_labs(gu_notes)
+
+    # Other independent synthesis agents
+    _doc_sexual = document_sexual
+    synthesis_tasks['sexual'] = lambda: synthesize_sexual(
+        gu_notes, non_gu_notes, document_sexual=_doc_sexual
+    )
+
+    # Capture document_pathology in closure
+    _doc_path = document_pathology
+    synthesis_tasks['pathology'] = lambda: synthesize_pathology(_doc_path, gu_notes)
+
+    synthesis_tasks['testosterone'] = lambda: synthesize_testosterone(gu_notes)
+
+    # Capture document_medications in closure
+    _doc_meds = document_medications
+    synthesis_tasks['medications'] = lambda: synthesize_medications(_doc_meds, gu_notes)
+
+    # Capture document_allergies in closure
+    _doc_allergies = document_allergies
+    synthesis_tasks['allergies'] = lambda: synthesize_allergies(gu_notes, non_gu_notes, document_allergies=_doc_allergies)
+
+    # Capture document_imaging in closure
+    _doc_imaging = document_imaging
+    synthesis_tasks['imaging'] = lambda: synthesize_imaging(_doc_imaging, gu_notes)
+
+    synthesis_tasks['ros'] = lambda: synthesize_ros(gu_notes, non_gu_notes)
+
+    # Capture patient_sex in closure
+    _pat_sex = patient_sex
+    synthesis_tasks['pe'] = lambda: synthesize_pe(gu_notes, non_gu_notes, patient_sex=_pat_sex)
+
+    # Execute all synthesis tasks in parallel using ThreadPoolExecutor
+    # Max workers = number of tasks for full parallelization
+    results: Dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=min(len(synthesis_tasks), 16)) as executor:
+        # Submit all tasks
+        future_to_key = {
+            executor.submit(task): key
+            for key, task in synthesis_tasks.items()
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                print(f"      WARNING: {key} synthesis failed: {e}")
+                results[key] = ""
+
+    # Extract results to named variables
+    cc = results.get('cc', '')
+    hpi = results.get('hpi', '')
+    ipss = results.get('ipss', '')
+    dhx = results.get('dhx', '')
+    pmh = results.get('pmh', '')
+    psh = results.get('psh', '')
+    social = results.get('social', '')
+    family = results.get('family', '')
+    psa = results.get('psa', '')
+    endocrine = results.get('endocrine', '')
+    labs = results.get('labs', '')
+    stone = results.get('stone', '')
+    sexual = results.get('sexual', '')
+    pathology = results.get('pathology', '')
+    testosterone = results.get('testosterone', '')
+    medications = results.get('medications', '')
+    allergies = results.get('allergies', '')
+    imaging = results.get('imaging', '')
+    ros = results.get('ros', '')
+    pe = results.get('pe', '')
+
+    parallel_time = time.time() - parallel_start
+    print(f"      CC: {len(cc) if cc else 0} chars")
+    print(f"      HPI: {len(hpi) if hpi else 0} chars")
+    print(f"      IPSS: {len(ipss) if ipss else 0} chars")
     # Note: Assessment and Plan are NOT generated in Stage 1 - they are completed during/after the visit
 
-    print(f"      Synthesized all sections")
+    print(f"      Parallel synthesis completed in {parallel_time:.2f}s ({len(synthesis_tasks)} agents)")
 
     # Step 5: Assemble final note
     print("\n[5/5] Assembling final note...")
@@ -512,7 +783,107 @@ def build_urology_note(clinical_document: str) -> str:
     print("NOTE BUILDING COMPLETE")
     print("="*80)
 
-    return final_note
+    # Clear the task config to prevent leaks between requests
+    set_current_task_config(None)
+
+    # ASCII-safety pass: convert Unicode look-alikes (en/em-dashes,
+    # curly quotes, NBSP, ellipsis, ...) to ASCII equivalents so the
+    # note pastes cleanly into VistA / CPRS. See text_normalizer.py.
+    from .text_normalizer import to_vista_ascii
+    return to_vista_ascii(final_note)
+
+
+def _group_labs_by_date(labs_text: str) -> str:
+    """
+    Group lab results by collection date, separated by blank lines.
+
+    Labs come in two formats:
+    - "TEST (Mon DD, YYYY): value..." → date in parentheses
+    - "TEST  value  units  range  [site] (Mon DD, YYYY)" → date at end
+
+    Labs sharing the same date are grouped together. Groups are separated
+    by a blank line, with the most recent group first.
+    """
+    import re
+    from datetime import datetime
+
+    if not labs_text or not labs_text.strip():
+        return labs_text
+
+    lines = labs_text.strip().split('\n')
+
+    # Extract date from each line
+    date_pattern_parens = re.compile(
+        r'\(([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\)'
+    )
+    date_pattern_inline = re.compile(
+        r'(\d{1,2}/\d{1,2}/\d{2,4})\s*:'
+    )
+
+    # Group lines by date
+    groups = {}  # date_key -> (datetime_obj, [lines])
+    no_date_lines = []
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        # Try parenthesized date: "(Sep 18, 2025)"
+        m = date_pattern_parens.search(line)
+        if m:
+            date_str = m.group(1)
+            # Parse for sorting
+            try:
+                dt = datetime.strptime(date_str, '%b %d, %Y')
+            except ValueError:
+                dt = None
+            if date_str not in groups:
+                groups[date_str] = (dt, [])
+            groups[date_str][1].append(line)
+            continue
+
+        # Try inline date: "9/4/25: PSA 7.46"
+        m = date_pattern_inline.search(line)
+        if m:
+            date_str = m.group(1)
+            try:
+                for fmt in ('%m/%d/%Y', '%m/%d/%y'):
+                    try:
+                        dt = datetime.strptime(date_str, fmt)
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    dt = None
+            except Exception:
+                dt = None
+            if date_str not in groups:
+                groups[date_str] = (dt, [])
+            groups[date_str][1].append(line)
+            continue
+
+        # No date found — keep at end
+        no_date_lines.append(line)
+
+    if not groups:
+        return labs_text  # No dates found, return as-is
+
+    # Sort groups by date (most recent first), None dates last
+    sorted_groups = sorted(
+        groups.values(),
+        key=lambda x: x[0] or datetime.min,
+        reverse=True
+    )
+
+    # Build output with blank lines between groups
+    result_parts = []
+    for _, group_lines in sorted_groups:
+        result_parts.append('\n'.join(group_lines))
+
+    if no_date_lines:
+        result_parts.append('\n'.join(no_date_lines))
+
+    return '\n\n'.join(result_parts)
 
 
 def assemble_note(**sections) -> str:
@@ -566,17 +937,21 @@ def assemble_note(**sections) -> str:
 
         note_parts.append(f"Patient: {patient_header}\n")
 
-    # CC (always required)
-    if sections.get("cc"):
-        note_parts.append(f"CC: {sections['cc']}\n")
-    else:
-        note_parts.append("CC: Unknown\n")
+    # CC (always required, always urologic). synthesize_cc never returns
+    # empty — it derives a CC from PMH/pathology/PSA when no GU-note CC
+    # is available, with "Urology follow-up" as the last-resort sentinel.
+    # If for some reason sections["cc"] is still falsy here, render the
+    # same sentinel rather than the old non-clinical "Unknown".
+    cc_text = sections.get("cc") or "Urology follow-up"
+    note_parts.append(f"CC: {cc_text}\n")
 
-    # HPI (always required)
-    if sections.get("hpi"):
-        note_parts.append(f"HPI: {sections['hpi']}\n")
-    else:
-        note_parts.append("HPI: Unknown\n")
+    # HPI (always required, always urologic). synthesize_hpi now falls
+    # back to a context-only narrative when no GU-note HPI exists but
+    # clinical context (PSA / pathology / imaging / etc.) is available.
+    # The "Unknown" placeholder is reserved for the rare case where we
+    # genuinely have no urologic data at all to write about.
+    hpi_text = sections.get("hpi") or "No prior urologic history documented"
+    note_parts.append(f"HPI: {hpi_text}\n")
 
     # Continue with all sections for both consults and clinic notes
 
@@ -608,9 +983,16 @@ def assemble_note(**sections) -> str:
     if sections.get("family"):
         note_parts.append(f"FAMILY HISTORY:\n{sections['family']}\n")
 
-    # Sexual History
+    # Sexual History — always emit the section header. If extraction
+    # produced nothing, render "Not documented" so a silent extraction
+    # failure is visible to the provider (mirrors DIETARY HISTORY's
+    # behavior above). Previously the entire section was skipped when
+    # synthesis returned empty, which made the gap impossible to spot
+    # in the rendered note.
     if sections.get("sexual"):
         note_parts.append(f"SEXUAL HISTORY:\n{sections['sexual']}\n")
+    else:
+        note_parts.append("SEXUAL HISTORY:\nNot documented\n")
 
     # PMH
     if sections.get("pmh"):
@@ -632,44 +1014,52 @@ def assemble_note(**sections) -> str:
     if sections.get("allergies"):
         note_parts.append(f"\nALLERGIES: {sections['allergies']}\n")
 
-    # Pathology
+    # Pathology — narrowed by 4 chars to fit CPRS line width
     if sections.get("pathology"):
-        note_parts.append(f"\n{'='*78}\nPATHOLOGY RESULTS:\n{sections['pathology']}\n")
+        note_parts.append(f"\n{'='*74}\nPATHOLOGY RESULTS:\n{sections['pathology']}\n")
     else:
         # Always include pathology section for urology notes
-        note_parts.append(f"\n{'='*78}\nPATHOLOGY RESULTS: None documented\n")
+        note_parts.append(f"\n{'='*74}\nPATHOLOGY RESULTS: None documented\n")
 
-    # Testosterone
+    # Testosterone — narrowed by 4 chars to fit CPRS line width
     if sections.get("testosterone"):
-        note_parts.append(f"\n{'='*78}\nTESTOSTERONE:\n{sections['testosterone']}\n")
+        note_parts.append(f"\n{'='*74}\nTESTOSTERONE:\n{sections['testosterone']}\n")
 
-    # Endocrine Labs
+    # Endocrine Labs — narrowed by 4 (2 each side of title) for CPRS width
     if sections.get("endocrine"):
-        note_parts.append(f"\n{'='*35}ENDOCRINE LABS {'='*29}\n{sections['endocrine']}\n")
+        note_parts.append(f"\n{'='*33}ENDOCRINE LABS {'='*27}\n{sections['endocrine']}\n")
 
-    # Stone Labs - Only show if patient has history of nephrolithiasis
+    # Stone Labs - show if patient has stone history OR if stone-specific
+    # data (24-hr urine, supersaturations, composition) was extracted
     if sections.get("stone"):
-        # Check for kidney stone history in PMH
         pmh_text = sections.get("pmh", "").lower()
         has_stone_history = any(term in pmh_text for term in [
             "nephrolithiasis", "kidney stone", "renal calculi", "urolithiasis",
             "calculus", "stone disease", "kidney calculi", "renal stone"
         ])
 
-        if has_stone_history:
-            note_parts.append(f"\n{'='*32}STONE RELATED LABS {'='*28}\n{sections['stone']}\n")
+        stone_text = sections["stone"]
+        has_stone_specific_data = any(marker in stone_text for marker in [
+            "24-Hour Urine", "Stone Risk", "Stone Composition",
+            "Supersaturation", "Litholink", "CaOx", "CaPO4", "Brushite",
+        ])
 
-    # General Labs (moved to after Stone Labs)
+        if has_stone_history or has_stone_specific_data:
+            # Narrowed by 4 (2 each side of title) for CPRS width
+            note_parts.append(f"\n{'='*30}STONE RELATED LABS {'='*26}\n{sections['stone']}\n")
+
+    # General Labs (moved to after Stone Labs) — narrowed by 4 for CPRS
     if sections.get("labs"):
-        note_parts.append(f"\n{'='*38} LABS {'='*34}\n{sections['labs']}\n")
+        grouped_labs = _group_labs_by_date(sections['labs'])
+        note_parts.append(f"\n{'='*36} LABS {'='*32}\n{grouped_labs}\n")
 
-    # Imaging
+    # Imaging — narrowed by 4 (2 each side of title) for CPRS width
     if sections.get("imaging"):
-        note_parts.append(f"\n{'='*38} IMAGING {'='*32}\n{sections['imaging']}\n")
+        note_parts.append(f"\n{'='*36} IMAGING {'='*30}\n{sections['imaging']}\n")
 
-    # ROS
+    # ROS — narrowed by 4 chars for CPRS width
     if sections.get("ros"):
-        note_parts.append(f"\n{'='*77}\n{sections['ros']}\n")
+        note_parts.append(f"\n{'='*73}\n{sections['ros']}\n")
 
     # PE
     if sections.get("pe"):

@@ -29,7 +29,7 @@ This will install all required packages (~2-3 minutes):
 
 ### 3. Create Environment File
 ```bash
-cp .env.example .env
+cp .env .env
 ```
 
 The `.env` file should contain:

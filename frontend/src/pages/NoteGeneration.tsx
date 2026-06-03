@@ -6,18 +6,21 @@ import { Select } from '@/components/common/Select'
 import { AmbientListening } from '@/components/notes/AmbientListening'
 import { CalculatorSuggestionPanel } from '@/components/notes/CalculatorSuggestionPanel'
 import { NoteEditor } from '@/components/notes/NoteEditor'
+import { Stage1Upload } from '@/components/notes/Stage1Upload'
+import { DocumentUploadZone } from '@/components/notes/DocumentUploadZone'
 import { notesApi, llmApi, settingsApi } from '@/api'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import { FiCopy, FiDownload, FiSave, FiPlay, FiCheckCircle, FiChevronRight, FiEdit } from 'react-icons/fi'
+import { FiCopy, FiDownload, FiSave, FiPlay, FiCheckCircle, FiChevronRight, FiEdit, FiUpload, FiZap } from 'react-icons/fi'
 import type {
   InitialNoteRequest,
   InitialNoteResponse,
   FinalNoteRequest,
   FinalNoteResponse,
   ExtractedEntity,
-  CalculatorSuggestion
+  CalculatorSuggestion,
+  DocumentUploadResponse
 } from '@/types/api.types'
 
 const MAX_CHAR_LIMIT = 1000000  // 1 million characters (~1MB) for extensive clinical data
@@ -50,11 +53,16 @@ export const NoteGeneration: React.FC = () => {
   // ========== Patient Information State ==========
   const [patientName, setPatientName] = useState('')
   const [ssnLast4, setSsnLast4] = useState('')
+  const [visitDate, setVisitDate] = useState('')
 
   // ========== Stage 1 State ==========
   const [isGeneratingInitial, setIsGeneratingInitial] = useState(false)
+  const [isGeneratingExpress, setIsGeneratingExpress] = useState(false)
+  const [expressProgress, setExpressProgress] = useState<string>('')
   const [preliminaryNote, setPreliminaryNote] = useState('')
   const [isEditingStage1, setIsEditingStage1] = useState(false)
+  const [uploadedStage1, setUploadedStage1] = useState<string | null>(null)
+  const [showUploadModal, setShowUploadModal] = useState(false)
   const [extractedEntities, setExtractedEntities] = useState<ExtractedEntity[]>([])
   const [suggestedCalculators, setSuggestedCalculators] = useState<CalculatorSuggestion[]>([])
   const [stage1Metadata, setStage1Metadata] = useState<any>(null)
@@ -207,6 +215,12 @@ export const NoteGeneration: React.FC = () => {
     })
   }
 
+  // ========== Document Upload Handler ==========
+  const handleDocumentUploadComplete = (text: string, _response: DocumentUploadResponse) => {
+    // Append extracted text to clinical input
+    setClinicalInput(prev => prev ? `${prev}\n\n${text}` : text)
+  }
+
   // ========== Stage 1: Generate Preliminary Note ==========
   const handleGenerateInitial = async () => {
     const combinedInput = [clinicalInput, ambientTranscription].filter(Boolean).join('\n\n')
@@ -226,9 +240,10 @@ export const NoteGeneration: React.FC = () => {
     try {
       const request: InitialNoteRequest = {
         clinical_input: combinedInput,
-        note_type: noteType as 'clinic_note' | 'consult' | 'urology_clinic',
+        note_type: noteType as 'urology_clinic' | 'urology_consult',
         patient_name: patientName || undefined,
         ssn_last4: ssnLast4 || undefined,
+        visit_date: visitDate || undefined,
         llm_provider: llmProvider,
         llm_model: selectedModel || undefined,
         temperature: temperature,
@@ -282,10 +297,84 @@ export const NoteGeneration: React.FC = () => {
     }
   }
 
+  // ========== Express: Stage 1 + Stage 2 in one call (no calculators) ==========
+  // Uses SSE streaming so the user sees per-phase progress instead of a
+  // blank multi-minute spinner.
+  const handleGenerateExpress = async () => {
+    const combinedInput = [clinicalInput, ambientTranscription].filter(Boolean).join('\n\n')
+
+    if (!combinedInput.trim()) {
+      alert('Please enter clinical input or use ambient listening')
+      return
+    }
+
+    if (!selectedModel) {
+      alert('Please select a model')
+      return
+    }
+
+    setIsGeneratingExpress(true)
+    setExpressProgress('Starting Express generation...')
+
+    const request: InitialNoteRequest = {
+      clinical_input: combinedInput,
+      note_type: noteType as 'urology_clinic' | 'urology_consult',
+      patient_name: patientName || undefined,
+      ssn_last4: ssnLast4 || undefined,
+      visit_date: visitDate || undefined,
+      llm_provider: llmProvider,
+      llm_model: selectedModel || undefined,
+      temperature: temperature,
+      use_rag: useRAG,
+    }
+
+    notesApi.generateExpressNoteStream(request, {
+      onStage1Start: (d) =>
+        setExpressProgress(`Stage 1: building preliminary note (${d.model || 'LLM'})...`),
+      onStage1Complete: (d) =>
+        setExpressProgress(
+          `Stage 1 complete (${d.length.toLocaleString()} chars in ${d.elapsed_seconds}s). Retrieving evidence...`
+        ),
+      onRagStart: (d) =>
+        setExpressProgress(`RAG: retrieving guidelines (${d.queries.length} query)...`),
+      onRagSkipped: (d) =>
+        setExpressProgress(`RAG skipped: ${d.reason}. Building Stage 2...`),
+      onRagComplete: (d) =>
+        setExpressProgress(
+          `RAG retrieved ${d.sources_count} source${d.sources_count === 1 ? '' : 's'}. Building Stage 2 A&P...`
+        ),
+      onStage2Start: (d) =>
+        setExpressProgress(`Stage 2: synthesizing Assessment & Plan (${d.model || 'LLM'})...`),
+      onStage2Complete: (d) =>
+        setExpressProgress(
+          `Stage 2 complete (${d.length.toLocaleString()} chars in ${d.elapsed_seconds}s). Finalizing...`
+        ),
+      onComplete: (response) => {
+        if (response.preliminary_note) setPreliminaryNote(response.preliminary_note)
+        setFinalNote(response.final_note)
+        setCalculatorResults(response.calculator_results || [])
+        setRagSources(response.rag_sources || [])
+        setStage2Metadata(response.metadata)
+        setSuggestedCalculators([])
+        setSelectedCalculators([])
+        setCurrentStage('final')
+        setExpressProgress('')
+        setIsGeneratingExpress(false)
+      },
+      onError: (detail) => {
+        alert(`Error generating express note: ${detail}`)
+        console.error('Express stream error:', detail)
+        setExpressProgress('')
+        setIsGeneratingExpress(false)
+      },
+    })
+  }
+
   // ========== Stage 2: Generate Final Note ==========
   const handleGenerateFinal = async () => {
-    if (!preliminaryNote) {
-      alert('Please generate preliminary note first')
+    const stage1Note = uploadedStage1 || preliminaryNote
+    if (!stage1Note) {
+      alert('Please generate or upload a preliminary note first')
       return
     }
 
@@ -295,7 +384,7 @@ export const NoteGeneration: React.FC = () => {
       const combinedInput = [clinicalInput, ambientTranscription].filter(Boolean).join('\n\n')
 
       const request: FinalNoteRequest = {
-        preliminary_note: preliminaryNote,
+        preliminary_note: stage1Note,
         clinical_input: combinedInput,
         selected_calculators: selectedCalculators,
         additional_inputs: additionalInputs,
@@ -432,8 +521,18 @@ export const NoteGeneration: React.FC = () => {
     URL.revokeObjectURL(url)
   }
 
-  const handleRestart = () => {
+  const handleRestart = async () => {
     if (confirm('Start a new note? This will clear all current progress.')) {
+      // CRITICAL: Call backend to purge all previous patient data (HIPAA compliance)
+      // This must happen BEFORE clearing local state to ensure server-side cleanup
+      try {
+        await notesApi.startNewSession()
+        console.log('Backend patient session purged successfully')
+      } catch (error) {
+        console.error('Failed to purge backend session, continuing with local cleanup:', error)
+        // Continue with local cleanup even if backend fails
+      }
+
       // Clear all clinical input and context (CRITICAL for patient data separation)
       setClinicalInput('')
       setAmbientTranscription('')
@@ -442,6 +541,7 @@ export const NoteGeneration: React.FC = () => {
       setPreliminaryNote('')
       setFinalNote('')
       setAmbientAugmentedNote('')
+      setUploadedStage1(null)
       setIsEditingStage1(false)
       setIsEditingStage2(false)
 
@@ -544,6 +644,12 @@ export const NoteGeneration: React.FC = () => {
                   maxLength={MAX_CHAR_LIMIT}
                 />
 
+                {/* Document Upload Zone */}
+                <DocumentUploadZone
+                  onUploadComplete={handleDocumentUploadComplete}
+                  disabled={isGeneratingInitial}
+                />
+
                 <div className="mt-4 flex justify-between items-center">
                   <Button
                     variant="outline"
@@ -558,6 +664,17 @@ export const NoteGeneration: React.FC = () => {
                   </Button>
 
                   <div className="flex items-center gap-3">
+                    <div>
+                      <label htmlFor="visit-date" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Visit Date</label>
+                      <input
+                        id="visit-date"
+                        type="date"
+                        value={visitDate}
+                        onChange={(e) => setVisitDate(e.target.value)}
+                        className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                        aria-label="Anticipated visit date for IPSS and age calculation"
+                      />
+                    </div>
                     <Select
                       label="Note Type"
                       value={noteType}
@@ -571,12 +688,30 @@ export const NoteGeneration: React.FC = () => {
                       icon={<FiPlay />}
                       onClick={handleGenerateInitial}
                       isLoading={isGeneratingInitial}
-                      disabled={(!clinicalInput.trim() && !ambientTranscription) || !selectedModel || isGeneratingInitial}
+                      disabled={(!clinicalInput.trim() && !ambientTranscription) || !selectedModel || isGeneratingInitial || isGeneratingExpress}
                     >
                       {isGeneratingInitial ? 'Generating...' : 'Generate Note'}
                     </Button>
+                    <Button
+                      variant="medical"
+                      size="lg"
+                      icon={<FiZap />}
+                      onClick={handleGenerateExpress}
+                      isLoading={isGeneratingExpress}
+                      disabled={(!clinicalInput.trim() && !ambientTranscription) || !selectedModel || isGeneratingInitial || isGeneratingExpress}
+                      title="Run Stage 1 + Stage 2 in one step, skipping calculator selection"
+                    >
+                      {isGeneratingExpress ? 'Generating...' : 'Express Note'}
+                    </Button>
                   </div>
                 </div>
+                {isGeneratingExpress && expressProgress && (
+                  <div className="mt-3 px-3 py-2 rounded-md bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700 text-sm text-blue-900 dark:text-blue-100"
+                       aria-live="polite">
+                    <span className="font-medium">Express progress: </span>
+                    {expressProgress}
+                  </div>
+                )}
               </Card>
             </>
           )}
@@ -601,6 +736,14 @@ export const NoteGeneration: React.FC = () => {
                     <Button
                       variant="outline"
                       size="sm"
+                      icon={<FiUpload />}
+                      onClick={() => setShowUploadModal(true)}
+                    >
+                      Upload Edited
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
                       icon={<FiCopy />}
                       onClick={() => handleCopy(preliminaryNote)}
                     >
@@ -614,6 +757,26 @@ export const NoteGeneration: React.FC = () => {
                     {preliminaryNote}
                   </ReactMarkdown>
                 </div>
+
+                {uploadedStage1 && (
+                  <div className="mt-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <FiUpload className="text-green-600 dark:text-green-400" />
+                        <span className="text-sm font-medium text-green-700 dark:text-green-300">
+                          Using uploaded Stage 1 note for Stage 2 generation
+                        </span>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setUploadedStage1(null)}
+                      >
+                        Use Generated Instead
+                      </Button>
+                    </div>
+                  </div>
+                )}
 
                 {stage1Metadata && (
                   <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-400 grid grid-cols-3 gap-2">
@@ -873,6 +1036,16 @@ export const NoteGeneration: React.FC = () => {
             setIsEditingStage2(false)
           }}
           onClose={() => setIsEditingStage2(false)}
+        />
+      )}
+
+      {showUploadModal && (
+        <Stage1Upload
+          onUpload={(content) => {
+            setUploadedStage1(content)
+            setShowUploadModal(false)
+          }}
+          onCancel={() => setShowUploadModal(false)}
         />
       )}
     </div>

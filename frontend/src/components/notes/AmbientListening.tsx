@@ -50,9 +50,17 @@ export const AmbientListening: React.FC<AmbientListeningProps> = ({
 
   // Get WebSocket URL
   const getWebSocketURL = () => {
-    const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
-    const wsURL = baseURL.replace(/^http/, 'ws')
-    return `${wsURL}/api/v1/ambient/stream`
+    // Prefer explicit VITE_WS_URL; fall back to deriving from VITE_API_BASE_URL;
+    // last resort: same-origin (Vite proxy will route /ws to backend).
+    const explicit = import.meta.env.VITE_WS_URL as string | undefined
+    if (explicit) return `${explicit}/api/v1/ambient/stream`
+    const baseURL = import.meta.env.VITE_API_BASE_URL as string | undefined
+    if (baseURL) {
+      const wsURL = baseURL.replace(/^http/, 'ws')
+      return `${wsURL}/api/v1/ambient/stream`
+    }
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    return `${proto}://${window.location.host}/api/v1/ambient/stream`
   }
 
   // Monitor audio level for visual feedback

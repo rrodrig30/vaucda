@@ -55,7 +55,7 @@ export const NoteEditor: React.FC<NoteEditorProps> = ({
 
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-2xl max-w-6xl w-full max-h-[90vh] flex flex-col">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-2xl max-w-[95vw] w-full max-h-[95vh] flex flex-col">
         {/* Header */}
         <div className="p-6 border-b border-gray-200 dark:border-gray-700">
           <div className="flex items-center justify-between">
@@ -83,11 +83,11 @@ export const NoteEditor: React.FC<NoteEditorProps> = ({
           <textarea
             value={editedNote}
             onChange={handleChange}
-            className="w-full h-full p-4 border border-gray-300 dark:border-gray-600 rounded-lg
+            className="w-full h-full min-h-[70vh] p-4 border border-gray-300 dark:border-gray-600 rounded-lg
                      bg-white dark:bg-gray-900 text-gray-900 dark:text-white
                      font-mono text-sm leading-relaxed
                      focus:ring-2 focus:ring-primary focus:border-transparent
-                     resize-none"
+                     resize-none scrollbar-thin"
             placeholder="Edit your clinical note here..."
           />
         </div>

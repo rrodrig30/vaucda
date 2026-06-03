@@ -7,12 +7,17 @@ Synthesizes treatment plan using:
 - Ambient listening transcript
 - Calculator results
 - RAG content (evidence-based guidelines)
+
+Supports task-specific LLM configuration via LLMTaskConfig.
 """
 
 import re
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 from ..llm_helper import synthesize_with_llm
 from .history_cleaners import clean_llm_commentary
+
+if TYPE_CHECKING:
+    from app.services.llm_config_manager import LLMTaskConfig
 
 
 def synthesize_plan(
@@ -22,6 +27,7 @@ def synthesize_plan(
     calculator_results: Optional[dict] = None,
     rag_content: Optional[str] = None,
     model: Optional[str] = None,
+    task_config: Optional["LLMTaskConfig"] = None,
     visit_progression: Optional[str] = None,
     cross_specialty_context: Optional[str] = None,
     prior_ap_context: Optional[str] = None
@@ -324,11 +330,14 @@ OUTPUT REQUIREMENTS:
 The plan should read as a coherent, actionable treatment strategy that reflects THIS patient's specific clinical situation.
 """
 
-    # Call LLM directly with comprehensive prompt
+    # Call LLM with task-specific configuration
+    # task_config takes precedence - uses provider/model/temperature from user settings
+    # Falls back to model parameter if task_config not provided (backwards compatibility)
     synthesized_plan = synthesize_with_llm(
         prompt=instructions,
         model=model,
-        temperature=0.0
+        temperature=0.0,
+        task_config=task_config
     )
 
     # Filter out VA administrative metadata that LLM might include

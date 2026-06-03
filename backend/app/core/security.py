@@ -2,6 +2,7 @@
 Security utilities for authentication and authorization
 Implements JWT token generation, password hashing, and user authentication
 """
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from jose import JWTError, jwt
@@ -14,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.sqlite_models import User
 from app.database.sqlite_session import get_db
+
+logger = logging.getLogger(__name__)
 
 
 # Password hashing context
@@ -232,18 +235,23 @@ async def get_optional_user(
         User object if authenticated, None otherwise
     """
     if not credentials:
+        logger.debug("get_optional_user: No credentials provided in request")
         return None
 
     try:
         token = credentials.credentials
+        logger.debug(f"get_optional_user: Token received (length: {len(token) if token else 0})")
+
         payload = decode_token(token)
 
         # Verify token type
         if payload.get("type") != "access":
+            logger.debug(f"get_optional_user: Invalid token type: {payload.get('type')}")
             return None
 
         user_id: str = payload.get("sub")
         if user_id is None:
+            logger.debug("get_optional_user: No user_id in token payload")
             return None
 
         # Get user from database
@@ -252,7 +260,16 @@ async def get_optional_user(
         )
         user = result.scalar_one_or_none()
 
+        if user:
+            logger.debug(f"get_optional_user: Found user {user_id}")
+        else:
+            logger.debug(f"get_optional_user: User {user_id} not found or inactive")
+
         return user
 
-    except (JWTError, Exception):
+    except JWTError as e:
+        logger.debug(f"get_optional_user: JWT error: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"get_optional_user: Unexpected error: {e}")
         return None

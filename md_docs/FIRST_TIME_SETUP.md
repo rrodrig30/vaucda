@@ -101,7 +101,7 @@ The model will be cached in `~/.cache/whisper/` and won't need to be downloaded 
 
 ```bash
 # Copy template
-cp .env.example .env
+cp .env .env
 
 # Edit .env file
 nano .env  # or use your favorite editor

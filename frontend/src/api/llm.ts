@@ -5,6 +5,7 @@ import type {
   PullModelRequest,
   PullModelResponse,
   PullModelStatus,
+  ModelContextSizeResponse,
 } from '@/types/api.types'
 
 export const llmApi = {
@@ -37,6 +38,17 @@ export const llmApi = {
    */
   getPullStatus: async (taskId: string): Promise<PullModelStatus> => {
     const response = await apiClient.get<PullModelStatus>(`/llm/ollama/pull/${taskId}`)
+    return response.data
+  },
+
+  /**
+   * Look up the published training context window (n_ctx_train) for a model.
+   * Used to populate the num_ctx input default in Settings when a user picks a model.
+   */
+  getModelContextSize: async (model: string): Promise<ModelContextSizeResponse> => {
+    const response = await apiClient.get<ModelContextSizeResponse>('/llm/model-context-size', {
+      params: { model },
+    })
     return response.data
   },
 }

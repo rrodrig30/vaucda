@@ -13,6 +13,7 @@ import { NoteGeneration } from './pages/NoteGeneration'
 import { Calculators } from './pages/Calculators'
 import { KnowledgeBase } from './pages/KnowledgeBase'
 import { Settings } from './pages/Settings'
+import { BatchProcessing } from './pages/BatchProcessing'
 
 // Private Route Component
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
@@ -46,6 +47,7 @@ function App() {
                 <Route path="/notes" element={<NoteGeneration />} />
                 <Route path="/calculators" element={<Calculators />} />
                 <Route path="/knowledge-base" element={<KnowledgeBase />} />
+                <Route path="/batch" element={<BatchProcessing />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Routes>

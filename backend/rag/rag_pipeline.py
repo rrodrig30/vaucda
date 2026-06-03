@@ -4,7 +4,7 @@ Complete RAG workflow from query to augmented context
 """
 
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +14,18 @@ from rag.document_parser import get_document_parser
 from rag.chunking import MedicalDocumentChunker, DocumentType
 from rag.embeddings import EmbeddingGenerator
 from database.neo4j_client import Neo4jClient
+
+# GraphRAG imports (optional)
+# We import the full pipeline (Leiden + LLM-summarized communities + map-reduce
+# global search + entity-traversal local search). The legacy GraphRAGRetriever
+# class still exists in graphrag_retriever.py but is NOT wired into the API path
+# any more — it had a schema-name mismatch (c.category vs c.id) that broke
+# retrieval against communities written by GraphRAGPipeline.store_communities.
+try:
+    from rag.graphrag_pipeline import GraphRAGPipeline, MapReduceResult, LocalSearchResult
+    GRAPHRAG_AVAILABLE = True
+except ImportError:
+    GRAPHRAG_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +115,11 @@ class RAGPipeline:
         Returns:
             RAGContext with assembled context and sources
         """
-        # 1. Retrieve relevant documents
-        documents = await self._retrieve_documents(
+        # 1. Retrieve relevant documents. Strategies may also return
+        # strategy-specific top-level metadata (e.g. graphrag surfaces
+        # MapReduceResult/LocalSearchResult counters). Non-graphrag
+        # strategies return an empty dict.
+        documents, extra_meta = await self._retrieve_documents(
             query=query,
             k=k,
             strategy=search_strategy,
@@ -114,11 +129,14 @@ class RAGPipeline:
 
         if not documents:
             logger.warning(f"No documents retrieved for query: {query}")
+            empty_meta = {"query": query, "strategy": search_strategy}
+            if extra_meta:
+                empty_meta.update(extra_meta)
             return RAGContext(
                 context="",
                 sources=[],
                 documents=[],
-                metadata={"query": query, "strategy": search_strategy}
+                metadata=empty_meta
             )
 
         # 2. Assemble context
@@ -135,6 +153,8 @@ class RAGPipeline:
             "avg_similarity": sum(d.similarity_score for d in documents) / len(documents),
             "category": category
         }
+        if extra_meta:
+            metadata.update(extra_meta)
 
         logger.info(
             f"RAG pipeline complete: {len(documents)} documents, "
@@ -155,27 +175,271 @@ class RAGPipeline:
         strategy: str,
         category: Optional[str],
         patient_context: Optional[Dict[str, Any]]
-    ) -> List[RetrievedDocument]:
-        """Execute retrieval based on strategy."""
+    ) -> Tuple[List[RetrievedDocument], Dict[str, Any]]:
+        """Execute retrieval based on strategy.
+
+        Returns (documents, extra_meta) where extra_meta is strategy-specific
+        top-level metadata to merge into RAGContext.metadata. Only graphrag
+        currently populates it; the other strategies return {}.
+        """
         if strategy == "vector":
-            return await self.retriever.vector_search(query, k, category)
+            return await self.retriever.vector_search(query, k, category), {}
 
         elif strategy == "hybrid":
-            return await self.retriever.hybrid_search(query, k, category=category)
+            return await self.retriever.hybrid_search(query, k, category=category), {}
 
         elif strategy == "graph":
-            return await self.retriever.graph_augmented_search(query, k, category)
+            return await self.retriever.graph_augmented_search(query, k, category), {}
 
         elif strategy == "clinical":
-            return await self.retriever.search_by_clinical_scenario(
+            docs = await self.retriever.search_by_clinical_scenario(
                 scenario=query,
                 patient_context=patient_context,
                 k=k
             )
+            return docs, {}
+
+        elif strategy == "graphrag":
+            return await self._graphrag_retrieve(query, k)
 
         else:
             logger.warning(f"Unknown strategy '{strategy}', using graph search")
-            return await self.retriever.graph_augmented_search(query, k, category)
+            return await self.retriever.graph_augmented_search(query, k, category), {}
+
+    async def _graphrag_retrieve(
+        self,
+        query: str,
+        k: int
+    ) -> Tuple[List[RetrievedDocument], Dict[str, Any]]:
+        """
+        Retrieve using GraphRAG (entity-graph + community-summary hierarchical retrieval).
+
+        Wires into the canonical GraphRAGPipeline (graphrag_pipeline.py), which
+        implements:
+          - Leiden community detection over the Entity/RELATED_TO subgraph
+          - LLM-generated community summaries (with structured findings)
+          - Map-reduce global search across community summaries
+          - Entity-extracted local search with graph traversal
+
+        We run BOTH local (entity-focused, returns specific chunks/entities) and
+        global (map-reduce across communities, returns synthesized answer) and
+        return both as RetrievedDocument objects so the downstream context
+        assembler sees concrete chunks + a community-level synthesis.
+
+        Args:
+            query: Search query
+            k: Number of LOCAL chunk results to surface (global synthesis is
+               always a single doc on top)
+
+        Returns:
+            List of RetrievedDocument objects
+
+        Raises:
+            RuntimeError: If GraphRAG is unavailable or fails. Callers that
+                want graceful degradation should catch and fall back themselves.
+                Silently swallowing errors here was the previous behavior and
+                hid broken retrieval from operators.
+        """
+        if not GRAPHRAG_AVAILABLE:
+            # Hard fail: the caller asked for graphrag explicitly.
+            logger.error(
+                "GRAPHRAG_DEGRADED: GraphRAGPipeline import failed at module load. "
+                "Cannot serve graphrag strategy."
+            )
+            raise RuntimeError(
+                "GraphRAG pipeline not importable. Check rag.graphrag_pipeline."
+            )
+
+        if not self.neo4j_client:
+            logger.error(
+                "GRAPHRAG_DEGRADED: Neo4j client not configured on RAGPipeline. "
+                "Cannot serve graphrag strategy."
+            )
+            raise RuntimeError(
+                "GraphRAG requires a Neo4j client. None was injected into RAGPipeline."
+            )
+
+        try:
+            import os
+
+            # Resolve config from app settings (which loads .env).
+            # GRAPHRAG_LLM_MODEL is the dedicated knob for map-reduce
+            # speed; defaults to a fast cloud model. The previous
+            # default (llama3.1:8b) caused 30s+ per LLM call which made
+            # the 10-call map-reduce multi-minute per query.
+            try:
+                from app.config import settings as _app_settings
+                ollama_url = (
+                    _app_settings.OLLAMA_BASE_URL
+                    or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+                )
+                llm_model = getattr(
+                    _app_settings, "GRAPHRAG_LLM_MODEL", None
+                ) or os.getenv("GRAPHRAG_LLM_MODEL", "gpt-oss:120b-cloud")
+                embedding_model = (
+                    _app_settings.OLLAMA_EMBEDDING_MODEL
+                    or os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+                )
+            except Exception:
+                # Fallback to env if settings import is somehow broken
+                ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+                llm_model = os.getenv("GRAPHRAG_LLM_MODEL", "gpt-oss:120b-cloud")
+                embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+
+            logger.info(
+                f"GraphRAG runtime: llm_model={llm_model}, "
+                f"embedding_model={embedding_model}"
+            )
+
+            pipeline = GraphRAGPipeline(
+                neo4j_client=self.neo4j_client,
+                ollama_base_url=ollama_url,
+                llm_model=llm_model,
+                embedding_model=embedding_model,
+            )
+
+            # Run global + local in parallel — they hit different Neo4j subgraphs.
+            import asyncio as _asyncio
+            global_task = pipeline.global_search(query, max_communities=10, parallel=True)
+            local_task = pipeline.local_search(query, max_entities=20, max_chunks=k)
+            global_result, local_result = await _asyncio.gather(
+                global_task, local_task, return_exceptions=True
+            )
+
+            documents: List[RetrievedDocument] = []
+
+            # Per-branch top-level metadata. Status is one of:
+            #   "ok"        — branch returned a usable result
+            #   "empty"     — branch ran without raising but produced nothing
+            #   "failed:<ExceptionType>" — branch raised; reason captured
+            global_meta: Dict[str, Any] = {"status": "empty"}
+            local_meta: Dict[str, Any] = {"status": "empty"}
+
+            # GLOBAL: prepend the synthesized cross-community answer if we got one.
+            if isinstance(global_result, MapReduceResult):
+                global_meta = {
+                    "status": "ok" if global_result.final_answer else "empty",
+                    "communities_queried": global_result.communities_queried,
+                    "intermediate_answers": len(global_result.intermediate_answers),
+                    "elapsed_s": global_result.total_time_seconds,
+                }
+                if global_result.final_answer:
+                    documents.append(RetrievedDocument(
+                        doc_id="graphrag_global_synthesis",
+                        title="GraphRAG Global Synthesis",
+                        content=global_result.final_answer,
+                        summary=global_result.final_answer,
+                        source="GraphRAG-Global",
+                        category="graphrag_global",
+                        similarity_score=1.0,  # synthesis is always top
+                        metadata={
+                            "communities_queried": global_result.communities_queried,
+                            "intermediate_answers": len(global_result.intermediate_answers),
+                            "retrieval_mode": "graphrag_global",
+                            "elapsed_s": global_result.total_time_seconds,
+                        }
+                    ))
+            elif isinstance(global_result, Exception):
+                global_meta = {
+                    "status": f"failed:{type(global_result).__name__}",
+                    "error": str(global_result)[:200],
+                }
+                logger.error(
+                    "GRAPHRAG_DEGRADED: global_search failed: %s",
+                    global_result, exc_info=global_result
+                )
+
+            # LOCAL: add the synthesized local answer + concrete supporting chunks.
+            if isinstance(local_result, LocalSearchResult):
+                chunks_emitted = min(len(local_result.relevant_chunks), k)
+                local_meta = {
+                    "status": "ok" if (local_result.context or chunks_emitted) else "empty",
+                    "query_entities": local_result.query_entities,
+                    "entity_count": len(local_result.relevant_entities),
+                    "relationship_count": len(local_result.relevant_relationships),
+                    "chunk_count": chunks_emitted,
+                    "elapsed_s": local_result.total_time_seconds,
+                }
+                if local_result.context:
+                    documents.append(RetrievedDocument(
+                        doc_id="graphrag_local_synthesis",
+                        title="GraphRAG Local Synthesis",
+                        content=local_result.context,
+                        summary=local_result.context,
+                        source="GraphRAG-Local",
+                        category="graphrag_local",
+                        similarity_score=0.99,
+                        metadata={
+                            "query_entities": local_result.query_entities,
+                            "entity_count": len(local_result.relevant_entities),
+                            "relationship_count": len(local_result.relevant_relationships),
+                            "retrieval_mode": "graphrag_local",
+                            "elapsed_s": local_result.total_time_seconds,
+                        }
+                    ))
+                # Concrete supporting chunks — these are what the LLM cites.
+                for idx, chunk in enumerate(local_result.relevant_chunks[:k]):
+                    documents.append(RetrievedDocument(
+                        doc_id=f"graphrag_chunk_{idx}",
+                        title=chunk.get('document_title') or 'Unknown',
+                        content=chunk.get('content', ''),
+                        summary=None,
+                        source="GraphRAG",
+                        category="graphrag_chunk",
+                        # Score by rank — preserves order without faking similarity.
+                        similarity_score=max(0.1, 0.9 - 0.05 * idx),
+                        metadata={
+                            "rank": idx,
+                            "retrieval_mode": "graphrag_local_chunk",
+                        }
+                    ))
+            elif isinstance(local_result, Exception):
+                local_meta = {
+                    "status": f"failed:{type(local_result).__name__}",
+                    "error": str(local_result)[:200],
+                }
+                logger.error(
+                    "GRAPHRAG_DEGRADED: local_search failed: %s",
+                    local_result, exc_info=local_result
+                )
+
+            if not documents:
+                # Both halves failed or produced nothing — surface that clearly.
+                logger.error(
+                    "GRAPHRAG_DEGRADED: graphrag returned no documents for query=%r. "
+                    "Check that entity extraction + community detection have been run.",
+                    query
+                )
+                raise RuntimeError(
+                    "GraphRAG returned no documents. Run the GraphRAG indexing pipeline "
+                    "(entity extraction + community detection + summarization) first."
+                )
+
+            top_meta: Dict[str, Any] = {
+                "graphrag": {
+                    "global": global_meta,
+                    "local": local_meta,
+                    "llm_model": llm_model,
+                    "embedding_model": embedding_model,
+                }
+            }
+
+            logger.info(
+                "GraphRAG retrieved %d documents (global=%s local=%s)",
+                len(documents), global_meta.get("status"), local_meta.get("status")
+            )
+            return documents, top_meta
+
+        except RuntimeError:
+            # Already a clearly-labeled GRAPHRAG_DEGRADED error — propagate.
+            raise
+        except Exception as e:
+            # Unexpected — log fully and re-raise so operators see the breakage.
+            logger.error(
+                "GRAPHRAG_DEGRADED: unexpected exception in _graphrag_retrieve: %s",
+                e, exc_info=True
+            )
+            raise
 
     def _assemble_context(self, documents: List[RetrievedDocument]) -> str:
         """
@@ -436,79 +700,86 @@ class RAGPipeline:
             logger.info(f"Created {len(chunks)} chunks")
 
             # Step 3: Generate embeddings
+            # Use larger batch size (128) for better throughput on large documents
             chunk_texts = [chunk.content for chunk in chunks]
             embeddings = self.embedding_generator.generate_embeddings_batch(
                 texts=chunk_texts,
-                batch_size=32,
+                batch_size=128,  # Increased from 32 for 2x faster embedding generation
                 show_progress=True
             )
 
             logger.info(f"Generated {len(embeddings)} embeddings")
 
-            # Step 4: Store in Neo4j
-            # Create document node
-            document_query = """
-            CREATE (d:Document {
-                title: $title,
-                filename: $filename,
-                category: $category,
-                file_type: $file_type,
-                ingestion_date: $ingestion_date,
-                num_chunks: $num_chunks,
-                author: $author,
-                source: $source
-            })
-            RETURN id(d) as doc_id
-            """
-
-            document_params = {
-                'title': combined_metadata.get('title', file_metadata.get('filename', 'Untitled')),
-                'filename': file_metadata.get('filename', Path(file_path).name),
-                'category': category,
-                'file_type': file_metadata.get('file_type', 'unknown'),
-                'ingestion_date': combined_metadata['ingestion_date'],
-                'num_chunks': len(chunks),
-                'author': combined_metadata.get('author', 'Unknown'),
-                'source': combined_metadata.get('original_filename', file_metadata.get('filename', ''))
-            }
-
+            # Step 4: Store in Neo4j using BATCH operations
+            # CRITICAL: Use single session with UNWIND for 20x faster insertion
             async with self.neo4j_client.driver.session() as session:
+                # Create document node
+                document_query = """
+                CREATE (d:Document {
+                    title: $title,
+                    filename: $filename,
+                    category: $category,
+                    file_type: $file_type,
+                    ingestion_date: $ingestion_date,
+                    num_chunks: $num_chunks,
+                    author: $author,
+                    source: $source
+                })
+                RETURN id(d) as doc_id
+                """
+
+                document_params = {
+                    'title': combined_metadata.get('title', file_metadata.get('filename', 'Untitled')),
+                    'filename': file_metadata.get('filename', Path(file_path).name),
+                    'category': category,
+                    'file_type': file_metadata.get('file_type', 'unknown'),
+                    'ingestion_date': combined_metadata['ingestion_date'],
+                    'num_chunks': len(chunks),
+                    'author': combined_metadata.get('author', 'Unknown'),
+                    'source': combined_metadata.get('original_filename', file_metadata.get('filename', ''))
+                }
+
                 result = await session.run(document_query, document_params)
                 record = await result.single()
                 document_id = record['doc_id']
 
-            logger.info(f"Created document node: {document_id}")
+                logger.info(f"Created document node: {document_id}")
 
-            # Create chunk nodes and link to document
-            chunks_created = 0
-            for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                chunk_query = """
+                # BATCH CREATE all chunks using UNWIND (20x faster than individual inserts)
+                # Prepare chunk data for batch insert
+                chunks_data = []
+                for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                    chunks_data.append({
+                        'content': chunk.content,
+                        'chunk_index': chunk.chunk_index,
+                        'total_chunks': chunk.total_chunks,
+                        'section': chunk.metadata.get('section', 'Unknown'),
+                        'embedding': embedding.tolist()
+                    })
+
+                # Single batch query for ALL chunks (vs N individual queries)
+                batch_chunk_query = """
                 MATCH (d:Document) WHERE id(d) = $doc_id
+                UNWIND $chunks AS chunk_data
                 CREATE (c:Chunk {
-                    content: $content,
-                    chunk_index: $chunk_index,
-                    total_chunks: $total_chunks,
-                    section: $section,
-                    embedding: $embedding
+                    content: chunk_data.content,
+                    chunk_index: chunk_data.chunk_index,
+                    total_chunks: chunk_data.total_chunks,
+                    section: chunk_data.section,
+                    embedding: chunk_data.embedding
                 })
                 CREATE (c)-[:BELONGS_TO]->(d)
-                RETURN id(c) as chunk_id
+                RETURN count(c) as chunks_created
                 """
 
-                chunk_params = {
+                result = await session.run(batch_chunk_query, {
                     'doc_id': document_id,
-                    'content': chunk.content,
-                    'chunk_index': chunk.chunk_index,
-                    'total_chunks': chunk.total_chunks,
-                    'section': chunk.metadata.get('section', 'Unknown'),
-                    'embedding': embedding.tolist()
-                }
+                    'chunks': chunks_data
+                })
+                record = await result.single()
+                chunks_created = record['chunks_created']
 
-                async with self.neo4j_client.driver.session() as session:
-                    await session.run(chunk_query, chunk_params)
-                chunks_created += 1
-
-            logger.info(f"Created {chunks_created} chunk nodes")
+            logger.info(f"Created {chunks_created} chunk nodes (batch insert)")
 
             # Create vector index if doesn't exist
             try:

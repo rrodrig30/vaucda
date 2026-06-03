@@ -1,6 +1,10 @@
 """
 LLM Service - Ollama Integration
 Primary LLM provider for clinical note generation
+
+Performance optimizations:
+- Singleton AsyncClient for connection reuse (avoids SSL/TLS handshake per request)
+- Connection pooling for concurrent requests
 """
 import logging
 from typing import Dict, Any, List, Optional, AsyncGenerator
@@ -10,6 +14,31 @@ import json
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Singleton AsyncClient for connection reuse
+# This avoids creating new SSL/TLS connections for each request
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Get or create singleton AsyncClient with connection pooling."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.OLLAMA_TIMEOUT, connect=30.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        )
+        logger.info("Created singleton AsyncClient with connection pooling")
+    return _http_client
+
+
+async def close_http_client():
+    """Close the singleton AsyncClient (call on application shutdown)."""
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+        logger.info("Closed singleton AsyncClient")
 
 
 class OllamaClient:
@@ -24,9 +53,9 @@ class OllamaClient:
     async def health_check(self) -> bool:
         """Check if Ollama service is available."""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(f"{self.base_url}/api/tags")
-                return response.status_code == 200
+            client = await get_http_client()
+            response = await client.get(f"{self.base_url}/api/tags", timeout=5.0)
+            return response.status_code == 200
         except Exception as e:
             logger.error(f"Ollama health check failed: {str(e)}")
             return False
@@ -39,9 +68,9 @@ class OllamaClient:
             List of model information dictionaries
         """
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(f"{self.base_url}/api/tags")
-                response.raise_for_status()
+            client = await get_http_client()
+            response = await client.get(f"{self.base_url}/api/tags", timeout=10.0)
+            response.raise_for_status()
 
                 data = response.json()
                 models = data.get("models", [])
@@ -90,6 +119,7 @@ class OllamaClient:
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
+                "keep_alive": settings.OLLAMA_KEEP_ALIVE,
                 "options": {
                     "temperature": temperature,
                     "num_predict": max_tokens,
@@ -102,14 +132,15 @@ class OllamaClient:
             if stop:
                 payload["options"]["stop"] = stop
 
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/generate",
-                    json=payload
-                )
-                response.raise_for_status()
+            client = await get_http_client()
+            response = await client.post(
+                f"{self.base_url}/api/generate",
+                json=payload,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
 
-                result = response.json()
+            result = response.json()
 
                 return {
                     "response": result.get("response", ""),
@@ -154,6 +185,7 @@ class OllamaClient:
                 "model": model,
                 "prompt": prompt,
                 "stream": True,
+                "keep_alive": settings.OLLAMA_KEEP_ALIVE,
                 "options": {
                     "temperature": temperature,
                     "num_predict": max_tokens,
@@ -163,26 +195,27 @@ class OllamaClient:
             if system:
                 payload["system"] = system
 
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream(
-                    "POST",
-                    f"{self.base_url}/api/generate",
-                    json=payload
-                ) as response:
-                    response.raise_for_status()
+            client = await get_http_client()
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/api/generate",
+                json=payload,
+                timeout=self.timeout
+            ) as response:
+                response.raise_for_status()
 
-                    async for line in response.aiter_lines():
-                        if line:
-                            try:
-                                data = json.loads(line)
-                                chunk = data.get("response", "")
-                                if chunk:
-                                    yield chunk
+                async for line in response.aiter_lines():
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            chunk = data.get("response", "")
+                            if chunk:
+                                yield chunk
 
-                                if data.get("done", False):
-                                    break
-                            except json.JSONDecodeError:
-                                continue
+                            if data.get("done", False):
+                                break
+                        except json.JSONDecodeError:
+                            continue
 
         except Exception as e:
             logger.error(f"Ollama streaming generation failed: {str(e)}")
@@ -211,15 +244,16 @@ class OllamaClient:
                 "prompt": text
             }
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/embeddings",
-                    json=payload
-                )
-                response.raise_for_status()
+            client = await get_http_client()
+            response = await client.post(
+                f"{self.base_url}/api/embeddings",
+                json=payload,
+                timeout=30.0
+            )
+            response.raise_for_status()
 
-                result = response.json()
-                embedding = result.get("embedding", [])
+            result = response.json()
+            embedding = result.get("embedding", [])
 
                 if len(embedding) != settings.EMBEDDING_DIMENSION:
                     logger.warning(
@@ -249,18 +283,19 @@ class OllamaClient:
                 "stream": False
             }
 
-            async with httpx.AsyncClient(timeout=3600.0) as client:  # 1 hour timeout for model pull
-                response = await client.post(
-                    f"{self.base_url}/api/pull",
-                    json=payload
-                )
-                response.raise_for_status()
+            client = await get_http_client()
+            response = await client.post(
+                f"{self.base_url}/api/pull",
+                json=payload,
+                timeout=3600.0  # 1 hour timeout for model pull
+            )
+            response.raise_for_status()
 
-                return {
-                    "status": "success",
-                    "model": model_name,
-                    "message": f"Model {model_name} pulled successfully"
-                }
+            return {
+                "status": "success",
+                "model": model_name,
+                "message": f"Model {model_name} pulled successfully"
+            }
 
         except Exception as e:
             logger.error(f"Failed to pull model {model_name}: {str(e)}")

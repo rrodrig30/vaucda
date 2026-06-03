@@ -140,11 +140,12 @@ assemble_note(**sections)
 ## 🚀 USAGE
 
 ### Option 1: Direct Call (Recommended for Testing)
+
 ```python
 from backend.app.services.note_processing.note_builder import build_urology_note
 
 # Read clinical document
-with open('logs/input.txt', 'r') as f:
+with open('../logs/input.txt', 'r') as f:
     clinical_doc = f.read()
 
 # Build note

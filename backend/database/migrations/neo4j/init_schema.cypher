@@ -41,13 +41,14 @@ FOR (a:AuditLog) REQUIRE a.id IS UNIQUE;
 // VECTOR INDEXES - For RAG and Semantic Search
 // ============================================================================
 
-// Document embeddings index (768 dimensions, cosine similarity)
+// Chunk embeddings index (384 dimensions for all-MiniLM-L6-v2, cosine similarity)
 // This is the PRIMARY index for RAG retrieval
-CREATE VECTOR INDEX document_embeddings IF NOT EXISTS
-FOR (d:Document) ON (d.embedding)
+// NOTE: Embeddings are stored on Chunk nodes, not Document nodes
+CREATE VECTOR INDEX chunk_embeddings IF NOT EXISTS
+FOR (c:Chunk) ON (c.embedding)
 OPTIONS {
     indexConfig: {
-        `vector.dimensions`: 768,
+        `vector.dimensions`: 384,
         `vector.similarity_function`: 'cosine',
         `vector.hnsw.m`: 16,
         `vector.hnsw.ef_construction`: 200,
@@ -55,13 +56,13 @@ OPTIONS {
     }
 };
 
-// ClinicalConcept embeddings index (768 dimensions, cosine similarity)
+// ClinicalConcept embeddings index (384 dimensions for all-MiniLM-L6-v2, cosine similarity)
 // For concept-based semantic search
 CREATE VECTOR INDEX concept_embeddings IF NOT EXISTS
 FOR (c:ClinicalConcept) ON (c.embedding)
 OPTIONS {
     indexConfig: {
-        `vector.dimensions`: 768,
+        `vector.dimensions`: 384,
         `vector.similarity_function`: 'cosine',
         `vector.hnsw.m`: 16,
         `vector.hnsw.ef_construction`: 200,
@@ -155,6 +156,66 @@ FOR (t:Template) ON (t.type);
 
 CREATE INDEX template_active IF NOT EXISTS
 FOR (t:Template) ON (t.active);
+
+// ============================================================================
+// GRAPHRAG COMPONENTS - Communities and Hierarchical Summaries
+// ============================================================================
+
+// Community node constraints
+CREATE CONSTRAINT community_id_unique IF NOT EXISTS
+FOR (c:Community) REQUIRE c.id IS UNIQUE;
+
+// HierarchicalSummary node constraints
+CREATE CONSTRAINT summary_id_unique IF NOT EXISTS
+FOR (s:HierarchicalSummary) REQUIRE s.id IS UNIQUE;
+
+// OntologyConcept node constraints (UMLS/SNOMED)
+CREATE CONSTRAINT ontology_umls_unique IF NOT EXISTS
+FOR (o:OntologyConcept) REQUIRE o.umls_cui IS UNIQUE;
+
+// Community embeddings index (384 dimensions for community-level retrieval)
+CREATE VECTOR INDEX community_embeddings IF NOT EXISTS
+FOR (c:Community) ON (c.embedding)
+OPTIONS {
+    indexConfig: {
+        `vector.dimensions`: 384,
+        `vector.similarity_function`: 'cosine',
+        `vector.hnsw.m`: 16,
+        `vector.hnsw.ef_construction`: 200,
+        `vector.quantization.enabled`: false
+    }
+};
+
+// Community property indexes
+CREATE INDEX community_tier IF NOT EXISTS
+FOR (c:Community) ON (c.tier);
+
+CREATE INDEX community_size IF NOT EXISTS
+FOR (c:Community) ON (c.size);
+
+// HierarchicalSummary property indexes
+CREATE INDEX summary_entity_type IF NOT EXISTS
+FOR (s:HierarchicalSummary) ON (s.entity_type);
+
+CREATE INDEX summary_level IF NOT EXISTS
+FOR (s:HierarchicalSummary) ON (s.level);
+
+CREATE INDEX summary_entity_id IF NOT EXISTS
+FOR (s:HierarchicalSummary) ON (s.entity_id);
+
+// OntologyConcept property indexes
+CREATE INDEX ontology_snomed IF NOT EXISTS
+FOR (o:OntologyConcept) ON (o.snomed_id);
+
+CREATE INDEX ontology_icd10 IF NOT EXISTS
+FOR (o:OntologyConcept) ON (o.icd10_code);
+
+CREATE INDEX ontology_preferred_term IF NOT EXISTS
+FOR (o:OntologyConcept) ON (o.preferred_term);
+
+// Full-text index for ontology concept search
+CREATE FULLTEXT INDEX ontology_fulltext IF NOT EXISTS
+FOR (o:OntologyConcept) ON EACH [o.preferred_term, o.synonyms_text];
 
 // ============================================================================
 // PERIODIC PROCEDURES - Background Jobs

@@ -19,27 +19,29 @@ from typing import Dict, Any
 # =============================================================================
 
 VECTOR_SEARCH_DOCUMENTS = """
-// Vector similarity search on Document nodes
-// Returns top-K most similar documents to query embedding
+// Vector similarity search on Chunk nodes, returning parent Documents
+// Returns top-K most similar chunks joined to their parent documents
 
-CALL db.index.vector.queryNodes('document_embeddings', $k, $query_embedding)
-YIELD node, score
+CALL db.index.vector.queryNodes('chunk_embeddings', $k, $query_embedding)
+YIELD node AS chunk, score
 
-WHERE ($category IS NULL OR node.category = $category)
-  AND ($min_year IS NULL OR node.publication_date.year >= $min_year)
-  AND ($source IS NULL OR node.source = $source)
+MATCH (chunk)-[:BELONGS_TO]->(doc:Document)
+WHERE ($category IS NULL OR doc.category = $category)
+  AND ($min_year IS NULL OR doc.publication_date IS NULL OR doc.publication_date.year >= $min_year)
+  AND ($source IS NULL OR doc.source = $source)
 
-RETURN node.id AS doc_id,
-       node.title AS title,
-       node.content AS content,
-       node.summary AS summary,
-       node.source AS source,
-       node.category AS category,
-       node.document_type AS document_type,
-       node.version AS version,
-       node.publication_date AS publication_date,
-       node.keywords AS keywords,
-       score AS similarity_score
+RETURN DISTINCT doc.id AS doc_id,
+       doc.title AS title,
+       chunk.content AS content,
+       doc.summary AS summary,
+       doc.source AS source,
+       doc.category AS category,
+       doc.document_type AS document_type,
+       doc.version AS version,
+       doc.publication_date AS publication_date,
+       doc.keywords AS keywords,
+       score AS similarity_score,
+       chunk.id AS chunk_id
 ORDER BY score DESC
 LIMIT $k
 """
@@ -66,16 +68,17 @@ LIMIT $k
 """
 
 HYBRID_SEARCH_WITH_CONTEXT = """
-// Hybrid retrieval: Vector search + Graph traversal
+// Hybrid retrieval: Vector search on Chunks + Graph traversal
 // Enriches vector search results with graph context
 
-CALL db.index.vector.queryNodes('document_embeddings', $k, $query_embedding)
-YIELD node AS doc, score
+CALL db.index.vector.queryNodes('chunk_embeddings', $k, $query_embedding)
+YIELD node AS chunk, score
 
+MATCH (chunk)-[:BELONGS_TO]->(doc:Document)
 WHERE ($category IS NULL OR doc.category = $category)
 
 // Graph traversal for related clinical concepts
-MATCH (doc)-[:REFERENCES]->(concept:ClinicalConcept)
+OPTIONAL MATCH (doc)-[:REFERENCES]->(concept:ClinicalConcept)
 
 // Find applicable calculators
 OPTIONAL MATCH (concept)<-[:APPLIES_TO]-(calc:Calculator)
@@ -85,11 +88,12 @@ OPTIONAL MATCH (doc)-[:CITES]->(cited_doc:Document)
 
 RETURN doc.id AS document_id,
        doc.title AS document_title,
-       doc.content AS content,
+       chunk.content AS content,
        doc.summary AS summary,
        doc.source AS source,
        doc.version AS version,
        score AS vector_score,
+       chunk.id AS chunk_id,
        collect(DISTINCT {
            name: concept.name,
            icd10: concept.icd10_codes,
@@ -103,27 +107,28 @@ LIMIT $k
 
 MULTI_HOP_RETRIEVAL = """
 // Multi-hop graph retrieval
-// Starting from vector search, traverse 2-3 hops for deep context
+// Starting from vector search on chunks, traverse 2-3 hops for deep context
 
-CALL db.index.vector.queryNodes('document_embeddings', 5, $query_embedding)
-YIELD node AS doc, score
+CALL db.index.vector.queryNodes('chunk_embeddings', 5, $query_embedding)
+YIELD node AS chunk, score
 
-WHERE doc.category = $category
+MATCH (chunk)-[:BELONGS_TO]->(doc:Document)
+WHERE $category IS NULL OR doc.category = $category
 
 // 1st hop: Clinical concepts referenced
-MATCH (doc)-[:REFERENCES]->(concept1:ClinicalConcept)
+OPTIONAL MATCH (doc)-[:REFERENCES]->(concept1:ClinicalConcept)
 
 // 2nd hop: Related clinical concepts
-MATCH (concept1)-[:RELATED_TO]-(concept2:ClinicalConcept)
+OPTIONAL MATCH (concept1)-[:RELATED_TO]-(concept2:ClinicalConcept)
 
 // 3rd hop: Documents referencing related concepts
-MATCH (concept2)<-[:REFERENCES]-(related_doc:Document)
-
+OPTIONAL MATCH (concept2)<-[:REFERENCES]-(related_doc:Document)
 WHERE related_doc.id <> doc.id  // Exclude original document
 
 RETURN doc.id AS primary_doc_id,
        doc.title AS primary_title,
        score AS primary_score,
+       chunk.id AS chunk_id,
        collect(DISTINCT concept1.name)[..5] AS direct_concepts,
        collect(DISTINCT concept2.name)[..10] AS related_concepts,
        collect(DISTINCT {
@@ -616,7 +621,7 @@ GET_INDEX_STATUS = """
 
 SHOW INDEXES
 YIELD name, state, type, populationPercent
-WHERE name IN ['document_embeddings', 'concept_embeddings', 'document_fulltext', 'concept_fulltext']
+WHERE name IN ['chunk_embeddings', 'concept_embeddings', 'community_embeddings', 'document_fulltext', 'concept_fulltext']
 
 RETURN name,
        state,
@@ -648,6 +653,118 @@ WITH type(r) AS relationship_type, count(r) AS relationship_count
 RETURN relationship_type,
        relationship_count
 ORDER BY relationship_count DESC
+"""
+
+# =============================================================================
+# GRAPHRAG QUERIES
+# =============================================================================
+
+COMMUNITY_VECTOR_SEARCH = """
+CALL db.index.vector.queryNodes('community_embeddings', $top_k, $embedding)
+YIELD node, score
+MATCH (node:Community)
+OPTIONAL MATCH (s:HierarchicalSummary)-[:SUMMARIZES]->(node)
+WHERE s.level = 2
+RETURN node.id AS community_id,
+       node.name AS community_name,
+       COALESCE(s.content, node.description) AS summary,
+       score AS relevance_score,
+       node.tier AS tier,
+       node.size AS document_count
+ORDER BY score DESC
+LIMIT $top_k
+"""
+
+COMMUNITY_DOCUMENTS = """
+MATCH (c:Community {id: $community_id})
+MATCH (d:Document)-[:BELONGS_TO_COMMUNITY]->(c)
+RETURN d.id AS document_id,
+       d.title AS title,
+       d.summary AS summary
+ORDER BY d.title
+"""
+
+HIERARCHICAL_PATH = """
+MATCH (target {id: $entity_id})
+OPTIONAL MATCH path = (s:HierarchicalSummary)-[:SUMMARIZES*1..3]->(target)
+RETURN nodes(path) AS hierarchy,
+       [node IN nodes(path) | node.level] AS levels,
+       [node IN nodes(path) | node.content] AS summaries
+"""
+
+CENTRALITY_SCORES = """
+CALL gds.betweenness.stream('document-concept-graph')
+YIELD nodeId, score
+MATCH (d:Document)
+WHERE id(d) = nodeId
+RETURN d.id AS document_id, score AS centrality
+ORDER BY score DESC
+LIMIT $top_k
+"""
+
+CREATE_COMMUNITY = """
+MERGE (c:Community {id: $community_id})
+SET c.name = $name,
+    c.description = $description,
+    c.size = $size,
+    c.tier = $tier,
+    c.key_terms = $key_terms,
+    c.embedding = $embedding,
+    c.created_at = datetime()
+WITH c
+UNWIND COALESCE($document_ids, []) AS doc_id
+MATCH (d:Document {id: doc_id})
+MERGE (d)-[:BELONGS_TO_COMMUNITY]->(c)
+RETURN c.id AS id
+"""
+
+GET_COMMUNITY_SUMMARIES = """
+MATCH (c:Community {id: $community_id})
+OPTIONAL MATCH (s:HierarchicalSummary)-[:SUMMARIZES]->(c)
+OPTIONAL MATCH (d:Document)-[:BELONGS_TO_COMMUNITY]->(c)
+OPTIONAL MATCH (ds:HierarchicalSummary)-[:SUMMARIZES]->(d)
+WHERE ds.level = 1
+RETURN {
+    community_summary: s.content,
+    document_summaries: collect(DISTINCT ds.content)
+} AS summaries
+"""
+
+STORE_HIERARCHICAL_SUMMARY = """
+MERGE (s:HierarchicalSummary {id: $summary_id})
+SET s.entity_id = $entity_id,
+    s.entity_type = $entity_type,
+    s.level = $level,
+    s.content = $content,
+    s.key_phrases = $key_phrases,
+    s.token_count = $token_count,
+    s.model_used = $model_used,
+    s.created_at = datetime()
+WITH s
+OPTIONAL MATCH (e)
+WHERE (e:Chunk AND e.id = $entity_id)
+   OR (e:Document AND e.id = $entity_id)
+   OR (e:Community AND e.id = $entity_id)
+FOREACH (x IN CASE WHEN e IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:SUMMARIZES]->(e)
+)
+RETURN s.id AS id
+"""
+
+GRAPHRAG_LOCAL_SEARCH = """
+CALL db.index.vector.queryNodes('chunk_embeddings', $top_k * 2, $embedding)
+YIELD node, score
+MATCH (node:Chunk)<-[:HAS_CHUNK]-(d:Document)
+OPTIONAL MATCH (d)-[:BELONGS_TO_COMMUNITY]->(c:Community)
+WHERE c.id IN $community_ids OR size($community_ids) = 0
+RETURN node.id AS chunk_id,
+       d.id AS document_id,
+       d.title AS document_title,
+       node.content AS content,
+       score AS relevance_score,
+       c.id AS community_id
+ORDER BY score DESC
+LIMIT $top_k
 """
 
 # =============================================================================
@@ -704,6 +821,16 @@ QUERY_TEMPLATES: Dict[str, str] = {
     "get_index_status": GET_INDEX_STATUS,
     "get_database_statistics": GET_DATABASE_STATISTICS,
     "get_relationship_statistics": GET_RELATIONSHIP_STATISTICS,
+
+    # GraphRAG
+    "community_vector_search": COMMUNITY_VECTOR_SEARCH,
+    "community_documents": COMMUNITY_DOCUMENTS,
+    "hierarchical_path": HIERARCHICAL_PATH,
+    "centrality_scores": CENTRALITY_SCORES,
+    "create_community": CREATE_COMMUNITY,
+    "get_community_summaries": GET_COMMUNITY_SUMMARIES,
+    "store_hierarchical_summary": STORE_HIERARCHICAL_SUMMARY,
+    "graphrag_local_search": GRAPHRAG_LOCAL_SEARCH,
 }
 
 

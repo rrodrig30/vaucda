@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Server Configuration
     API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8000
+    API_PORT: int = 8027
     API_WORKERS: int = 4
 
     # Protocol Configuration
@@ -99,20 +99,31 @@ class Settings(BaseSettings):
     # LLM - Ollama (Primary Provider) - REQUIRED for production
     OLLAMA_BASE_URL: Optional[str] = None  # Must be set in .env
     OLLAMA_DEFAULT_MODEL: str = "llama3.1:8b"
-    OLLAMA_TIMEOUT: int = 120
+    OLLAMA_TIMEOUT: int = 3600  # 1 hour timeout for complex note generation
+    OLLAMA_MAX_TOKENS: int = 8192  # Default 8K tokens, user configurable for larger context LLMs
     OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text"
+
+    # GraphRAG runtime LLM (used by global_search map/score/reduce and
+    # local_search query-entity extraction). Default to a fast cloud
+    # model — local llama3.1:8b on this Ollama instance has been
+    # observed to take 30+ s per call, making the multi-call
+    # map-reduce path multi-minute. Cloud models typically respond in
+    # 1-5 s. Override per-deployment via the GRAPHRAG_LLM_MODEL env
+    # var. Embeddings remain on `OLLAMA_EMBEDDING_MODEL` (local) since
+    # the cloud LLM does not expose an embeddings endpoint.
+    GRAPHRAG_LLM_MODEL: str = "gpt-oss:120b-cloud"
 
     # LLM - Anthropic (Optional)
     ANTHROPIC_API_KEY: Optional[str] = None
     ANTHROPIC_DEFAULT_MODEL: str = "claude-3-5-sonnet-20250101"
     ANTHROPIC_MAX_TOKENS: int = 8096
-    ANTHROPIC_TIMEOUT: int = 60
+    ANTHROPIC_TIMEOUT: int = 3600  # 1 hour timeout for complex note generation
 
     # LLM - OpenAI (Optional)
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_DEFAULT_MODEL: str = "gpt-4o"
     OPENAI_MAX_TOKENS: int = 8096
-    OPENAI_TIMEOUT: int = 60
+    OPENAI_TIMEOUT: int = 3600  # 1 hour timeout for complex note generation
 
     # RAG Configuration
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -120,6 +131,86 @@ class Settings(BaseSettings):
     VECTOR_SEARCH_TOP_K: int = 5
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200
+
+    # UMLS Concept Linking
+    UMLS_API_KEY: Optional[str] = None
+    USE_UMLS_API: bool = True
+    USE_SCISPACY_UMLS: bool = False
+    QUICKUMLS_PATH: str = "./data/umls/quickumls"
+
+    # OCR Configuration (Ollama vision model for scanned PDFs)
+    OCR_TIMEOUT: int = 180  # seconds per page
+    OCR_MAX_PAGES: int = 50  # Maximum pages to OCR
+    OCR_DPI: int = 300  # DPI for PDF to image conversion (300 minimum for OCR)
+    TEMP_FILE_DIR: str = "/tmp/vaucda"
+
+    # Task-Specific LLM Defaults (configurable via .env)
+    # These are used as database column defaults when no user preference exists
+    # OCR Task: Vision model for document OCR
+    OCR_LLM_PROVIDER: str = "ollama"
+    OCR_LLM_MODEL: str = "qwen3-vl:32b"  # Vision model for document OCR (glm-ocr crashes on Ollama 0.17.x)
+    OCR_LLM_TEMPERATURE: float = 0.1
+    OCR_LLM_MAX_TOKENS: int = 4096
+
+    # Stage 1 Task: Note generation/extraction
+    STAGE1_LLM_PROVIDER: str = "ollama"
+    STAGE1_LLM_MODEL: str = "llama3.1:8b"  # Default text model
+    STAGE1_LLM_TEMPERATURE: float = 0.1
+    STAGE1_LLM_MAX_TOKENS: int = 8192
+
+    # Stage 2 Task: Assessment & Plan with RAG
+    STAGE2_LLM_PROVIDER: str = "ollama"
+    STAGE2_LLM_MODEL: str = "llama3.1:8b"  # Default text model
+    STAGE2_LLM_TEMPERATURE: float = 0.0  # Zero for clinical accuracy
+    STAGE2_LLM_MAX_TOKENS: int = 8192
+    STAGE2_USE_RAG: bool = True
+    STAGE2_USE_GRAPHRAG: bool = True
+    STAGE2_RAG_TOP_K: int = 5
+
+    # Legacy OCR_MODEL for backward compatibility (deprecated, use OCR_LLM_MODEL)
+    @property
+    def OCR_MODEL(self) -> str:
+        return self.OCR_LLM_MODEL
+
+    # LLM Concurrency & Retry
+    OLLAMA_LOCAL_CONCURRENCY: int = 4  # Max concurrent requests to local Ollama models (prevents GPU contention)
+    LLM_MAX_RETRIES: int = 5  # Max retries on 429 Too Many Requests
+    LLM_RETRY_BASE_DELAY: float = 3.0  # Base delay in seconds (exponential backoff)
+
+    # Model resident-time on Ollama. Sent as `keep_alive` in /api/generate
+    # payloads. "0" or "0s" unloads after each request; "24h" or "-1"
+    # keeps the model resident. Set high to avoid 30s cold-start on the
+    # first request after backend idle.
+    OLLAMA_KEEP_ALIVE: str = "24h"
+
+    # Pre-warm Stage 1 / Stage 2 / OCR models at backend startup so the
+    # first user request does not pay the model-load cost.
+    ENABLE_MODEL_PREWARM: bool = True
+
+    # Skip pre-warming any LOCAL Ollama model whose on-disk size
+    # exceeds this threshold (in GB). Models larger than the available
+    # GPU VRAM either fail to load or fall back to slow CPU offload,
+    # producing a 60s+ stall every backend restart for no benefit.
+    # Cloud models (`:cloud` suffix) are always pre-warmed regardless
+    # of size since they do not consume local VRAM.
+    MODEL_PREWARM_MAX_LOCAL_GB: float = 60.0
+
+    # Skip pre-warming preferences from system/seed accounts (admin
+    # default user). Only the human user's actual configured models are
+    # worth pre-warming. Set to "" to disable filtering.
+    MODEL_PREWARM_SKIP_USER_EMAILS: str = "admin@vaucda.va.gov"
+
+    # Batch Processing
+    BATCH_ALLOWED_DIRS: str = '[]'  # JSON array of allowed base directories for batch processing
+    BATCH_MAX_RETRIES: int = 3
+    BATCH_FILE_SEPARATOR: str = "+++++++++"
+    BATCH_FILE_TIMEOUT: int = 5400  # seconds per file (90 minutes)
+    BATCH_MAX_FILES: int = 200  # maximum files in a single batch
+
+    @property
+    def batch_allowed_dirs_list(self) -> List[str]:
+        """Parse batch allowed directories from JSON string."""
+        return json.loads(self.BATCH_ALLOWED_DIRS)
 
     # Note Generation
     NOTE_GENERATION_TIMEOUT: int = 30

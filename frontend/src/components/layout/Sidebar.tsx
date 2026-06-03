@@ -1,6 +1,6 @@
 import React from 'react'
 import { NavLink } from 'react-router-dom'
-import { FiHome, FiFileText, FiTool, FiBook, FiSettings } from 'react-icons/fi'
+import { FiHome, FiFileText, FiTool, FiBook, FiSettings, FiLayers } from 'react-icons/fi'
 import { useAppSelector } from '@/store/hooks'
 import clsx from 'clsx'
 
@@ -8,6 +8,7 @@ const navigation = [
   { name: 'Dashboard', href: '/', icon: FiHome },
   { name: 'Note Generation', href: '/notes', icon: FiFileText },
   { name: 'Calculators', href: '/calculators', icon: FiTool },
+  { name: 'Batch Processing', href: '/batch', icon: FiLayers },
   { name: 'Knowledge Base', href: '/knowledge-base', icon: FiBook },
   { name: 'Settings', href: '/settings', icon: FiSettings },
 ]

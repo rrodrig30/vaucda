@@ -26,7 +26,7 @@ class RAGSearchRequest(BaseModel):
     search_strategy: str = Field(
         default="graph",
         description="Search strategy to use",
-        pattern="^(vector|hybrid|graph|clinical)$"
+        pattern="^(vector|hybrid|graph|graphrag|clinical)$"
     )
     patient_context: Optional[Dict[str, Any]] = Field(
         default=None,

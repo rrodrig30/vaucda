@@ -126,13 +126,13 @@ This directory contains all the necessary files and documentation to deploy VAUC
 python scripts/generate_secrets.py --env production > /tmp/secrets.txt
 
 # Update .env files with generated secrets
-cp .env.example .env
+cp .env .env
 # Edit .env and replace CHANGE_THIS values
 
-cp backend/.env.example backend/.env
+cp backend/.env backend/.env
 # Edit backend/.env and replace CHANGE_THIS values
 
-cp frontend/.env.example frontend/.env
+cp frontend/.env frontend/.env
 # Edit frontend/.env if needed for production URLs
 
 # Set secure permissions
@@ -294,7 +294,7 @@ bash scripts/init_databases.sh
 ### Staging Environment
 ```bash
 # Update .env for staging
-cp .env.example .env
+cp .env .env
 # Edit .env with staging values
 docker-compose up -d
 bash scripts/init_databases.sh

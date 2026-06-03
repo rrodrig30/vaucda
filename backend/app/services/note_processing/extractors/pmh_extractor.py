@@ -158,8 +158,44 @@ def extract_pmh(clinical_document: str) -> str:
     if not diagnoses:
         return ""
 
-    # Return as numbered list
-    return '\n'.join(diagnoses)
+    # Strip SNOMED CT and ICD codes from diagnosis text
+    # Input:  "Benign prostatic hyperplasia (SCT 266569009) (ICD-10-CM D29.1)"
+    # Output: "Benign prostatic hyperplasia"
+    cleaned_diagnoses = []
+    for diagnosis in diagnoses:
+        cleaned = _strip_diagnostic_codes(diagnosis)
+        if cleaned:
+            cleaned_diagnoses.append(cleaned)
+
+    return '\n'.join(cleaned_diagnoses)
+
+
+def _strip_diagnostic_codes(diagnosis: str) -> str:
+    """
+    Strip SNOMED CT, ICD-10-CM, and ICD-9-CM codes from diagnosis text.
+
+    Input:  "Benign prostatic hyperplasia (SCT 266569009) (ICD-10-CM D29.1)"
+    Output: "Benign prostatic hyperplasia"
+
+    Also handles:
+    - Trailing asterisks: "Diabetes mellitus *"
+    - Multiple code systems: "(SCT 123) (ICD-10-CM N40.1) (ICD-9-CM 600.0)"
+
+    Args:
+        diagnosis: Raw diagnosis text with embedded codes
+
+    Returns:
+        Clean diagnosis text without codes
+    """
+    # Remove (SCT XXXXXX) patterns
+    cleaned = re.sub(r'\s*\(SCT\s+\d+\)', '', diagnosis)
+    # Remove (ICD-10-CM XXXXX) patterns
+    cleaned = re.sub(r'\s*\(ICD-10-CM\s+[A-Z]\d{1,2}\.?\d*\w*\)', '', cleaned)
+    # Remove (ICD-9-CM XXXXX) patterns
+    cleaned = re.sub(r'\s*\(ICD-9-CM\s+[\d.]+\w*\)', '', cleaned)
+    # Remove trailing asterisks
+    cleaned = cleaned.rstrip('*').strip()
+    return cleaned
 
 
 def extract_pmh_from_note(note_content: str) -> str:

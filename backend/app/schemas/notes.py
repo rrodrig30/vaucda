@@ -2,9 +2,10 @@
 Pydantic schemas for note generation API
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
+from enum import Enum
 
 
 class NoteGenerateRequest(BaseModel):
@@ -169,6 +170,10 @@ class InitialNoteRequest(BaseModel):
         default=None,
         description="Last 4 digits of patient SSN for identification"
     )
+    visit_date: Optional[str] = Field(
+        default=None,
+        description="Anticipated date of visit (MM/DD/YYYY). Used for IPSS date and accurate age calculation."
+    )
     llm_provider: str = Field(
         default="ollama",
         description="LLM provider to use",
@@ -274,6 +279,10 @@ class FinalNoteRequest(BaseModel):
         default=None,
         description="Last 4 digits of patient SSN for identification"
     )
+    visit_date: Optional[str] = Field(
+        default=None,
+        description="Anticipated date of visit (MM/DD/YYYY). Used for IPSS date and accurate age calculation."
+    )
     selected_calculators: List[str] = Field(
         default_factory=list,
         description="Calculator IDs selected by user"
@@ -312,6 +321,11 @@ class FinalNoteRequest(BaseModel):
 class FinalNoteResponse(BaseModel):
     """Response schema for Stage 2: Complete note with A&P."""
     final_note: str = Field(..., description="Complete note with Assessment & Plan")
+    preliminary_note: Optional[str] = Field(
+        default=None,
+        description="Preliminary (Stage 1) note. Populated by Express path; "
+                    "omitted by the standard /generate-final endpoint."
+    )
     calculator_results: List[CalculatorResultSchema] = Field(
         default_factory=list,
         description="Results from executed calculators"
@@ -349,3 +363,97 @@ class FinalNoteResponse(BaseModel):
                 }
             }
         }
+
+
+# ============================================================================
+# DOCUMENT UPLOAD SCHEMAS (OCR Support)
+# ============================================================================
+
+class DocumentUploadResponse(BaseModel):
+    """Response from document upload endpoint with OCR support."""
+    extracted_text: str = Field(..., description="Text extracted from document")
+    temp_file_id: str = Field(..., description="ID for temp file (deleted after Stage 2)")
+    extraction_method: Literal["text", "ocr"] = Field(
+        ...,
+        description="Method used: 'text' for direct extraction, 'ocr' for image-based PDFs"
+    )
+    page_count: int = Field(default=1, description="Number of pages processed")
+    file_name: str = Field(..., description="Original file name")
+    file_size_bytes: int = Field(..., description="Original file size in bytes")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "extracted_text": "Patient Name: John Doe\nDOB: 01/15/1960\nPSA: 8.5 ng/mL...",
+                "temp_file_id": "sess_abc123_doc_xyz789",
+                "extraction_method": "ocr",
+                "page_count": 3,
+                "file_name": "lab_results.pdf",
+                "file_size_bytes": 524288
+            }
+        }
+
+
+# ============================================================================
+# BATCH PROCESSING SCHEMAS
+# ============================================================================
+
+class BatchProcessingRequest(BaseModel):
+    """Request schema for batch processing a folder of clinical documents.
+
+    LLM provider, model, temperature, and RAG settings are loaded from
+    the user's saved preferences in the Settings page (Stage 1 and Stage 2 configs).
+    """
+    folder_path: str = Field(
+        ...,
+        description="Absolute path to folder containing clinical documents (.txt files)",
+        min_length=1
+    )
+    visit_date: Optional[str] = Field(
+        default=None,
+        description="Anticipated date of visit (MM/DD/YYYY or YYYY-MM-DD). Used for IPSS date column and accurate age calculation from DOB."
+    )
+
+
+class BatchFileStatus(str, Enum):
+    """Status of a single file in batch processing."""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class BatchFileResult(BaseModel):
+    """Result for a single file in batch processing."""
+    filename: str = Field(..., description="Original filename")
+    output_filename: str = Field(..., description="Output filename (.vaucda)")
+    note_type: str = Field(..., description="Detected note type (urology_clinic or urology_consult)")
+    status: BatchFileStatus = Field(..., description="Processing status")
+    attempts: int = Field(default=0, description="Number of processing attempts")
+    error_message: Optional[str] = Field(default=None, description="Error message if failed")
+    generation_time_seconds: Optional[float] = Field(default=None, description="Time to generate")
+
+
+class BatchProcessingResponse(BaseModel):
+    """Response schema for batch processing completion."""
+    total_files: int = Field(..., description="Total files found in folder")
+    processed: int = Field(..., description="Successfully processed count")
+    failed: int = Field(..., description="Failed count after max retries")
+    results: List[BatchFileResult] = Field(default_factory=list, description="Per-file results")
+    total_file: str = Field(..., description="Path to total.vaucda concatenation file")
+    total_time_seconds: float = Field(..., description="Total batch processing time")
+
+
+class BatchFolderFile(BaseModel):
+    """Schema for a single file in batch folder listing."""
+    filename: str = Field(..., description="File name")
+    size_bytes: int = Field(..., description="File size in bytes")
+    note_type: str = Field(..., description="Detected note type")
+    output_filename: str = Field(..., description="Expected output filename (.vaucda)")
+
+
+class BatchFolderListResponse(BaseModel):
+    """Response schema for listing folder contents for batch processing."""
+    folder_path: str = Field(..., description="Validated folder path")
+    total_files: int = Field(..., description="Number of processable files")
+    files: List[BatchFolderFile] = Field(default_factory=list, description="File details")

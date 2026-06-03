@@ -46,7 +46,7 @@ VAUCDA is a production-ready Python web application designed for VA urology prov
 
 2. **Configure environment:**
    ```bash
-   cp .env.example .env
+   cp .env .env
    # Edit .env with your configuration
    nano .env
    ```

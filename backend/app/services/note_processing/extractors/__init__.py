@@ -19,7 +19,7 @@ from .psa_extractor import extract_psa
 from .pathology_extractor import extract_pathology, extract_pathology_from_note
 from .testosterone_extractor import extract_testosterone
 from .medications_extractor import extract_medications, extract_medications_from_note
-from .allergies_extractor import extract_allergies
+from .allergies_extractor import extract_allergies, extract_allergies_from_document
 from .endocrine_extractor import extract_endocrine_labs
 from .stone_extractor import extract_stone_labs
 from .lab_extractor import extract_labs
@@ -29,7 +29,15 @@ from .assessment_extractor import extract_assessment
 from .plan_extractor import extract_plan
 from .pe_extractor import extract_pe
 from .ros_extractor import extract_ros
-from .consult_request_extractor import extract_consult_request
+from .consult_request_extractor import (
+    extract_consult_request,
+    is_urology_consult,
+    get_providers_to_scan
+)
+from .provider_note_scanner import (
+    scan_provider_notes_for_urologic_content,
+    extract_provider_urologic_context
+)
 
 __all__ = [
     'extract_cc',
@@ -48,6 +56,7 @@ __all__ = [
     'extract_medications',
     'extract_medications_from_note',
     'extract_allergies',
+    'extract_allergies_from_document',
     'extract_endocrine_labs',
     'extract_stone_labs',
     'extract_labs',
@@ -59,4 +68,8 @@ __all__ = [
     'extract_pe',
     'extract_ros',
     'extract_consult_request',
+    'is_urology_consult',
+    'get_providers_to_scan',
+    'scan_provider_notes_for_urologic_content',
+    'extract_provider_urologic_context',
 ]

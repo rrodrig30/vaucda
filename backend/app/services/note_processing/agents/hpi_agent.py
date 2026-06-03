@@ -21,6 +21,63 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _build_psa_delta_block(psa_data: Optional[str]) -> str:
+    """Build a deterministic "PSA since prior visit" summary.
+
+    The LLM frequently overlooks the most recent vs prior delta when
+    given a long PSA curve — it instead anchors on whichever older
+    value was emphasized in a stale HPI snapshot. This function pre-
+    computes the current PSA, the prior PSA, the peak PSA, and the
+    direction of change as plain text that the prompt can quote
+    verbatim. Returns "" if fewer than 2 values are parseable.
+    """
+    if not psa_data:
+        return ""
+    # Re-use the same parsing logic as cc_agent so behaviour is shared.
+    # Locally inlined to avoid a circular import.
+    values: List[Tuple[str, float]] = []
+    for raw_line in psa_data.split('\n'):
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Capture optional leading date+time so we can label values.
+        date_match = re.match(
+            r'(?:\[[a-z]+\]\s+)?'
+            r'([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})',
+            line,
+        )
+        date_label = date_match.group(1) if date_match else ''
+        # Take the last decimal number on the line as the PSA value.
+        nums = re.findall(r'\d+\.\d+', line)
+        if nums:
+            try:
+                values.append((date_label, float(nums[-1])))
+            except ValueError:
+                pass
+    if len(values) < 2:
+        return ""
+    # PSA curve is reverse-chronological → first value is most recent.
+    cur_date, cur_v = values[0]
+    prev_date, prev_v = values[1]
+    peak_v = max(v for _, v in values)
+    if cur_v < prev_v - 0.05:
+        direction = 'decreased'
+    elif cur_v > prev_v + 0.05:
+        direction = 'increased'
+    else:
+        direction = 'unchanged'
+    cur_label = f" on {cur_date}" if cur_date else ""
+    prev_label = f" on {prev_date}" if prev_date else ""
+    return (
+        "PSA SINCE PRIOR VISIT (use these exact values in the HPI):\n"
+        f"- Current PSA: {cur_v} ng/mL{cur_label}\n"
+        f"- Prior PSA:   {prev_v} ng/mL{prev_label}\n"
+        f"- Direction:   {direction}\n"
+        f"- Peak PSA observed in this series: {peak_v} ng/mL\n"
+        "When the HPI references PSA, it MUST cite the current value above."
+    )
+
+
 def synthesize_hpi(
     gu_notes: List[Dict[str, str]],
     non_gu_notes: List[Dict[str, str]],
@@ -32,7 +89,10 @@ def synthesize_hpi(
     visit_progression: Optional[str] = None,
     prior_ap_context: Optional[str] = None,
     verify_facts: bool = True,
-    return_verification: bool = False
+    return_verification: bool = False,
+    patient_name: Optional[str] = None,
+    patient_age: Optional[str] = None,
+    patient_sex: Optional[str] = None,
 ) -> Union[str, Tuple[str, Optional[HPIVerificationResult]]]:
     """
     Synthesize HPI from GU notes with clinical context.
@@ -74,12 +134,32 @@ def synthesize_hpi(
     # Collect HPIs from GU notes ONLY
     # Non-GU HPIs are excluded to prevent contamination with irrelevant content
     # (headaches, dizziness, ankle pain, etc. should not appear in urology HPI)
+    #
+    # Each HPI is a SNAPSHOT from a prior visit, not a description of
+    # today's encounter. Prefix each one with the source visit date so
+    # the synthesis LLM sees a temporal ordering instead of treating
+    # all HPIs as concurrent inputs. Without this label the LLM
+    # routinely merges multi-year histories as if they all happened at
+    # the same encounter (e.g. saying "patient on active surveillance"
+    # for a patient who completed XRT 18 months ago — because an old
+    # surveillance-era HPI is presented at the same level as the most
+    # recent one).
     hpi_instances = []
-
-    # GU notes: HPIs only (Assessment/Plan are Stage 2)
     for note in gu_notes:
-        if note.get("HPI"):
-            hpi_instances.append(note['HPI'])
+        hpi_text = note.get("HPI")
+        if not hpi_text:
+            continue
+        src_date = (note.get("_source_date") or "").strip()
+        src_title = (note.get("_source_title") or "").strip()
+        if src_date and src_title:
+            header = f"[Prior visit dated {src_date} — {src_title}]"
+        elif src_date:
+            header = f"[Prior visit dated {src_date}]"
+        elif src_title:
+            header = f"[Prior visit ({src_title})]"
+        else:
+            header = "[Prior visit, undated]"
+        hpi_instances.append(f"{header}\n{hpi_text}")
 
     # Non-GU notes: EXCLUDED from HPI synthesis
     # Reason: Non-GU HPIs contain non-urological content that confuses the LLM
@@ -88,8 +168,32 @@ def synthesize_hpi(
     #     if note.get("HPI"):
     #         hpi_instances.append(f"Non-GU HPI: {note['HPI']}")
 
-    if not hpi_instances:
+    # If no GU-note HPIs exist but we have clinical context (PSA,
+    # pathology, imaging, prior A&P) — write a UROLOGIC HPI from the
+    # context alone rather than returning empty. The renderer used to
+    # display "HPI: Unknown" in this case; that's never acceptable for
+    # a urology note. Falling through to the LLM-synthesis path below
+    # with no hpi_instances list lets the prompt generate a narrative
+    # purely from the clinical-data context section. We require at
+    # least one piece of urologic context (PSA / pathology / imaging /
+    # cross-specialty / visit-progression / prior-AP) before doing this
+    # — otherwise there's truly nothing to write about.
+    has_clinical_context = any(
+        (s or '').strip()
+        for s in (psa_data, pathology_data, imaging_data,
+                  cross_specialty_context, visit_progression, prior_ap_context)
+    )
+    if not hpi_instances and not has_clinical_context:
         return ""
+    if not hpi_instances:
+        # Sentinel placeholder so combine_sections_with_llm has something
+        # to operate on; the prompt instructions and CLINICAL DATA
+        # CONTEXT below tell the LLM to derive the HPI from context.
+        hpi_instances = [
+            "[NO PRIOR UROLOGY NOTE AVAILABLE — synthesize HPI from the "
+            "CLINICAL DATA CONTEXT below, focusing strictly on urologic "
+            "issues.]"
+        ]
 
     # If only one instance, clean it up
     if len(hpi_instances) == 1:
@@ -103,11 +207,36 @@ def synthesize_hpi(
         result = re.sub(r'\bfor\s+a\s+urology\s+consult\b', 'for a urology followup', result, flags=re.IGNORECASE)
         return result
 
-    # Build clinical context section from available data
+    # Build clinical context section from available data.
+    # Patient demographics first — the LLM tends to either invent an
+    # age (often "72-year-old male" by default) or carry one over
+    # stale from prior notes if we don't anchor it. Putting age and
+    # sex up front prevents that.
     clinical_context = ""
     context_parts = []
+    demo_lines = []
+    if patient_name:
+        demo_lines.append(f"Name: {patient_name}")
+    if patient_age:
+        demo_lines.append(f"Age at this visit: {patient_age} years")
+    if patient_sex:
+        demo_lines.append(f"Sex: {patient_sex}")
+    if demo_lines:
+        context_parts.append(
+            "PATIENT DEMOGRAPHICS (use ONLY these values for age/sex in the HPI; "
+            "do NOT use any age you may see referenced elsewhere in the source notes — "
+            "those reflect the patient's age at the time of an old note, not now):\n"
+            + "\n".join(demo_lines)
+        )
     if psa_data and psa_data.strip():
         context_parts.append(f"RECENT PSA VALUES:\n{psa_data}")
+        # Always emit a deterministic "since prior visit" PSA summary so
+        # the LLM cannot miss the current-vs-prior delta. _build_psa_delta
+        # returns "" if it can't parse two values (in which case the
+        # plain RECENT PSA VALUES block above is what the LLM gets).
+        psa_delta_block = _build_psa_delta_block(psa_data)
+        if psa_delta_block:
+            context_parts.append(psa_delta_block)
     if pathology_data and pathology_data.strip():
         context_parts.append(f"PATHOLOGY RESULTS:\n{pathology_data}")
     if labs_data and labs_data.strip():
@@ -136,9 +265,35 @@ def synthesize_hpi(
 
     # Use LLM to synthesize comprehensive HPI
     instructions = f"""
-Create a current, comprehensive UROLOGY HPI that synthesizes all available urologic information from the source notes into a cohesive narrative.
+Create a current, comprehensive UROLOGY HPI that synthesizes all available urologic information from the source notes into a cohesive narrative for TODAY'S visit.
 
 {clinical_context}
+
+CRITICAL TEMPORAL INVARIANTS (read before doing anything else):
+- The HPI entries below are PRIOR-VISIT SNAPSHOTS, each labeled with
+  "[Prior visit dated <DATE> — <NOTE TITLE>]". The newest snapshot is
+  NOT today. Today's clinical reality may differ substantially —
+  treatment may have been completed since, PSA may have changed,
+  imaging may have been done. Treat each prior HPI as a record of how
+  things stood on its specific date, and DO NOT carry forward any
+  prior statement that the CLINICAL DATA CONTEXT contradicts.
+- Whenever a value (PSA, Gleason, treatment status, etc.) appears in
+  both a prior HPI and the CLINICAL DATA CONTEXT, the CLINICAL DATA
+  CONTEXT wins. The HPI you write must use TODAY'S current PSA, not
+  a stale one from a prior snapshot.
+- If "PSA SINCE PRIOR VISIT" appears in the context above, you MUST
+  quote the current PSA value in the HPI narrative. Do not invent a
+  different value, do not omit it, do not use the prior value as
+  "current".
+- If a prior-visit HPI describes the patient as e.g. "on active
+  surveillance with rising PSA" but the data context shows definitive
+  treatment was completed and PSA is now responding, the HPI you
+  write must reflect the POST-TREATMENT current state, not the stale
+  surveillance era.
+- Frame each historical fact with its date (e.g. "underwent radical
+  prostatectomy in June 2024" not "underwent radical prostatectomy").
+  This makes time elapsed explicit instead of letting the reader
+  guess.
 
 STRUCTURE:
 0. TEMPORAL FRAMING (CRITICAL for followup visits):
@@ -146,7 +301,8 @@ STRUCTURE:
    - Start by referencing what was recommended at the last visit
    - Describe what has happened since (completed procedures, test results, ongoing treatments)
    - Then present the patient's current status and reason for today's visit
-   - Example opening: "Mr. X returns for followup after prostate biopsy which revealed..."
+   - Example opening (generic structure ONLY — substitute the patient's actual diagnosis/procedure from the source notes; do NOT carry "prostate biopsy" or any specific clinical detail from this example into the output):
+       "<Patient> returns for followup of <DIAGNOSIS-FROM-SOURCE>. At the last visit, <RECOMMENDATION-FROM-SOURCE>. Since then, <COMPLETED-EVENT-FROM-SOURCE>. Today, <REASON-FOR-VISIT-FROM-SOURCE>."
 1. Start with the patient's current chief complaint and presenting urologic issue
 2. Include relevant history from past visits in chronological flow
 3. Document urologic symptoms, test results, and diagnoses that are mentioned
@@ -176,11 +332,13 @@ CROSS-SPECIALTY INTEGRATION (when CROSS-SPECIALTY UROLOGIC FINDINGS provided):
 PRIOR ASSESSMENT & PLAN INTEGRATION (when PRIOR A&P CONTEXT provided):
 - Use prior A&P context to inform the HPI narrative with clinical progression
 - Reference what was diagnosed and planned at previous visits
-- Mention completed procedures and their results (e.g., "biopsy completed showing...")
-- Note patient treatment decisions (e.g., "patient declined radiation therapy")
+- Mention completed procedures and their results (using ONLY procedures explicitly named in PRIOR A&P CONTEXT or PATHOLOGY RESULTS above — do NOT invent procedure names)
+- Note patient treatment decisions when explicitly documented
 - Identify what issues remain outstanding from prior visits
 - Frame the current visit in context of the clinical progression
-- Example: "Mr. X returns for followup of prostate cancer Gleason 4+3=7 diagnosed on biopsy in October 2025. At last visit, staging workup was recommended. PSMA PET completed December 2025 showed disease confined to prostate. He was evaluated by radiation oncology and declined brachytherapy. Today he presents to discuss systemic therapy options."
+- ANTI-HALLUCINATION FOR EXAMPLES: never copy specific diagnoses, Gleason scores, procedure names, or imaging modalities from this prompt. The structure shown is a SHAPE only — every clinical fact in the actual HPI must come from the patient's source notes.
+- Generic shape example (do NOT copy any clinical specifics from this — they are placeholders):
+    "<Patient> returns for followup of <DIAGNOSIS>. At last visit, <RECOMMENDATION>. Since then, <EVENT/RESULT>. Today, <CURRENT-DECISION-POINT>."
 
 ANTI-HALLUCINATION RULES:
 - DO NOT invent procedures or treatments not mentioned in the notes

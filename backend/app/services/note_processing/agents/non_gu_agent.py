@@ -13,6 +13,7 @@ from ..extractors import (
     extract_psh,
     extract_social,
     extract_family,
+    extract_sexual,
     extract_assessment,
     extract_plan,
 )
@@ -51,7 +52,10 @@ def process_non_gu_notes(non_gu_notes: List[Dict[str, str]]) -> List[Dict[str, s
     for note in non_gu_notes:
         note_content = note["content"]
 
-        # Extract clinically relevant sections
+        # Extract clinically relevant sections. Sexual history can appear
+        # in non-GU notes (PCP visits, IM notes) and must be carried
+        # forward — synthesize_sexual iterates over non_gu_notes looking
+        # for a "Sexual" key, which was previously never populated here.
         non_gu_note = {
             "CC": extract_cc(note_content),
             "HPI": extract_hpi(note_content),
@@ -60,6 +64,7 @@ def process_non_gu_notes(non_gu_notes: List[Dict[str, str]]) -> List[Dict[str, s
             "PSH": extract_psh(note_content),
             "Social": extract_social(note_content),
             "Family": extract_family(note_content),
+            "Sexual": extract_sexual(note_content),
             "Assessment": extract_assessment(note_content),
             "Plan": extract_plan(note_content)
         }

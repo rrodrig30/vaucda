@@ -364,3 +364,52 @@ async def change_password(
     await db.commit()
 
     return {"message": "Password updated successfully"}
+
+
+@router.post("/logout", status_code=status.HTTP_200_OK)
+async def logout(
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Logout user and PURGE all patient data from memory.
+
+    CRITICAL: This endpoint:
+    1. Purges ALL patient data from the current session
+    2. Ends the patient session
+    3. Forces garbage collection
+
+    The frontend should:
+    1. Call this endpoint before clearing tokens
+    2. Clear local storage/session storage
+    3. Redirect to login page
+
+    Note: Since we use JWT tokens, the token itself remains valid until expiration.
+    The frontend must discard the token to complete logout.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        # CRITICAL: Purge all patient data before logout
+        from app.services.note_processing.session_manager import purge_all_patient_data
+
+        logger.info(f"User {current_user.user_id} logging out - purging all patient data")
+
+        purge_all_patient_data()
+
+        logger.info(f"User {current_user.user_id} logout complete - all patient data purged")
+
+        return {
+            "status": "success",
+            "message": "Logged out successfully. All patient data purged.",
+            "action_required": "Please clear your access token from local storage."
+        }
+
+    except Exception as e:
+        logger.error(f"Logout failed: {e}", exc_info=True)
+        # Still return success - user should be logged out even if purge fails
+        return {
+            "status": "warning",
+            "message": "Logged out with warnings. Please clear your access token.",
+            "error": str(e)
+        }

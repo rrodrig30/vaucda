@@ -56,6 +56,12 @@ librosa==0.10.1
 httpx==0.25.2
 aiohttp==3.9.1
 
+# GraphRAG Components
+networkx>=3.2
+igraph>=0.11.0
+leidenalg>=0.10.0
+quickumls>=1.4.0
+
 # Utilities
 python-dateutil==2.8.2
 pytz==2023.3
@@ -77,3 +83,4 @@ black==23.12.1
 isort==5.13.2
 flake8==7.0.0
 mypy==1.8.0
+openpyxl>=3.1.0  # Excel spreadsheet support for metadata import

@@ -7,6 +7,7 @@ Suggests relevant clinical calculators based on extracted entities.
 import logging
 from typing import Dict, List, Any, Optional
 from calculators.registry import CalculatorRegistry
+from app.services.entity_extractor import ClinicalEntityExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +16,10 @@ class CalculatorSuggester:
     """Suggest calculators based on available clinical data."""
 
     # Map calculators to their required inputs
+    # NOTE: Calculator IDs must match the registry IDs (e.g., 'capracalculator' not 'capra_score')
     CALCULATOR_REQUIREMENTS = {
         # Prostate Cancer Calculators
-        'capra_score': {
+        'capracalculator': {
             'category': 'prostate',
             'name': 'CAPRA Score',
             'required': ['psa', 'age', 'gleason_primary', 'gleason_secondary', 'clinical_stage', 'percent_positive_cores'],
@@ -31,28 +33,28 @@ class CalculatorSuggester:
             'optional': [],
             'description': 'Estimates risk of prostate cancer on biopsy'
         },
-        'nccn_risk': {
+        'nccnriskcalculator': {
             'category': 'prostate',
             'name': 'NCCN Risk Stratification',
             'required': ['psa', 'gleason_primary', 'gleason_secondary', 'clinical_stage'],
             'optional': ['percent_positive_cores'],
             'description': 'NCCN prostate cancer risk classification'
         },
-        'psa_kinetics': {
+        'psakineticscalculator': {
             'category': 'prostate',
             'name': 'PSA Kinetics',
             'required': ['psa_values', 'time_points'],
             'optional': ['prostate_volume_cc'],
             'description': 'Calculate PSA velocity, doubling time, and density'
         },
-        'phi_score': {
+        'phicalculator': {
             'category': 'prostate',
             'name': 'Prostate Health Index (PHI)',
             'required': ['psa', 'free_psa', 'p2psa'],
             'optional': [],
             'description': 'Enhanced prostate cancer risk assessment'
         },
-        'free_psa': {
+        'freepsacalculator': {
             'category': 'prostate',
             'name': 'Free PSA Ratio',
             'required': ['psa', 'free_psa'],
@@ -61,28 +63,28 @@ class CalculatorSuggester:
         },
 
         # Kidney Cancer Calculators
-        'ssign_score': {
+        'ssigncalculator': {
             'category': 'kidney',
             'name': 'SSIGN Score',
             'required': ['tumor_size_cm', 'tnm_stage', 'nuclear_grade', 'tumor_necrosis'],
             'optional': [],
             'description': 'Predict cancer-specific survival for RCC'
         },
-        'imdc_criteria': {
+        'imdccalculator': {
             'category': 'kidney',
             'name': 'IMDC Criteria',
             'required': ['karnofsky_score', 'hemoglobin', 'calcium', 'neutrophils', 'platelets', 'time_from_diagnosis'],
             'optional': [],
             'description': 'Prognostic model for metastatic RCC'
         },
-        'renal_score': {
+        'renalscorecalculator': {
             'category': 'kidney',
             'name': 'RENAL Nephrometry Score',
             'required': ['tumor_size_cm', 'tumor_location', 'nearness_to_sinus'],
             'optional': [],
             'description': 'Assess renal mass complexity for partial nephrectomy'
         },
-        'leibovich_score': {
+        'leibovichcalculator': {
             'category': 'kidney',
             'name': 'Leibovich Score',
             'required': ['tumor_size_cm', 'tnm_stage', 'nuclear_grade', 'tumor_necrosis'],
@@ -91,21 +93,21 @@ class CalculatorSuggester:
         },
 
         # Bladder Cancer Calculators
-        'eortc_recurrence': {
+        'eortcrecurrencecalculator': {
             'category': 'bladder',
             'name': 'EORTC Recurrence Risk',
             'required': ['num_tumors', 'tumor_size_cm', 'prior_recurrence', 't_category', 'cis_present', 'tumor_grade'],
             'optional': [],
             'description': 'Predict bladder cancer recurrence risk'
         },
-        'eortc_progression': {
+        'eortcprogressioncalculator': {
             'category': 'bladder',
             'name': 'EORTC Progression Risk',
             'required': ['num_tumors', 'tumor_size_cm', 'prior_recurrence', 't_category', 'cis_present', 'tumor_grade'],
             'optional': [],
             'description': 'Predict bladder cancer progression risk'
         },
-        'cueto_score': {
+        'cuetocalculator': {
             'category': 'bladder',
             'name': 'Cueto BCG Score',
             'required': ['age', 'prior_recurrence', 'num_tumors', 'tumor_grade'],
@@ -114,30 +116,37 @@ class CalculatorSuggester:
         },
 
         # Voiding Dysfunction
-        'iciq': {
+        'iciqcalculator': {
             'category': 'voiding',
             'name': 'ICIQ Score',
             'required': ['frequency', 'amount', 'impact'],
             'optional': [],
             'description': 'Incontinence impact assessment'
         },
+        'ipsscalculator': {
+            'category': 'voiding',
+            'name': 'IPSS Score',
+            'required': ['incomplete_emptying', 'frequency', 'intermittency', 'urgency', 'weak_stream', 'straining', 'nocturia', 'qol'],
+            'optional': [],
+            'description': 'Assess lower urinary tract symptoms'
+        },
 
         # Surgical Risk
-        'rcri': {
+        'rcricalculator': {
             'category': 'surgical',
             'name': 'Revised Cardiac Risk Index',
             'required': ['risk_factors_count'],
             'optional': [],
             'description': 'Perioperative cardiac risk assessment'
         },
-        'clavien_dindo': {
+        'claviendindocalculator': {
             'category': 'surgical',
             'name': 'Clavien-Dindo Classification',
             'required': ['complication_grade'],
             'optional': [],
             'description': 'Surgical complication severity grading'
         },
-        'cci': {
+        'ccicalculator': {
             'category': 'surgical',
             'name': 'Charlson Comorbidity Index',
             'required': ['age', 'comorbidities'],
@@ -146,7 +155,7 @@ class CalculatorSuggester:
         },
         'lifeexpectancycalculator': {
             'category': 'surgical',
-            'name': 'Actuarial 10-Year Survival Calculator',
+            'name': 'Life Expectancy Calculator',
             'required': ['age', 'gender', 'health_status', 'comorbidities'],
             'optional': [],
             'description': 'Estimate life expectancy using actuarial tables'
@@ -167,8 +176,18 @@ class CalculatorSuggester:
         Returns:
             List of calculator suggestions with confidence and missing inputs
         """
-        # Build entity lookup dict
+        # Build entity lookup dict from raw extractions
         entity_dict = {e['field']: e['value'] for e in extracted_entities}
+
+        # Derive calculator-specific inputs (e.g., dre_abnormal from dre_findings)
+        extractor = ClinicalEntityExtractor()
+        derived_inputs = extractor.derive_calculator_inputs(extracted_entities)
+
+        # Merge derived inputs into entity_dict (derived values take precedence)
+        entity_dict.update(derived_inputs)
+
+        logger.debug(f"Calculator inputs after derivation: {list(entity_dict.keys())}")
+
         suggestions = []
 
         for calc_id, requirements in self.CALCULATOR_REQUIREMENTS.items():

@@ -13,7 +13,7 @@ export default defineConfig(({ mode }) => {
   const useHttps = env.USE_HTTPS === 'true'
   const protocol = useHttps ? 'https' : 'http'
   const wsProtocol = useHttps ? 'wss' : 'ws'
-  const backendPort = env.BACKEND_PORT || '8002'
+  const backendPort = env.BACKEND_PORT || '8027'  // Default to 8027 to match backend
   const frontendPort = parseInt(env.FRONTEND_PORT || '3005')
 
   return {
@@ -39,6 +39,8 @@ export default defineConfig(({ mode }) => {
           target: `${protocol}://localhost:${backendPort}`,
           changeOrigin: true,
           secure: false,  // Accept self-signed certificates
+          timeout: 32400000,  // 9 hours (10 files × 90 min max each)
+          proxyTimeout: 32400000,  // 9 hours proxy timeout
         },
         '/ws': {
           target: `${wsProtocol}://localhost:${backendPort}`,

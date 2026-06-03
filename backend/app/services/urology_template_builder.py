@@ -814,7 +814,7 @@ class UrologyTemplateBuilder:
         endocrine_labs_from_parsed = [lab for lab in lab_results if lab.get('test', '').lower() in ['testosterone', 'free testosterone', 'lh', 'fsh', 'prolactin', 'estradiol']]
 
         if endocrine or endocrine_labs_from_parsed:
-            parts.append("===================================ENDOCRINE LABS =============================")
+            parts.append("=================================ENDOCRINE LABS ===========================")
 
             # Add extracted section content
             if endocrine:
@@ -833,7 +833,7 @@ class UrologyTemplateBuilder:
         stone_labs_from_parsed = [lab for lab in lab_results if lab.get('category') == 'stone_related']
 
         if stone_labs or stone_labs_from_parsed:
-            parts.append("================================STONE RELATED LABS ============================")
+            parts.append("==============================STONE RELATED LABS ==========================")
 
             # Add extracted section content
             if stone_labs:
@@ -884,7 +884,7 @@ class UrologyTemplateBuilder:
                         parts.append(f"{lab['test']}: {lab['value']} {unit} {lab.get('flag', '')}".strip())
 
         # 17. General Labs
-        parts.append("======================================= LABS ==================================")
+        parts.append("===================================== LABS ================================")
 
         # Filter out endocrine and stone-related labs from general display
         general_labs = [
@@ -951,6 +951,16 @@ class UrologyTemplateBuilder:
                         study_name = study_match.group(0).strip()
                         # Clean up extra words
                         study_name = re.sub(r'\s+(WITH|WITHOUT|AND|REPORT).*', '', study_name, flags=re.IGNORECASE)
+                        # Strip a trailing "(MM/DD/YYYY):" or "(MON DD, YYYY):"
+                        # that upstream extractors already embed in the study
+                        # line — otherwise the date below appears twice
+                        # ("STUDY (date): (date): ...").
+                        study_name = re.sub(
+                            r'\s*\(\s*(?:\d{1,2}/\d{1,2}/\d{2,4}|'
+                            r'[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s*\)\s*:?\s*$',
+                            '',
+                            study_name,
+                        ).strip().rstrip(':').strip()
                         break
 
             # Extract date
@@ -999,9 +1009,9 @@ class UrologyTemplateBuilder:
         if not cleaned_imaging:
             return ""
 
-        parts = ["====================================== IMAGING ================================"]
+        parts = ["==================================== IMAGING =============================="]
         parts.append(cleaned_imaging)
-        parts.append("===============================================================================")
+        parts.append("===========================================================================")
         return "\n".join(parts)
 
     def _build_ros(self, sections: Dict[str, str]) -> str:

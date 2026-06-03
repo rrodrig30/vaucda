@@ -337,27 +337,58 @@ class PCPNoteExtractor:
         """
         Extract dietary history from PCP note.
 
+        IMPORTANT: This extracts the FULL dietary history without truncation.
+
         Args:
             pcp_note: Full PCP note text
 
         Returns:
-            Dietary history text
+            Dietary history text (complete, not truncated)
         """
-        # Pattern 1: Nutrition section in nursing assessment
-        nutrition_pattern = r'Nutrition:\s*\n\s*([^\n]+)'
-        match = re.search(nutrition_pattern, pcp_note, re.IGNORECASE)
+        diet_parts = []
+
+        # Pattern 1: Full Nutrition section in nursing assessment (multi-line)
+        # Capture everything until next section header
+        nutrition_pattern = r'Nutrition\s*:\s*\n?\s*(.*?)(?=\n\s*(?:Activity|Elimination|Sleep|Safety|Psychological|Pain|[A-Z][a-z]+\s*:)|\Z)'
+        match = re.search(nutrition_pattern, pcp_note, re.IGNORECASE | re.DOTALL)
         if match:
             nutrition = match.group(1).strip()
-            if nutrition.lower() not in ['no problem', 'wdl', 'wnl']:
-                return nutrition
+            if nutrition and nutrition.lower() not in ['no problem', 'wdl', 'wnl', 'within normal limits']:
+                diet_parts.append(nutrition)
 
-        # Pattern 2: Food insecurity screening
-        food_pattern = r'food.*?(?:run out|didn.*?last|insecurity)([^\n.]+)'
+        # Pattern 2: Dietary History explicit section
+        dietary_pattern = r'(?:Dietary\s+History|DHx|Diet)\s*:\s*(.*?)(?=\n\s*(?:Social|Family|PMH|PSH|ROS|PE|EXAM|ASSESSMENT|PLAN|[A-Z][A-Z]+\s*:)|\Z)'
+        match = re.search(dietary_pattern, pcp_note, re.IGNORECASE | re.DOTALL)
+        if match:
+            dietary = match.group(1).strip()
+            if dietary and dietary not in diet_parts:
+                diet_parts.append(dietary)
+
+        # Pattern 3: Food insecurity screening (full response)
+        food_pattern = r'(?:food\s+(?:insecurity|security)|hunger)\s*[:\s]*(.*?)(?=\n\s*[A-Z]|\Z)'
         match = re.search(food_pattern, pcp_note, re.DOTALL | re.IGNORECASE)
         if match:
-            return f"Food security screening: {match.group(0)}"
+            food_text = match.group(1).strip()
+            if food_text and food_text not in diet_parts:
+                diet_parts.append(f"Food security: {food_text}")
 
-        return ""
+        # Pattern 4: Fluid intake mentions
+        fluid_pattern = r'(?:fluid|water)\s+intake\s*[:\s]*([^\n]+(?:\n(?![A-Z][a-z]+:)[^\n]+)*)'
+        match = re.search(fluid_pattern, pcp_note, re.IGNORECASE)
+        if match:
+            fluid = match.group(1).strip()
+            if fluid and fluid not in diet_parts:
+                diet_parts.append(f"Fluid intake: {fluid}")
+
+        if not diet_parts:
+            return ""
+
+        # Combine all parts
+        combined = '\n'.join(diet_parts)
+        # Clean up whitespace
+        combined = re.sub(r' +', ' ', combined)
+        combined = re.sub(r'\n{3,}', '\n\n', combined)
+        return combined.strip()
 
     def extract_hpi(self, pcp_note: str) -> str:
         """

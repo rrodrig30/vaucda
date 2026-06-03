@@ -2,7 +2,7 @@ import React from 'react'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { login, clearError } from '@/store/slices/authSlice'
 import { Button } from '@/components/common/Button'
@@ -10,7 +10,7 @@ import { Input } from '@/components/common/Input'
 import { Alert } from '@/components/common/Alert'
 
 const loginSchema = z.object({
-  username: z.string().min(1, 'Username is required'),
+  username: z.string().min(1, 'Email is required'),
   password: z.string().min(1, 'Password is required'),
 })
 
@@ -59,11 +59,11 @@ export const Login: React.FC = () => {
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <Input
             {...register('username')}
-            label="Username"
-            type="text"
-            placeholder="Enter your username"
+            label="Email"
+            type="email"
+            placeholder="Enter your email"
             error={errors.username?.message}
-            autoComplete="username"
+            autoComplete="email"
           />
 
           <Input
@@ -85,7 +85,19 @@ export const Login: React.FC = () => {
           </Button>
         </form>
 
-        <div className="mt-6 text-center text-sm text-gray-600 dark:text-gray-400">
+        <div className="mt-6 text-center">
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            Don't have an account?{' '}
+            <Link
+              to="/register"
+              className="text-primary hover:text-primary-dark font-medium"
+            >
+              Register here
+            </Link>
+          </p>
+        </div>
+
+        <div className="mt-4 text-center text-sm text-gray-600 dark:text-gray-400">
           <p>Secure VA System - Authorized Access Only</p>
         </div>
       </div>

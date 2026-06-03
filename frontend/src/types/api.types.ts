@@ -33,6 +33,7 @@ export interface LoginRequest {
 
 export interface LoginResponse {
   access_token: string
+  refresh_token: string
   token_type: string
   expires_in: number
 }
@@ -224,6 +225,10 @@ export interface UserSettings {
   default_template: string
   module_defaults: ModuleDefaults
   display_preferences: DisplayPreferences
+  // Task-specific LLM configuration
+  ocr_llm?: TaskLLMConfig
+  stage1_llm?: TaskLLMConfig
+  stage2_llm?: Stage2LLMConfig
 }
 
 export interface ModuleDefaults {
@@ -253,11 +258,54 @@ export interface UpdateSettingsRequest {
   default_template?: string
   llm_temperature?: number
   llm_max_tokens?: number
+  llm_num_ctx?: number
   llm_top_p?: number
   llm_frequency_penalty?: number
   llm_presence_penalty?: number
   module_defaults?: Partial<ModuleDefaults>
   display_preferences?: Partial<DisplayPreferences>
+  // Task-specific LLM settings
+  ocr_llm_provider?: string
+  ocr_llm_model?: string
+  ocr_llm_temperature?: number
+  ocr_llm_max_tokens?: number
+  ocr_llm_num_ctx?: number
+  stage1_llm_provider?: string
+  stage1_llm_model?: string
+  stage1_llm_temperature?: number
+  stage1_llm_max_tokens?: number
+  stage1_llm_num_ctx?: number
+  stage2_llm_provider?: string
+  stage2_llm_model?: string
+  stage2_llm_temperature?: number
+  stage2_llm_max_tokens?: number
+  stage2_llm_num_ctx?: number
+  stage2_use_rag?: boolean
+  stage2_use_graphrag?: boolean
+  stage2_rag_top_k?: number
+}
+
+// Task-Specific LLM Configuration
+export interface TaskLLMConfig {
+  provider: string
+  model: string
+  temperature: number
+  max_tokens: number
+  num_ctx?: number | null
+}
+
+export interface Stage2LLMConfig extends TaskLLMConfig {
+  use_rag: boolean
+  use_graphrag: boolean
+  rag_top_k: number
+}
+
+// Model context window lookup (GET /llm/model-context-size)
+export interface ModelContextSizeResponse {
+  model: string
+  context_size: number
+  known: boolean
+  default_size: number
 }
 
 // LLM Provider Types
@@ -414,11 +462,12 @@ export interface WSError {
 }
 
 // Dashboard/Stats Types
+// HIPAA COMPLIANCE: UsageStats does not include note history - notes are ephemeral only
 export interface UsageStats {
   total_notes_generated: number
   total_calculators_used: number
   total_searches: number
-  recent_notes: SavedNote[]
+  // recent_notes removed for HIPAA compliance - no note persistence
   popular_calculators: Array<{
     calculator_id: string
     name: string
@@ -461,9 +510,10 @@ export interface CalculatorSuggestion {
 // Stage 1: Initial Note Request
 export interface InitialNoteRequest {
   clinical_input: string
-  note_type?: 'clinic_note' | 'consult' | 'preop' | 'postop' | 'procedure_note'
+  note_type?: 'urology_clinic' | 'urology_consult'
   patient_name?: string
   ssn_last4?: string
+  visit_date?: string  // MM/DD/YYYY - used for IPSS date and accurate age calculation
   llm_provider?: 'ollama' | 'anthropic' | 'openai'
   llm_model?: string
   temperature?: number
@@ -512,6 +562,7 @@ export interface CalculatorResultSchema {
 // Stage 2: Final Note Response
 export interface FinalNoteResponse {
   final_note: string
+  preliminary_note?: string
   calculator_results: CalculatorResultSchema[]
   rag_sources: Array<{
     id?: string
@@ -525,7 +576,22 @@ export interface FinalNoteResponse {
     calculators_executed: number
     rag_enabled: boolean
     rag_sources_count: number
+    workflow?: string
   }
+}
+
+// ============================================================================
+// DOCUMENT UPLOAD TYPES (OCR Support)
+// ============================================================================
+
+// Document Upload Response
+export interface DocumentUploadResponse {
+  extracted_text: string
+  temp_file_id: string
+  extraction_method: 'text' | 'ocr'
+  page_count: number
+  file_name: string
+  file_size_bytes: number
 }
 
 // ============================================================================
@@ -573,3 +639,69 @@ export type AmbientWSMessage =
   | WSStopMessage
   | WSStoppedMessage
   | WSError
+
+// ============================================================================
+// BATCH PROCESSING TYPES
+// ============================================================================
+
+export interface BatchProcessingRequest {
+  folder_path: string
+}
+
+export type BatchFileStatus = 'pending' | 'processing' | 'completed' | 'failed'
+
+export interface BatchFileResult {
+  filename: string
+  output_filename: string
+  note_type: string
+  status: BatchFileStatus
+  attempts: number
+  error_message?: string
+  generation_time_seconds?: number
+}
+
+export interface BatchProcessingResponse {
+  total_files: number
+  processed: number
+  failed: number
+  results: BatchFileResult[]
+  total_file: string
+  total_time_seconds: number
+}
+
+export interface BatchFolderFile {
+  filename: string
+  size_bytes: number
+  note_type: string
+  output_filename: string
+}
+
+export interface BatchFolderListResponse {
+  folder_path: string
+  total_files: number
+  files: BatchFolderFile[]
+}
+
+export interface BrowseDirectoryEntry {
+  name: string
+  path: string
+  txt_file_count: number
+}
+
+export interface BrowseDirectoryResponse {
+  current_path: string | null
+  parent_path: string | null
+  directories: BrowseDirectoryEntry[]
+  txt_file_count: number
+}
+
+export interface BatchProgressEvent {
+  current_file: string
+  current_index: number
+  total_files: number
+  status: string
+  attempt: number
+  note_type: string
+  generation_time_seconds?: number
+  error_message?: string
+}

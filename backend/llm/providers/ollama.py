@@ -27,28 +27,62 @@ logger = logging.getLogger(__name__)
 class OllamaProvider(LLMProvider):
     """Ollama provider implementation for local LLM inference."""
 
+    # Model context window sizes - CRITICAL: These must match actual model capabilities
+    # Using full context windows ensures maximum input processing capacity
+    # IMPORTANT: context_window controls num_ctx sent to Ollama.
+    # Using the model's MAX context (128K) is catastrophically slow on local GPU
+    # because Ollama allocates full KV-cache and processes all attention layers.
+    # Use practical values that balance context with performance.
     SUPPORTED_MODELS = {
         "llama3.1:70b": {
-            "context_window": 8192,
-            "max_tokens": 4096,
+            "context_window": 16384,  # 16K practical limit on local GPU
+            "max_tokens": 8192,
             "capabilities": ["completion", "chat", "streaming"],
         },
         "llama3.1:8b": {
-            "context_window": 8192,
-            "max_tokens": 4096,
+            "context_window": 8192,  # 8K - fast on local GPU, sufficient for extraction
+            "max_tokens": 8192,
+            "capabilities": ["completion", "chat", "streaming"],
+        },
+        "llama3.3:70b": {
+            "context_window": 16384,  # 16K practical limit
+            "max_tokens": 8192,
             "capabilities": ["completion", "chat", "streaming"],
         },
         "phi3:medium": {
-            "context_window": 4096,
-            "max_tokens": 2048,
+            "context_window": 8192,  # 8K practical limit
+            "max_tokens": 4096,
             "capabilities": ["completion", "chat", "streaming"],
         },
         "mistral:7b": {
-            "context_window": 8192,
+            "context_window": 8192,  # 8K practical limit
+            "max_tokens": 8192,
+            "capabilities": ["completion", "chat", "streaming"],
+        },
+        "mixtral:8x7b": {
+            "context_window": 16384,  # 16K practical limit
+            "max_tokens": 8192,
+            "capabilities": ["completion", "chat", "streaming"],
+        },
+        "qwen2.5:72b": {
+            "context_window": 16384,  # 16K practical limit
+            "max_tokens": 8192,
+            "capabilities": ["completion", "chat", "streaming"],
+        },
+        "gemma2:9b": {
+            "context_window": 8192,  # 8K context
+            "max_tokens": 4096,
+            "capabilities": ["completion", "chat", "streaming"],
+        },
+        "gemma2:27b": {
+            "context_window": 8192,  # 8K context
             "max_tokens": 4096,
             "capabilities": ["completion", "chat", "streaming"],
         },
     }
+
+    # Default context size for unknown models
+    DEFAULT_CONTEXT_SIZE = 8192  # 8K — matches llm_config_manager and llm_helper defaults
 
     def __init__(self, config: Dict):
         """
@@ -98,11 +132,18 @@ class OllamaProvider(LLMProvider):
         """
         start_time = datetime.now()
 
-        # Build request payload
+        # Build request payload. keep_alive sourced from app.config keeps
+        # the model resident on the GPU between requests.
+        try:
+            from app.config import settings as _app_settings
+            _keep_alive = _app_settings.OLLAMA_KEEP_ALIVE
+        except Exception:
+            _keep_alive = "24h"
         payload = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "keep_alive": _keep_alive,
             "options": {
                 "temperature": temperature,
             }
@@ -112,9 +153,16 @@ class OllamaProvider(LLMProvider):
         if system_prompt:
             payload["system"] = system_prompt
 
-        # Add context window size
+        # Add context window size - CRITICAL: Always set to enable full context capacity
+        # If not explicitly configured, use the model's full context window
         if self.num_ctx:
             payload["options"]["num_ctx"] = self.num_ctx
+        else:
+            # Get context window from model config or use default
+            model_config = self.SUPPORTED_MODELS.get(self.model, {})
+            ctx_size = model_config.get("context_window", self.DEFAULT_CONTEXT_SIZE)
+            payload["options"]["num_ctx"] = ctx_size
+            logger.debug(f"Setting num_ctx={ctx_size} for model {self.model}")
 
         # Add max tokens
         if max_tokens or self.num_predict:
@@ -124,53 +172,72 @@ class OllamaProvider(LLMProvider):
         if kwargs:
             payload["options"].update(kwargs)
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/api/generate",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout),
-                ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        raise LLMProviderError(
-                            f"Ollama API error (status {response.status}): {error_text}"
+        max_retries = 3
+        base_delay = 3.0
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.base_url}/api/generate",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    ) as response:
+                        if response.status in (429, 500) and attempt < max_retries:
+                            error_text = await response.text()
+                            delay = base_delay * (2 ** (attempt - 1))
+                            logger.warning(
+                                f"Ollama {response.status} (attempt {attempt}/{max_retries}), "
+                                f"retrying in {delay:.1f}s..."
+                            )
+                            await asyncio.sleep(delay)
+                            start_time = datetime.now()  # Reset timer for retry
+                            continue
+
+                        if response.status != 200:
+                            error_text = await response.text()
+                            raise LLMProviderError(
+                                f"Ollama API error (status {response.status}): {error_text}"
+                            )
+
+                        result = await response.json()
+
+                        # Extract response content
+                        content = result.get("response", "")
+
+                        # Calculate tokens used (Ollama provides eval_count)
+                        tokens_used = result.get("eval_count")
+
+                        duration = (datetime.now() - start_time).total_seconds()
+
+                        return LLMResponse(
+                            content=content,
+                            model=self.model,
+                            provider="ollama",
+                            tokens_used=tokens_used,
+                            finish_reason=result.get("done_reason"),
+                            metadata={
+                                "total_duration_ns": result.get("total_duration"),
+                                "load_duration_ns": result.get("load_duration"),
+                                "prompt_eval_count": result.get("prompt_eval_count"),
+                                "eval_count": result.get("eval_count"),
+                                "duration_seconds": duration,
+                            },
                         )
 
-                    result = await response.json()
+            except asyncio.TimeoutError:
+                raise LLMTimeoutError(
+                    f"Ollama request timed out after {self.timeout}s"
+                )
+            except aiohttp.ClientError as e:
+                raise LLMProviderError(f"Ollama connection error: {str(e)}")
+            except LLMProviderError:
+                raise
+            except Exception as e:
+                logger.error(f"Ollama generation error: {str(e)}")
+                raise LLMProviderError(f"Ollama generation failed: {str(e)}")
 
-                    # Extract response content
-                    content = result.get("response", "")
-
-                    # Calculate tokens used (Ollama provides eval_count)
-                    tokens_used = result.get("eval_count")
-
-                    duration = (datetime.now() - start_time).total_seconds()
-
-                    return LLMResponse(
-                        content=content,
-                        model=self.model,
-                        provider="ollama",
-                        tokens_used=tokens_used,
-                        finish_reason=result.get("done_reason"),
-                        metadata={
-                            "total_duration_ns": result.get("total_duration"),
-                            "load_duration_ns": result.get("load_duration"),
-                            "prompt_eval_count": result.get("prompt_eval_count"),
-                            "eval_count": result.get("eval_count"),
-                            "duration_seconds": duration,
-                        },
-                    )
-
-        except asyncio.TimeoutError:
-            raise LLMTimeoutError(
-                f"Ollama request timed out after {self.timeout}s"
-            )
-        except aiohttp.ClientError as e:
-            raise LLMProviderError(f"Ollama connection error: {str(e)}")
-        except Exception as e:
-            logger.error(f"Ollama generation error: {str(e)}")
-            raise LLMProviderError(f"Ollama generation failed: {str(e)}")
+        raise LLMProviderError(f"Ollama failed after {max_retries} retries")
 
     async def generate_stream(
         self,
@@ -193,11 +260,17 @@ class OllamaProvider(LLMProvider):
         Yields:
             StreamChunk objects as they are generated
         """
-        # Build request payload
+        # Build request payload (streaming path).
+        try:
+            from app.config import settings as _app_settings
+            _keep_alive = _app_settings.OLLAMA_KEEP_ALIVE
+        except Exception:
+            _keep_alive = "24h"
         payload = {
             "model": self.model,
             "prompt": prompt,
             "stream": True,
+            "keep_alive": _keep_alive,
             "options": {
                 "temperature": temperature,
             }
@@ -207,9 +280,16 @@ class OllamaProvider(LLMProvider):
         if system_prompt:
             payload["system"] = system_prompt
 
-        # Add context window size
+        # Add context window size - CRITICAL: Always set to enable full context capacity
+        # If not explicitly configured, use the model's full context window
         if self.num_ctx:
             payload["options"]["num_ctx"] = self.num_ctx
+        else:
+            # Get context window from model config or use default
+            model_config = self.SUPPORTED_MODELS.get(self.model, {})
+            ctx_size = model_config.get("context_window", self.DEFAULT_CONTEXT_SIZE)
+            payload["options"]["num_ctx"] = ctx_size
+            logger.debug(f"Setting num_ctx={ctx_size} for model {self.model}")
 
         # Add max tokens
         if max_tokens or self.num_predict:

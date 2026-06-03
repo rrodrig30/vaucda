@@ -35,18 +35,42 @@ export const authApi = {
   },
 
   /**
-   * Logout (clear local storage)
+   * Logout - calls backend to purge patient data, then clears local storage
+   * CRITICAL: Must call backend first to ensure patient data is purged (HIPAA compliance)
    */
   logout: async (): Promise<void> => {
-    localStorage.removeItem('access_token')
-    localStorage.removeItem('user')
+    try {
+      // CRITICAL: Call backend to purge all patient data before clearing tokens
+      await apiClient.post('/auth/logout')
+    } catch (error) {
+      // Log error but continue with local cleanup
+      console.warn('Backend logout failed, continuing with local cleanup:', error)
+    } finally {
+      // Always clear local storage regardless of backend response
+      localStorage.removeItem('access_token')
+      localStorage.removeItem('user')
+    }
   },
 
   /**
-   * Refresh token
+   * Refresh access token using stored refresh token
+   * Returns new access_token and refresh_token pair
    */
   refreshToken: async (): Promise<LoginResponse> => {
-    const response = await apiClient.post<LoginResponse>('/auth/refresh')
+    const refreshToken = localStorage.getItem('refresh_token')
+    if (!refreshToken) {
+      throw new Error('No refresh token available')
+    }
+    const response = await apiClient.post<LoginResponse>('/auth/refresh', {
+      refresh_token: refreshToken
+    })
+    // Update stored tokens with new values
+    if (response.data.access_token) {
+      localStorage.setItem('access_token', response.data.access_token)
+    }
+    if (response.data.refresh_token) {
+      localStorage.setItem('refresh_token', response.data.refresh_token)
+    }
     return response.data
   },
 }

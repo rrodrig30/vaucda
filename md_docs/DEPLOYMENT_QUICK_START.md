@@ -13,15 +13,15 @@
 cd /home/gulab/PythonProjects/VAUCDA
 
 # Update root environment file
-cp .env.example .env
+cp .env .env
 # Edit .env and update CHANGE_THIS values
 
 # Update backend environment file
-cp backend/.env.example backend/.env
+cp backend/.env backend/.env
 # Edit backend/.env and update CHANGE_THIS values
 
 # Update frontend environment file
-cp frontend/.env.example frontend/.env
+cp frontend/.env frontend/.env
 # Edit frontend/.env and update API URLs if needed
 
 # Set secure permissions

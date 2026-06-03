@@ -4,7 +4,7 @@ Stores user settings, session metadata, and audit logs (NO PHI)
 """
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, JSON, Index
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, JSON, Index, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -119,16 +119,50 @@ class UserPreferences(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String(36), unique=True, nullable=False, index=True)
 
-    # LLM preferences
+    # Legacy LLM preferences (kept for backwards compatibility)
     default_llm = Column(String(50), nullable=False, default="ollama")
     default_model = Column(String(100), nullable=False, default="llama3.1:8b")
 
-    # LLM generation parameters
+    # Legacy LLM generation parameters
     llm_temperature = Column(JSON, nullable=True)  # Default: 0.3
     llm_max_tokens = Column(Integer, nullable=True, default=4000)
+    llm_num_ctx = Column(Integer, nullable=True, default=None)  # User override for input context window; NULL defers to lookup table
     llm_top_p = Column(JSON, nullable=True)  # Default: 0.9
     llm_frequency_penalty = Column(JSON, nullable=True)  # Default: 0.0
     llm_presence_penalty = Column(JSON, nullable=True)  # Default: 0.0
+
+    # ==========================================================================
+    # Task-Specific LLM Configuration
+    # Each task (OCR, Stage 1, Stage 2) has its own provider, model, temperature
+    # NOTE: Default values come from environment variables via Settings API layer
+    # These columns are nullable to allow the API layer to apply env-based defaults
+    # ==========================================================================
+
+    # OCR Processing LLM Configuration
+    ocr_llm_provider = Column(String(50), nullable=True)  # Default from env: OCR_LLM_PROVIDER
+    ocr_llm_model = Column(String(100), nullable=True)  # Default from env: OCR_LLM_MODEL
+    ocr_llm_temperature = Column(Float, nullable=True)  # Default from env: OCR_LLM_TEMPERATURE
+    ocr_llm_max_tokens = Column(Integer, nullable=True)  # Default from env: OCR_LLM_MAX_TOKENS
+    ocr_llm_num_ctx = Column(Integer, nullable=True, default=None)  # User-set input context window for OCR; NULL defers to model lookup
+
+    # Stage 1: Note Generation/Extraction LLM Configuration
+    stage1_llm_provider = Column(String(50), nullable=True)  # Default from env: STAGE1_LLM_PROVIDER
+    stage1_llm_model = Column(String(100), nullable=True)  # Default from env: STAGE1_LLM_MODEL
+    stage1_llm_temperature = Column(Float, nullable=True)  # Default from env: STAGE1_LLM_TEMPERATURE
+    stage1_llm_max_tokens = Column(Integer, nullable=True)  # Default from env: STAGE1_LLM_MAX_TOKENS
+    stage1_llm_num_ctx = Column(Integer, nullable=True, default=None)  # User-set input context window for Stage 1; NULL defers to model lookup
+
+    # Stage 2: Assessment & Plan LLM Configuration (with RAG/GraphRAG)
+    stage2_llm_provider = Column(String(50), nullable=True)  # Default from env: STAGE2_LLM_PROVIDER
+    stage2_llm_model = Column(String(100), nullable=True)  # Default from env: STAGE2_LLM_MODEL
+    stage2_llm_temperature = Column(Float, nullable=True)  # Default from env: STAGE2_LLM_TEMPERATURE
+    stage2_llm_max_tokens = Column(Integer, nullable=True)  # Default from env: STAGE2_LLM_MAX_TOKENS
+    stage2_llm_num_ctx = Column(Integer, nullable=True, default=None)  # User-set input context window for Stage 2; NULL defers to model lookup
+
+    # RAG/GraphRAG Configuration for Stage 2 (defaults from env)
+    stage2_use_rag = Column(Boolean, nullable=True)  # Default from env: STAGE2_USE_RAG
+    stage2_use_graphrag = Column(Boolean, nullable=True)  # Default from env: STAGE2_USE_GRAPHRAG
+    stage2_rag_top_k = Column(Integer, nullable=True)  # Default from env: STAGE2_RAG_TOP_K
 
     # Template preferences
     default_template = Column(String(100), nullable=False, default="urology_clinic")

@@ -142,7 +142,7 @@ cd vaucda
 
 ```bash
 # Copy example environment file
-cp backend/.env.example backend/.env
+cp backend/.env backend/.env
 
 # Edit configuration
 nano backend/.env
@@ -269,7 +269,7 @@ OPENEVIDENCE_ENCRYPTION_KEY=<generated_key_here>
 
 ```bash
 # Copy example environment file
-cp frontend/.env.example frontend/.env
+cp frontend/.env frontend/.env
 
 # Edit configuration
 nano frontend/.env
