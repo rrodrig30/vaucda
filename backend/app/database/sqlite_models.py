@@ -8,7 +8,21 @@ from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, JSON, I
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
+from app.config import settings
+
 Base = declarative_base()
+
+
+def _default_model_factory() -> str:
+    """Default-model factory for new user_preferences rows.
+
+    Reads ``settings.OLLAMA_DEFAULT_MODEL`` at INSERT time so the
+    per-deployment env value (``OLLAMA_DEFAULT_MODEL=...``) flows into
+    new user defaults instead of a hardcoded literal. Per rules.txt
+    ("No hardcoded elements"), defaults that drive runtime behavior
+    must come from environment configuration.
+    """
+    return settings.OLLAMA_DEFAULT_MODEL
 
 
 class User(Base):
@@ -121,7 +135,7 @@ class UserPreferences(Base):
 
     # Legacy LLM preferences (kept for backwards compatibility)
     default_llm = Column(String(50), nullable=False, default="ollama")
-    default_model = Column(String(100), nullable=False, default="llama3.1:8b")
+    default_model = Column(String(100), nullable=False, default=_default_model_factory)
 
     # Legacy LLM generation parameters
     llm_temperature = Column(JSON, nullable=True)  # Default: 0.3

@@ -22,6 +22,7 @@ from app.schemas.notes import BatchFileResult, BatchFileStatus
 from app.services.ollama_health import (
     assert_ollama_healthy,
     check_ollama_gpu_health,
+    check_ollama_health_for_workload,
     OllamaWedgedError,
 )
 
@@ -176,6 +177,7 @@ async def run_batch_processing(
     stage2_func: Callable,
     purge_func: Callable,
     visit_date: Optional[str] = None,
+    active_model: Optional[str] = None,
 ) -> Tuple[List[BatchFileResult], str, float]:
     """
     Process all files in a folder through Stage 1 → Stage 2.
@@ -186,6 +188,13 @@ async def run_batch_processing(
         stage2_func: Async callable for Stage 2
         purge_func: Callable to purge all patient data between files
         visit_date: Optional visit date (MM/DD/YYYY) for IPSS and age calculation
+        active_model: The Ollama model name this batch will call (typically
+            the user's stage2_llm_model). Used by the pre-flight health
+            check to relax the local-VRAM guard when the workload is
+            cloud-proxied (``*-cloud``) and the cloud route is verified
+            responsive — so a separate process's local-model wedge can't
+            block a vaucda batch whose synthesis is entirely cloud-routed.
+            When None, the strict local-VRAM check is used.
 
     Returns:
         Tuple of (results list, path to total.vaucda, total time in seconds)
@@ -211,23 +220,26 @@ async def run_batch_processing(
 
     # Pre-flight: refuse to start the batch when Ollama / GPU is already
     # wedged. The most common failure mode we've seen is another process
-    # on the shared GPU (e.g. UT-MS1-SIM) loading a model with its full
-    # 131K context, which exceeds VRAM and wedges the runner so EVERY
-    # subsequent Ollama request (vaucda included) blocks indefinitely.
-    # Without this check the batch processor would discover the wedge
-    # only via per-file 20-min timeouts — burning 6+ hours on a 20-file
-    # batch when the user should have been told up front to restart
-    # Ollama.
-    pre_health = check_ollama_gpu_health()
+    # on the shared GPU (e.g. UT-MS1-SIM, Grant-Assist) loading a model
+    # with its full 131K context, which exceeds VRAM and wedges the
+    # runner so subsequent Ollama LOCAL requests block indefinitely.
+    # Cloud-proxied requests usually still flow through unaffected, so
+    # when active_model is a cloud model we use the workload-aware
+    # variant which probes the cloud route and lets the batch proceed
+    # if the cloud is responsive — local-VRAM wedge be damned.
+    pre_health = check_ollama_health_for_workload(active_model=active_model)
     if not pre_health.healthy:
         raise RuntimeError(
             f"Refusing to start batch: Ollama is not healthy. "
             f"{pre_health.reason}"
         )
     logger.info(
-        "Ollama health check passed (loaded VRAM: %d MB / %s MB GPU)",
+        "Ollama health check passed (loaded VRAM: %d MB / %s MB GPU; "
+        "active_model=%r; note: %s)",
         pre_health.loaded_vram_mb,
         pre_health.total_vram_mb if pre_health.total_vram_mb is not None else "?",
+        active_model,
+        pre_health.reason or "no warnings",
     )
 
     results: List[BatchFileResult] = []
@@ -250,7 +262,8 @@ async def run_batch_processing(
         # process loads an oversized model between files. Check before
         # each file so we fail this file fast with an actionable error
         # rather than burning 20-min × max_retries on a wedged Ollama.
-        per_file_health = check_ollama_gpu_health()
+        # Same workload-aware relaxation as the batch-start check.
+        per_file_health = check_ollama_health_for_workload(active_model=active_model)
         if not per_file_health.healthy:
             result.status = BatchFileStatus.FAILED
             result.error_message = (

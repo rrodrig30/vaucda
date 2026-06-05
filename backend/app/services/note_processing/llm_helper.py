@@ -37,9 +37,13 @@ def _get_local_semaphore() -> threading.Semaphore:
     return _local_ollama_semaphore
 
 
-def _is_cloud_model(model: str) -> bool:
-    """Check if a model is a cloud/remote model (not limited by local GPU)."""
-    return ':cloud' in model.lower()
+# Canonical cloud-model detector — single source of truth in
+# llm_config_manager. The previous local copy used ``':cloud' in
+# model.lower()`` which MISSED the ``-cloud`` suffix variant (e.g.
+# ``gpt-oss:120b-cloud``), so cloud models were incorrectly throttled
+# by the local-concurrency semaphore. Importing the shared helper
+# fixes that latent bug.
+from app.services.llm_config_manager import is_cloud_model as _is_cloud_model
 
 from app.config import settings
 
@@ -96,6 +100,38 @@ def task_config_context(config: Optional["LLMTaskConfig"]):
         yield
     finally:
         set_current_task_config(old_config)
+
+
+def run_with_task_config(
+    task_config: Optional["LLMTaskConfig"],
+    func,
+    *args,
+    **kwargs,
+):
+    """Invoke ``func`` with ``task_config`` established on the current thread.
+
+    Restores the prior task_config after the call (correctness for any
+    caller that's already running inside a different thread-local
+    setting; necessary for ThreadPoolExecutor worker reuse where the
+    same worker thread may run many tasks).
+
+    Purpose-built for ``ThreadPoolExecutor.submit`` from
+    ``note_builder.build_urology_note``: ``threading.local`` state set
+    by ``set_current_task_config`` on the parent thread does NOT
+    propagate into worker threads, so without this wrapper every
+    synthesis sub-agent call inside ``func`` would fall through
+    ``synthesize_with_llm``'s legacy path — using
+    ``settings.OLLAMA_DEFAULT_MODEL`` (historically ``llama3.1:8b``)
+    instead of the user's configured Stage 2 model. That's both wrong
+    (bypasses user intent) and dangerous (the legacy model + default
+    context size has wedged the GPU multiple times).
+    """
+    previous = get_current_task_config()
+    set_current_task_config(task_config)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        set_current_task_config(previous)
 
 
 class LLMProviderError(Exception):

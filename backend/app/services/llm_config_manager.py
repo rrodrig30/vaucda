@@ -94,31 +94,98 @@ MODEL_CONTEXT_SIZES = {
 DEFAULT_CONTEXT_SIZE = 125000
 
 
+# Maximum num_ctx we'll ever automatically request for a LOCAL (non-cloud)
+# Ollama model. The MODEL_CONTEXT_SIZES table lists each model's TRUE
+# training context (e.g. 131072 for llama3.1:8b), but using that value
+# as the runtime default for a local model allocates a KV cache that's
+# typically much bigger than the GPU. Concrete failure mode: llama3.1:8b
+# with num_ctx=131072 allocates ~140 GB on a 96 GB H100, throwing the
+# runner into thrash that blocks every subsequent Ollama request —
+# local AND cloud-proxied — until the runner is killed.
+#
+# This cap applies ONLY when neither the user nor the caller has set an
+# explicit value. A user who edits Settings -> num_ctx is still allowed
+# any value they want (see the resolution at LLMConfigManager.get_config
+# below). Cloud models (``*-cloud`` / ``:cloud`` suffix) are NOT capped
+# — they don't allocate local VRAM, so their full context-window
+# benefit (200k, 1M for Gemini, etc.) passes through unchanged.
+#
+# Sourced from settings.OLLAMA_LOCAL_RUNTIME_MAX_CONTEXT (env var
+# OLLAMA_LOCAL_RUNTIME_MAX_CONTEXT, default 16384). The settings import
+# is lazy to avoid a top-level circular import.
+def _local_runtime_max_context() -> int:
+    from app.config import settings as _settings
+    return _settings.OLLAMA_LOCAL_RUNTIME_MAX_CONTEXT
+
+
+def is_cloud_model(model: Optional[str]) -> bool:
+    """Return True for Ollama cloud-proxied model names.
+
+    Canonical implementation — imported by ollama_health, llm_helper,
+    and any other module that needs to know whether a model name refers
+    to a cloud-routed model. Two suffix conventions are used by Ollama:
+
+      ``-cloud`` (e.g. ``gpt-oss:120b-cloud``, ``qwen3.5:397b-cloud``,
+                 ``mistral-large-3:675b-cloud``)
+      ``:cloud`` (e.g. ``kimi-k2.6:cloud``, ``glm-4.6:cloud``,
+                 ``deepseek-v4-pro:cloud``, ``minimax-m2:cloud``,
+                 ``deepseek-v3.2:cloud``, ``gemini-3-flash-preview:cloud``,
+                 ``kimi-k2-thinking:cloud``, ``minimax-m2.5:cloud``)
+
+    Both forms route through ``ollama serve`` to ollama.com and don't
+    allocate local VRAM. Callers use this to skip local-resource
+    guards (concurrency semaphore, VRAM checks, runtime-context cap).
+    """
+    if not model:
+        return False
+    n = model.strip().lower()
+    return n.endswith('-cloud') or n.endswith(':cloud')
+
+
+# Module-private alias retained for the existing get_model_context_size
+# caller below. New code should use the public is_cloud_model instead.
+def _is_cloud_model_name(model: str) -> bool:
+    return is_cloud_model(model)
+
+
 def get_model_context_size(model: str) -> int:
     """
-    Look up the model's TRUE training context window (n_ctx_train).
+    Return the runtime-safe num_ctx for ``model``.
 
-    This is ONLY the lookup-table fallback; the resolved value used at runtime
-    is computed by LLMConfigManager.get_config(), which prefers the user-set
-    per-task num_ctx when present.
+    Resolution order:
+      1. Exact-match table lookup, then suffix-stripped partial match.
+      2. ``DEFAULT_CONTEXT_SIZE`` if nothing matches.
+      3. For LOCAL models, clamp the result to ``LOCAL_RUNTIME_MAX_CONTEXT``
+         so the GPU isn't allocated a KV cache larger than it can hold.
+         Cloud models (``*-cloud`` / ``:cloud``) pass through unclamped —
+         they don't allocate local VRAM.
 
-    Args:
-        model: Model name (e.g., "llama3.1:8b")
-
-    Returns:
-        Context window size in tokens (table value or DEFAULT_CONTEXT_SIZE).
+    This is ONLY the fallback path. The resolved value used at runtime
+    is computed by ``LLMConfigManager.get_config()``, which prefers the
+    user-set per-task num_ctx when present. A user who explicitly sets
+    a higher num_ctx in Settings still gets exactly that value — this
+    clamp only protects the codepath where no user choice exists
+    (synthesis sub-agents in ThreadPoolExecutor workers, etc.).
     """
     # Exact match first
     if model in MODEL_CONTEXT_SIZES:
-        return MODEL_CONTEXT_SIZES[model]
+        ctx_size = MODEL_CONTEXT_SIZES[model]
+    else:
+        # Check for partial matches (e.g., "llama3.1" matches "llama3.1:8b")
+        model_lower = model.lower()
+        ctx_size = DEFAULT_CONTEXT_SIZE
+        for known_model, known_ctx in MODEL_CONTEXT_SIZES.items():
+            if known_model.split(":")[0] in model_lower:
+                ctx_size = known_ctx
+                break
 
-    # Check for partial matches (e.g., "llama3.1" matches "llama3.1:8b")
-    model_lower = model.lower()
-    for known_model, ctx_size in MODEL_CONTEXT_SIZES.items():
-        if known_model.split(":")[0] in model_lower:
-            return ctx_size
-
-    return DEFAULT_CONTEXT_SIZE
+    # Local-runtime safety cap (cloud models exempt). Env-driven via
+    # OLLAMA_LOCAL_RUNTIME_MAX_CONTEXT (see _local_runtime_max_context).
+    if not _is_cloud_model_name(model):
+        cap = _local_runtime_max_context()
+        if ctx_size > cap:
+            return cap
+    return ctx_size
 
 
 class LLMTaskType(Enum):

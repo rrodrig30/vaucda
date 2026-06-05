@@ -49,7 +49,11 @@ from .extractors.specialty_urologic_scanner import (
     format_cross_specialty_context
 )
 from .visit_progression_analyzer import analyze_visit_progression
-from .llm_helper import set_current_task_config
+from .llm_helper import (
+    set_current_task_config,
+    get_current_task_config,
+    run_with_task_config,
+)
 
 # Import synthesis agents
 from .agents.cc_agent import synthesize_cc
@@ -732,12 +736,26 @@ def build_urology_note(
     synthesis_tasks['pe'] = lambda: synthesize_pe(gu_notes, non_gu_notes, patient_sex=_pat_sex)
 
     # Execute all synthesis tasks in parallel using ThreadPoolExecutor
-    # Max workers = number of tasks for full parallelization
+    # Max workers = number of tasks for full parallelization.
+    #
+    # CRITICAL: capture the parent thread's task_config (set by
+    # set_current_task_config earlier in this function) and re-establish
+    # it inside each worker via run_with_task_config. ThreadPoolExecutor
+    # worker threads do NOT inherit threading.local state from the
+    # parent, so without this wrapper every sub-agent call would fall
+    # through synthesize_with_llm's legacy path to
+    # settings.OLLAMA_DEFAULT_MODEL (historically llama3.1:8b),
+    # bypassing the user's configured Stage 2 model — both clinically
+    # wrong (different model than user requested) and dangerous (the
+    # legacy 8B model loaded at its training-max context has wedged
+    # the GPU multiple times in production).
+    parent_task_config = get_current_task_config()
     results: Dict[str, Any] = {}
     with ThreadPoolExecutor(max_workers=min(len(synthesis_tasks), 16)) as executor:
-        # Submit all tasks
+        # Submit each task wrapped so the worker thread re-establishes
+        # parent_task_config before invoking the actual synthesis lambda.
         future_to_key = {
-            executor.submit(task): key
+            executor.submit(run_with_task_config, parent_task_config, task): key
             for key, task in synthesis_tasks.items()
         }
 

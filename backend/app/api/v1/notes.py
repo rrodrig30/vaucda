@@ -1219,15 +1219,21 @@ async def generate_note_two_stage(
     """
     Generate clinical note using improved two-model workflow.
 
-    **Stage 1 (Data Extraction):** qwen3-coder:30b
+    **Stage 1 (Data Extraction):** model = STAGE1_LLM_MODEL (env / user setting)
     - Extracts and organizes clinical data
     - Lower temperature (0.1) for factual accuracy
     - Structured data output without interpretation
 
-    **Stage 2 (Clinical Reasoning):** llama3.1:70b
+    **Stage 2 (Clinical Reasoning):** model = STAGE2_LLM_MODEL (env / user setting)
     - Generates final note with Assessment & Plan
     - Incorporates calculator results and evidence
     - Clinical reasoning and recommendations
+
+    Both models are selected per task by LLMConfigManager based on the
+    user's Settings page preferences and the .env defaults. The note
+    response metadata records the actual model + provider used for
+    each stage so the audit trail reflects what ran, not a documentation
+    assumption.
 
     This approach:
     - Reduces hallucinations by separating extraction from reasoning
@@ -2111,13 +2117,18 @@ async def batch_process_folder(
         def purge_func():
             purge_all_patient_data()
 
-        # Run batch processing
+        # Run batch processing. active_model lets the pre-flight Ollama
+        # health check use the workload-aware variant — when the user's
+        # Stage 2 model is cloud-proxied (``*-cloud``), a separate
+        # process's local-model wedge is tolerated as long as the cloud
+        # route is verified responsive.
         results, total_path, total_time = await run_batch_processing(
             folder_path=folder_path,
             stage1_func=stage1_func,
             stage2_func=stage2_func,
             purge_func=purge_func,
             visit_date=request.visit_date,
+            active_model=stage2_config.model,
         )
 
         processed = sum(

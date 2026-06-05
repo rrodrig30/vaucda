@@ -644,8 +644,10 @@ class NoteGenerator:
         """
         Generate clinical note using two-stage workflow.
 
-        Stage 1: Data extraction with qwen3-coder:30b
-        Stage 2: Final note generation with llama3.1:70b
+        Stage 1: Data extraction (model = configured Stage 1 LLM).
+        Stage 2: Final note generation (model = configured Stage 2 LLM).
+        Both stages route through LLMManager which honors per-user
+        settings, env-driven defaults, and provider selection.
 
         This approach separates data extraction from clinical reasoning,
         improving accuracy and reducing hallucinations.
@@ -686,8 +688,8 @@ class NoteGenerator:
                 logger.error(f"RAG retrieval failed: {e}")
                 rag_context = None
 
-        # 3. STAGE 1: Data Extraction with Ollama llama3.1:8b
-        logger.info("Stage 1: Extracting and organizing clinical data with Ollama llama3.1:8b...")
+        # 3. STAGE 1: Data Extraction (model = configured Stage 1 LLM)
+        logger.info("Stage 1: Extracting and organizing clinical data...")
 
         # Construct Stage 1 prompt
         stage1_prompt_parts = [self.stage1_prompt]
@@ -704,8 +706,9 @@ class NoteGenerator:
         stage1_prompt = "\n".join(stage1_prompt_parts)
 
         try:
-            # Use Ollama llama3.1:8b for fast data extraction
-            # Extract and organize data WITHOUT interpretation
+            # Model selection delegated to LLMManager via TaskType +
+            # configured defaults (.env / user settings). Passing
+            # model=None ensures the user's Stage 1 configuration wins.
             stage1_response = await self.llm_manager.generate(
                 prompt=stage1_prompt,
                 system_prompt="You are a medical data extraction specialist. Extract and organize clinical data accurately without interpretation. Focus on urologic findings, chief complaint, HPI, PMH, labs, imaging, and IPSS scores.",
@@ -722,7 +725,7 @@ class NoteGenerator:
             logger.error(f"Stage 1 extraction failed: {e}")
             raise RuntimeError(f"Stage 1 data extraction failed: {str(e)}")
 
-        # 4. STAGE 2: Final Note Generation with llama3.1:70b
+        # 4. STAGE 2: Final Note Generation (model = configured Stage 2 LLM)
         logger.info("Stage 2: Generating final clinical note with assessment...")
 
         # Construct Stage 2 prompt
@@ -744,7 +747,9 @@ class NoteGenerator:
         stage2_prompt = "\n".join(stage2_prompt_parts)
 
         try:
-            # Use llama3.1:70b for clinical reasoning and final note
+            # Model selection delegated to LLMManager via TaskType +
+            # configured defaults. Passing provider=None ensures the
+            # user's Stage 2 configuration wins.
             stage2_response = await self.llm_manager.generate(
                 prompt=stage2_prompt,
                 system_prompt="You are an expert urologist creating a comprehensive clinical note with assessment and plan.",
@@ -761,13 +766,19 @@ class NoteGenerator:
             logger.error(f"Stage 2 note generation failed: {e}")
             raise RuntimeError(f"Stage 2 note generation failed: {str(e)}")
 
-        # 5. Build metadata
+        # 5. Build metadata. Record the ACTUAL model + provider that
+        # each stage used (from the response object), not a hardcoded
+        # legacy default — the user's per-task settings can route any
+        # stage to any provider/model and the audit trail must reflect
+        # what actually ran.
         generation_time = (datetime.now() - start_time).total_seconds()
         metadata = {
             "note_type": note_type,
             "workflow": "two_stage",
-            "stage1_model": "llama3.1:8b",
-            "stage2_model": "llama3.1:70b",
+            "stage1_model": getattr(stage1_response, "model", None) or "unknown",
+            "stage1_provider": getattr(stage1_response, "provider", None) or "unknown",
+            "stage2_model": getattr(stage2_response, "model", None) or "unknown",
+            "stage2_provider": getattr(stage2_response, "provider", None) or "unknown",
             "generation_time_seconds": generation_time,
             "timestamp": datetime.now().isoformat(),
             "num_calculators": len(calculator_results),

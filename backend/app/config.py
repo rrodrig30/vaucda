@@ -68,7 +68,13 @@ class Settings(BaseSettings):
         default="CHANGE_THIS_TO_A_SECURE_RANDOM_STRING_AT_LEAST_32_CHARACTERS_LONG"
     )
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    # 480 minutes (8 hours) covers a full clinical work shift, so a
+    # user who logs in at the start of clinic doesn't get logged out
+    # mid-batch. Batches routinely take 15-20 min per file × dozens of
+    # files, and the frontend doesn't currently auto-refresh on 401
+    # (see api/notes.ts), so a short TTL means in-flight batches die
+    # with a 401 error and force a re-login + restart. Was 30.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # Security - Password Hashing
@@ -197,6 +203,23 @@ class Settings(BaseSettings):
     # keeps the model resident. Set high to avoid 30s cold-start on the
     # first request after backend idle.
     OLLAMA_KEEP_ALIVE: str = "24h"
+
+    # Maximum num_ctx vaucda will automatically request for a LOCAL
+    # (non-cloud) Ollama model when no per-task user override is set.
+    # llm_config_manager.get_model_context_size() applies this as a
+    # safety cap: even when MODEL_CONTEXT_SIZES lists the model's full
+    # training context (e.g. 131072 for llama3.1:8b), local-model calls
+    # without an explicit user value get clamped to this value. Cloud
+    # models (``*-cloud`` / ``:cloud``) are exempt — they don't allocate
+    # local VRAM.
+    #
+    # 16384 fits any synthesis sub-agent prompt (typically 2-4K input
+    # + 2-8K output) while keeping the KV cache to single-digit GB.
+    # Concrete failure mode the cap prevents: llama3.1:8b with the
+    # full 131072 context allocates ~140 GB of KV cache on a 96 GB
+    # H100, throwing the runner into thrash that blocks every
+    # subsequent Ollama request (local AND cloud-proxied).
+    OLLAMA_LOCAL_RUNTIME_MAX_CONTEXT: int = 16384
 
     # Pre-warm Stage 1 / Stage 2 / OCR models at backend startup so the
     # first user request does not pay the model-load cost.
