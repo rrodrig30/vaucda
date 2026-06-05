@@ -21,6 +21,238 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _build_treatment_status_block(
+    psh: Optional[str],
+    clinical_document: Optional[str],
+    psa_data: Optional[str],
+) -> str:
+    """Deterministic "TREATMENT STATUS" block for the HPI prompt.
+
+    The LLM repeatedly truncates the HPI before reaching treatment-
+    completion events when the source contains BOTH older "pending
+    treatment" notes AND newer "completed treatment" notes — it anchors
+    on the older framing. This block restates the patient's current
+    treatment posture in unambiguous text so the prompt cannot miss it.
+
+    Detects:
+      - Definitive prostate-cancer treatment that has been COMPLETED
+        (XRT / prostatectomy / brachytherapy / focal therapy), via the
+        same regexes the CC agent uses (kept in sync via import).
+      - Whether ADT is part of the regimen (lupron / leuprolide /
+        degarelix / bicalutamide phrases — detected separately because
+        many patients get XRT without ADT, as in this case).
+      - Whether PSA shows biochemical response post-treatment.
+
+    Returns "" when no treatment-completion signal is found in PSH or
+    the raw document, so non-treated patients aren't given a spurious
+    "post-treatment" framing.
+    """
+    if not (psh or clinical_document):
+        return ""
+
+    # Import lazily to avoid a circular import at module load.
+    from .cc_agent import (
+        _detect_treatment_history, _assess_psa_trend,
+        _is_biochemically_responding, _TREATMENT_LABEL,
+    )
+
+    treatment = _detect_treatment_history(psh or '', clinical_document or '')
+    if not treatment:
+        return ""
+
+    t_type = treatment.get('type', '')
+    label = _TREATMENT_LABEL.get(t_type, t_type or 'treatment')
+
+    lines = [
+        "TREATMENT STATUS (deterministic — use these statements as ground "
+        "truth, they override any contradictory claim in the prior-visit "
+        "HPI snapshots):",
+        f"- Patient has COMPLETED definitive {label} for prostate cancer.",
+    ]
+
+    # ADT detection. Look for current-tense ADT markers in source. If
+    # neither current ADT nor a clear "no ADT" signal is present, skip
+    # the statement — better silent than wrong.
+    src_blob = '\n'.join(s for s in (psh, clinical_document) if s)
+    adt_active = re.search(
+        r'\b(?:currently\s+on|on\s+)\s*(?:ADT|androgen\s+deprivation|'
+        r'leuprolide|lupron|degarelix|eligard|firmagon|bicalutamide)\b',
+        src_blob, re.IGNORECASE,
+    )
+    adt_completed = re.search(
+        r'\b(?:completed|finished|stopped|discontinued)\s+'
+        r'(?:ADT|androgen\s+deprivation|leuprolide|lupron|degarelix)\b',
+        src_blob, re.IGNORECASE,
+    )
+    adt_explicitly_no = re.search(
+        r'\b(?:without\s+ADT|no\s+ADT|did\s+not\s+receive\s+ADT|'
+        r'XRT\s+without\s+(?:concurrent\s+)?ADT|radiation\s+without\s+ADT)\b',
+        src_blob, re.IGNORECASE,
+    )
+    if adt_active:
+        lines.append("- Patient is currently on androgen-deprivation therapy.")
+    elif adt_completed:
+        lines.append("- Patient previously received ADT (now completed).")
+    elif adt_explicitly_no:
+        lines.append("- Patient did NOT receive ADT.")
+
+    # PSA biochemical response.
+    psa_state = _assess_psa_trend(psa_data)
+    responding = _is_biochemically_responding(t_type, psa_state)
+    if responding is True:
+        cur = psa_state.get('current')
+        peak = psa_state.get('max')
+        if cur is not None and peak is not None:
+            lines.append(
+                f"- PSA shows biochemical response post-treatment "
+                f"(current {cur} ng/mL vs peak {peak} ng/mL)."
+            )
+        else:
+            lines.append("- PSA shows biochemical response post-treatment.")
+    elif responding is False:
+        lines.append(
+            "- PSA pattern is concerning for biochemical recurrence "
+            "(per Phoenix criteria — current value is > nadir + 2 ng/mL "
+            "for radiation, or > 0.2 ng/mL after prostatectomy)."
+        )
+
+    lines.append(
+        "- The HPI MUST narrate the completed treatment and its outcome. "
+        "It MUST NOT describe the patient as awaiting treatment, "
+        "pending treatment, or still considering treatment options, "
+        "because the source documents treatment as already finished."
+    )
+    return '\n'.join(lines)
+
+
+def _dedupe_hpi_sentences(hpi: str) -> str:
+    """Remove sentence-level redundancy that survives the LLM prompt.
+
+    Removes any subsequent sentence that:
+      (a) is a near-duplicate of an earlier sentence (high token
+          overlap), OR
+      (b) consists primarily of facts already stated earlier (a PSA
+          value, lab phrase, or treatment phrase that appears verbatim
+          earlier and the sentence carries no new clinical content).
+
+    The deletion is conservative: it never removes the first mention
+    of a fact and never collapses two sentences whose word sets
+    differ by more than 40% (i.e. genuinely different sentences
+    survive).
+
+    Operates on the final LLM output, AFTER fact verification, AFTER
+    clean_llm_commentary. Idempotent.
+    """
+    if not hpi or not hpi.strip():
+        return hpi
+
+    # Split into sentences while preserving paragraph breaks. The
+    # period-after-letter rule handles abbreviated phrases like
+    # "5 mg." poorly, so we split on ". " followed by capital letter.
+    paragraphs = re.split(r'\n\s*\n', hpi)
+    out_paragraphs: List[str] = []
+    seen_signatures: List[set] = []
+
+    # A "token signature" is the set of clinically-loaded tokens in a
+    # sentence: numbers, PSA / Gleason / GG / treatment / mg / ng-mL
+    # mentions, drug names, organ names. We use that to detect when
+    # two sentences are about the same thing. Stopwords / generic
+    # filler words are stripped so "He returns for followup" and "The
+    # patient returns for followup" don't both match each other.
+    STOPWORDS = {
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'has', 'have',
+        'had', 'he', 'she', 'his', 'her', 'patient', 'this', 'that',
+        'with', 'and', 'or', 'but', 'for', 'on', 'in', 'at', 'to',
+        'of', 'currently', 'now', 'previously', 'noted', 'recently',
+        'mr', 'mrs', 'ms', 'dr',
+    }
+
+    def _signature(sentence: str) -> set:
+        # Lowercase, strip punctuation, drop stopwords.
+        tokens = re.findall(r"[A-Za-z0-9.+/-]+", sentence.lower())
+        return {t for t in tokens if t not in STOPWORDS and len(t) > 1}
+
+    # LLM "summary restatement" lead phrases. These ALWAYS restate
+    # facts already narrated earlier — the HPI is a narrative, the
+    # narrative IS the summary, so a sentence beginning with one of
+    # these is virtually always redundant filler. Drop every such
+    # sentence (even the first); if the sentence carries unique new
+    # facts, the LLM should phrase it in the running narrative, not
+    # as a summary aside.
+    SUMMARY_LEADS = re.compile(
+        r'^\s*(?:'
+        r"The patient is currently"
+        r"|The patient's current"
+        r"|His current (?:PSA|status|chief complaint|treatment)"
+        r"|Her current (?:PSA|status|chief complaint|treatment)"
+        r"|Currently, the patient"
+        r"|At present, (?:the patient|he|she)"
+        r"|To summarize"
+        r"|In summary"
+        r"|Overall, the patient"
+        r')',
+        re.IGNORECASE,
+    )
+
+    for para in paragraphs:
+        # Split on sentence terminators followed by whitespace + capital.
+        # Keep separators by using look-behind / look-ahead.
+        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z(])', para.strip())
+        kept_sentences: List[str] = []
+        for sent in sentences:
+            sent_stripped = sent.strip()
+            if not sent_stripped:
+                continue
+            # Summary-restatement leads — drop unconditionally.
+            if SUMMARY_LEADS.match(sent_stripped):
+                logger.debug(
+                    "HPI dedupe: dropped summary-restatement sentence: %r",
+                    sent_stripped[:120],
+                )
+                continue
+            sig = _signature(sent_stripped)
+            if not sig:
+                # Sentence is mostly stopwords (e.g. "He is doing well.")
+                # — keep it; not redundancy material.
+                kept_sentences.append(sent_stripped)
+                seen_signatures.append(sig)
+                continue
+            # Compare against every earlier signature in this HPI.
+            is_redundant = False
+            for prev_sig in seen_signatures:
+                if not prev_sig:
+                    continue
+                overlap = len(sig & prev_sig)
+                # Two thresholds:
+                #   1. ≥80% of the new sentence's tokens already
+                #      appeared earlier → near-duplicate sentence.
+                #   2. ≥60% overlap AND new sentence has no token
+                #      with a digit (no fresh value introduced) → a
+                #      "summary" sentence that just restates earlier
+                #      content.
+                ratio_self = overlap / max(1, len(sig))
+                has_new_value = any(re.search(r'\d', t) for t in (sig - prev_sig))
+                if ratio_self >= 0.8 and not has_new_value:
+                    is_redundant = True
+                    break
+                if ratio_self >= 0.6 and not has_new_value and len(sig) >= 4:
+                    is_redundant = True
+                    break
+            if is_redundant:
+                logger.debug(
+                    "HPI dedupe: dropped redundant sentence "
+                    "(no new tokens, overlap=%.0f%%): %r",
+                    ratio_self * 100, sent_stripped[:120],
+                )
+                continue
+            kept_sentences.append(sent_stripped)
+            seen_signatures.append(sig)
+        if kept_sentences:
+            out_paragraphs.append(' '.join(kept_sentences))
+
+    return '\n\n'.join(out_paragraphs).strip()
+
+
 def _build_psa_delta_block(psa_data: Optional[str]) -> str:
     """Build a deterministic "PSA since prior visit" summary.
 
@@ -88,6 +320,8 @@ def synthesize_hpi(
     cross_specialty_context: Optional[str] = None,
     visit_progression: Optional[str] = None,
     prior_ap_context: Optional[str] = None,
+    psh_data: Optional[str] = None,
+    clinical_document: Optional[str] = None,
     verify_facts: bool = True,
     return_verification: bool = False,
     patient_name: Optional[str] = None,
@@ -237,6 +471,16 @@ def synthesize_hpi(
         psa_delta_block = _build_psa_delta_block(psa_data)
         if psa_delta_block:
             context_parts.append(psa_delta_block)
+    # Deterministic TREATMENT STATUS block — always added when the
+    # document shows completed definitive prostate-cancer therapy.
+    # Prevents the LLM from anchoring on older "pending treatment"
+    # snapshots and writing an HPI that says the patient is still
+    # awaiting therapy when treatment has actually been completed.
+    treatment_status_block = _build_treatment_status_block(
+        psh_data, clinical_document, psa_data,
+    )
+    if treatment_status_block:
+        context_parts.append(treatment_status_block)
     if pathology_data and pathology_data.strip():
         context_parts.append(f"PATHOLOGY RESULTS:\n{pathology_data}")
     if labs_data and labs_data.strip():
@@ -307,6 +551,41 @@ STRUCTURE:
 2. Include relevant history from past visits in chronological flow
 3. Document urologic symptoms, test results, and diagnoses that are mentioned
 4. Write in narrative paragraph form (not bullet points)
+5. The HPI is ONE INTEGRATED NARRATIVE. Use 1-2 paragraphs maximum.
+   Do NOT produce three or four short paragraphs that each restate
+   the same facts (PSA value, treatments, labs) — that pattern is
+   the most common reason this HPI gets sent back for rewrite.
+
+NON-REDUNDANCY (MANDATORY — output is rejected if violated):
+- Each clinically distinct fact appears EXACTLY ONCE. If a PSA value
+  (e.g. "0.22 ng/mL"), a treatment ("monthly Degarelix injections"),
+  an imaging finding ("PSMA-avid osseous metastases"), or a lab
+  abnormality ("anemia, leukopenia") is mentioned anywhere in the
+  HPI, do NOT restate it in a later sentence or "summary" paragraph.
+- Do NOT write a closing paragraph that re-summarizes what was just
+  narrated. The narrative IS the summary.
+- Do NOT use phrasings like "The patient's current chief complaint
+  is..." after already covering the chief complaint at the top — the
+  CC line above the HPI already states the chief complaint.
+- Do NOT lead multiple sentences with "The patient is currently...",
+  "The patient's current status is...", "His current PSA is...".
+  Each of those leads is allowed AT MOST ONCE.
+- If you must reference a fact a second time for context, use a back-
+  reference ("the previously noted decline", "this elevation") rather
+  than restating the value.
+
+ANTI-REDUNDANCY EXAMPLE (do NOT produce output like this):
+   BAD: "His PSA rose to 30.25 ng/mL. He has metastatic disease and
+        is on monthly Degarelix. Most recent PSA is 30.25 ng/mL.
+        Patient is currently on monthly Degarelix injections.
+        Mild anemia, leukopenia, and elevated alkaline phosphatase
+        noted. The patient's current chief complaint is rising PSA,
+        with a value of 30.25 ng/mL. Mild anemia, leukopenia, and
+        elevated alkaline phosphatase noted."
+   GOOD: "His PSA has risen from 0.26 ng/mL (Sep 2025) to 30.25 ng/mL
+        (Jun 2026) despite ongoing monthly Degarelix injections, with
+        accompanying mild anemia, leukopenia, and elevated alkaline
+        phosphatase on recent labs."
 
 CONTENT REQUIREMENTS:
 - USE all urologically relevant information provided in the source notes
@@ -371,6 +650,15 @@ Provide ONLY the clinical narrative HPI. NO meta-commentary, NO explanations lik
     )
 
     cleaned_hpi = clean_llm_commentary(synthesized_hpi)
+
+    # Deterministic redundancy removal. Catches the cases where the
+    # LLM produces "summary" sentences that restate facts already
+    # narrated earlier (e.g. "The patient's current PSA is 30.25
+    # ng/mL" after a prior sentence already mentioned 30.25 ng/mL).
+    # Only removes sentences with ≥60–80% token overlap to an earlier
+    # sentence AND no new value introduced. See _dedupe_hpi_sentences
+    # for the exact criteria.
+    cleaned_hpi = _dedupe_hpi_sentences(cleaned_hpi)
 
     # STEP: Verify HPI against ground truth facts
     verification_result = None

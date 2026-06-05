@@ -359,6 +359,35 @@ def build_urology_note(
         age_at_visit = visit_dt.year - dob.year
         if (visit_dt.month, visit_dt.day) < (dob.month, dob.day):
             age_at_visit -= 1
+        # MEDICAL DOB CENTURY PIVOT. Python's %y parses 2-digit years
+        # with a POSIX pivot at 69 (00-68 → 2000s, 69-99 → 1900s). This
+        # is wrong for medical DOBs: a patient with "DOB: 1/29/43" was
+        # born in 1943, not 2043. When the naive parse produces an
+        # impossible age (negative, > 130), shift the year back by 100.
+        # We also catch the symmetric case where a young patient's DOB
+        # would be parsed as the 1900s but the year > current 2-digit
+        # year (e.g. "DOB: 01/15/05" in 2026 should be 2005, not 1905
+        # — Python's pivot already handles that, but the guard below
+        # is the same loop pattern for safety).
+        while age_at_visit < 0 or age_at_visit > 130:
+            if age_at_visit < 0:
+                # Shift DOB back a century.
+                from datetime import datetime as _dt
+                try:
+                    dob = dob.replace(year=dob.year - 100)
+                except ValueError:
+                    break
+                age_at_visit = visit_dt.year - dob.year
+                if (visit_dt.month, visit_dt.day) < (dob.month, dob.day):
+                    age_at_visit -= 1
+            else:  # > 130 — shift forward a century
+                try:
+                    dob = dob.replace(year=dob.year + 100)
+                except ValueError:
+                    break
+                age_at_visit = visit_dt.year - dob.year
+                if (visit_dt.month, visit_dt.day) < (dob.month, dob.day):
+                    age_at_visit -= 1
         if age_at_visit != patient_age:
             print(
                 f"      Age corrected: chart-text age={patient_age!r} -> "
@@ -588,6 +617,12 @@ def build_urology_note(
             cross_specialty_context=_cross_specialty_context,
             visit_progression=_visit_progression,
             prior_ap_context=_prior_ap_for_hpi,
+            # New: feed PSH + raw document so HPI agent can build the
+            # deterministic TREATMENT STATUS block. Forces the LLM to
+            # narrate completed treatment instead of regurgitating an
+            # older "awaiting treatment" snapshot.
+            psh_data=document_psh,
+            clinical_document=clinical_document,
             patient_name=_patient_name_val,
             patient_age=_patient_age_val,
             patient_sex=_patient_sex_val,

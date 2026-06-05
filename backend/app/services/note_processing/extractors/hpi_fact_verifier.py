@@ -768,23 +768,31 @@ class HPIFactVerifier:
 
                 if claim.startswith('PSA '):
                     psa_val = claim.replace('PSA ', '')
-                    # Handle both "12.50" and "12.5" formats
+                    # Handle both "12.50" and "12.5" formats. Dedupe so
+                    # the for-loop doesn't run with the same pattern
+                    # twice — when it did, the second iteration matched
+                    # the already-wrapped "[UNVERIFIED PSA: X]" and
+                    # produced "[UNVERIFIED [UNVERIFIED PSA: X]]".
                     psa_val_stripped = psa_val.rstrip('0').rstrip('.')
                     psa_patterns = [psa_val, psa_val_stripped]
                     if '.' not in psa_val_stripped:
                         psa_patterns.append(psa_val_stripped + '.0')
+                    psa_patterns = list(dict.fromkeys(psa_patterns))
 
                     for pv in psa_patterns:
-                        # Match PSA followed by value in various formats
+                        # Skip if this value is already wrapped by a
+                        # prior iteration — negative lookbehind for
+                        # "[UNVERIFIED PSA: " immediately before the
+                        # match guards against re-wrapping.
                         corrected = re.sub(
-                            rf'PSA[:\s]+{re.escape(pv)}(?:\s*ng/mL)?',
+                            rf'(?<!\[UNVERIFIED PSA: )PSA[:\s]+{re.escape(pv)}(?:\s*ng/mL)?',
                             f'[UNVERIFIED PSA: {pv}]',
                             corrected,
                             flags=re.IGNORECASE
                         )
-                        # Also match "PSA of X" format
+                        # "PSA of X" format — same guard.
                         corrected = re.sub(
-                            rf'PSA\s+(?:of\s+)?{re.escape(pv)}',
+                            rf'(?<!\[UNVERIFIED PSA: )PSA\s+(?:of\s+)?{re.escape(pv)}',
                             f'[UNVERIFIED PSA: {pv}]',
                             corrected,
                             flags=re.IGNORECASE

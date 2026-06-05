@@ -19,6 +19,11 @@ from typing import Callable, List, Optional, Tuple
 
 from app.config import settings
 from app.schemas.notes import BatchFileResult, BatchFileStatus
+from app.services.ollama_health import (
+    assert_ollama_healthy,
+    check_ollama_gpu_health,
+    OllamaWedgedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +209,27 @@ async def run_batch_processing(
 
     logger.info(f"Batch processing: {len(files)} files found in {folder_path}")
 
+    # Pre-flight: refuse to start the batch when Ollama / GPU is already
+    # wedged. The most common failure mode we've seen is another process
+    # on the shared GPU (e.g. UT-MS1-SIM) loading a model with its full
+    # 131K context, which exceeds VRAM and wedges the runner so EVERY
+    # subsequent Ollama request (vaucda included) blocks indefinitely.
+    # Without this check the batch processor would discover the wedge
+    # only via per-file 20-min timeouts — burning 6+ hours on a 20-file
+    # batch when the user should have been told up front to restart
+    # Ollama.
+    pre_health = check_ollama_gpu_health()
+    if not pre_health.healthy:
+        raise RuntimeError(
+            f"Refusing to start batch: Ollama is not healthy. "
+            f"{pre_health.reason}"
+        )
+    logger.info(
+        "Ollama health check passed (loaded VRAM: %d MB / %s MB GPU)",
+        pre_health.loaded_vram_mb,
+        pre_health.total_vram_mb if pre_health.total_vram_mb is not None else "?",
+    )
+
     results: List[BatchFileResult] = []
     output_folder = Path(folder_path)
 
@@ -219,6 +245,24 @@ async def run_batch_processing(
             status=BatchFileStatus.PROCESSING,
             attempts=0,
         )
+
+        # Pre-flight per file: a wedge can happen MID-BATCH if another
+        # process loads an oversized model between files. Check before
+        # each file so we fail this file fast with an actionable error
+        # rather than burning 20-min × max_retries on a wedged Ollama.
+        per_file_health = check_ollama_gpu_health()
+        if not per_file_health.healthy:
+            result.status = BatchFileStatus.FAILED
+            result.error_message = (
+                f"Skipped: Ollama wedged before this file could be processed. "
+                f"{per_file_health.reason}"
+            )
+            logger.error(
+                "[%d/%d] %s SKIPPED — Ollama unhealthy: %s",
+                idx + 1, len(files), file_path.name, per_file_health.reason,
+            )
+            results.append(result)
+            continue
 
         # Retry loop
         success = False

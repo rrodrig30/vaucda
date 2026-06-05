@@ -367,27 +367,71 @@ def _is_biochemically_responding(
     return current < 2.0
 
 
+# A CC that names a prostate-cancer diagnosis without specifying a
+# post-treatment qualifier is also stale once definitive treatment has
+# been completed. "Prostate cancer", "Follow-up for prostate cancer",
+# "PCa follow-up" all need to become "Follow-up after <treatment> for
+# prostate cancer" so the CC reflects current state. We DON'T want to
+# overwrite a CC that's already post-treatment-aware (e.g. "Follow-up
+# after radiation therapy for prostate cancer") or that explicitly
+# refers to current treatment ("on active surveillance", "on ADT").
+_BARE_PROSTATE_CANCER_CC = re.compile(
+    r'(?:^|\b)'
+    r'(?:follow[-\s]?up\s+(?:for|of)\s+)?'
+    r'(?:prostate\s+(?:cancer|adenocarcinoma|carcinoma|malignancy)'
+    r'|PCa|prostate\s+ca\b)',
+    re.IGNORECASE,
+)
+_ALREADY_POST_TREATMENT_CC = re.compile(
+    r'\b(?:after\s+(?:radiation|prostatectomy|brachytherapy|focal|treatment|XRT|EBRT|IMRT)'
+    r'|post[-\s](?:radiation|prostatectomy|brachytherapy|XRT|EBRT|IMRT)'
+    r'|s/?p\s+(?:radiation|prostatectomy|brachytherapy|XRT|EBRT|IMRT)'
+    r'|biochemical\s+recurrence)',
+    re.IGNORECASE,
+)
+_CURRENT_MGMT_CC = re.compile(
+    r'\b(?:active\s+surveillance|on\s+ADT|on\s+androgen\s+deprivation|'
+    r'on\s+leuprolide|on\s+lupron|on\s+degarelix)',
+    re.IGNORECASE,
+)
+
+
 def _reframe_post_treatment_cc(
     cc: str,
     treatment: Optional[Dict[str, str]],
     psa: Dict[str, Optional[float]],
 ) -> str:
-    """Replace stale "persistent / rising PSA / elevated PSA" framing
-    with a clinically accurate post-treatment CC when the data supports
-    it. Returns the input unchanged when:
-      - no completed definitive treatment is detected, OR
-      - the CC has no stale framing markers, OR
-      - PSA data is insufficient to confirm response.
+    """Replace stale or generic prostate-cancer CCs with a clinically
+    accurate post-treatment CC when the data supports it.
 
-    When the patient is post-treatment with biochemical response, the CC
-    becomes "Follow-up after <treatment> for prostate cancer". When the
-    PSA pattern looks like biochemical recurrence (post-treatment but
-    not responding by our coarse threshold), the CC becomes "Follow-up
-    for biochemical recurrence after <treatment> for prostate cancer".
+    The reframer now fires in EITHER of two cases:
+      A. CC contains a stale-management marker (persistent / active /
+         rising PSA / elevated PSA / etc.) — historical behavior.
+      B. CC names a bare prostate-cancer diagnosis without a
+         post-treatment qualifier (e.g. "Prostate cancer", "Follow-up
+         for prostate cancer", "PCa follow-up") AND the patient is
+         clearly post-treatment with biochemical response.
+
+    No-op when:
+      - no completed definitive treatment is detected, OR
+      - PSA data is insufficient to confirm response, OR
+      - CC already mentions a post-treatment qualifier
+        ("after radiation", "s/p XRT", "biochemical recurrence"), OR
+      - CC explicitly describes current management mode
+        ("on active surveillance", "on ADT").
     """
     if not cc or not treatment:
         return cc
-    if not _STALE_CC_INDICATORS.search(cc):
+    if _ALREADY_POST_TREATMENT_CC.search(cc):
+        return cc
+    if _CURRENT_MGMT_CC.search(cc):
+        return cc
+
+    # Decide which gate to use: stale-marker (existing) or bare-PCa-CC
+    # (new). At least one must match for us to consider reframing.
+    is_stale = bool(_STALE_CC_INDICATORS.search(cc))
+    is_bare_pca = bool(_BARE_PROSTATE_CANCER_CC.search(cc))
+    if not (is_stale or is_bare_pca):
         return cc
 
     t_type = treatment.get('type', '')

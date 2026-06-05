@@ -99,7 +99,22 @@ class Settings(BaseSettings):
     # LLM - Ollama (Primary Provider) - REQUIRED for production
     OLLAMA_BASE_URL: Optional[str] = None  # Must be set in .env
     OLLAMA_DEFAULT_MODEL: str = "llama3.1:8b"
-    OLLAMA_TIMEOUT: int = 3600  # 1 hour timeout for complex note generation
+    # OLLAMA_TIMEOUT: per-request timeout for Ollama /api/generate calls.
+    # 1200 s (20 minutes) accommodates the observed worst case where
+    # large files (>200 KB clinical input, complex pathology, and
+    # heavy GraphRAG context) have taken up to 15 minutes to synthesize
+    # a single stage. 20 minutes gives 5 minutes of headroom over that
+    # observed maximum without flagging legitimately-slow calls as
+    # failures. The previous value (3600 s / 1 hour) was excessive:
+    # when Ollama serve was wedged — typically because some process
+    # loaded an 8B model with its full 131K context, allocating ~140
+    # GB on a 96 GB GPU — every parallel synthesis agent would block
+    # for an hour before failing, then the batch processor would retry
+    # the same file and burn another hour. With 20 min, a wedge is
+    # detected in 20 min instead of 60 min, the batch fails fast, and
+    # the user sees an actionable error from the pre-flight GPU health
+    # check (app/services/ollama_health.py) on the next submission.
+    OLLAMA_TIMEOUT: int = 1200
     OLLAMA_MAX_TOKENS: int = 8192  # Default 8K tokens, user configurable for larger context LLMs
     OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text"
 
