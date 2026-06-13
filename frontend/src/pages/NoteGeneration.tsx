@@ -3,7 +3,6 @@ import { Card } from '@/components/common/Card'
 import { Button } from '@/components/common/Button'
 import { Textarea } from '@/components/common/Textarea'
 import { Select } from '@/components/common/Select'
-import { AmbientListening } from '@/components/notes/AmbientListening'
 import { CalculatorSuggestionPanel } from '@/components/notes/CalculatorSuggestionPanel'
 import { NoteEditor } from '@/components/notes/NoteEditor'
 import { Stage1Upload } from '@/components/notes/Stage1Upload'
@@ -48,7 +47,6 @@ export const NoteGeneration: React.FC = () => {
 
   // ========== Clinical Input State ==========
   const [clinicalInput, setClinicalInput] = useState('')
-  const [ambientTranscription, setAmbientTranscription] = useState('')
 
   // ========== Patient Information State ==========
   const [patientName, setPatientName] = useState('')
@@ -77,14 +75,8 @@ export const NoteGeneration: React.FC = () => {
   const [ragSources, setRagSources] = useState<any[]>([])
   const [stage2Metadata, setStage2Metadata] = useState<any>(null)
 
-  // ========== Stage 3 State (Ambient Augmented) ==========
-  const [isAmbientActive, setIsAmbientActive] = useState(false)
-  const [isGeneratingAmbient, setIsGeneratingAmbient] = useState(false)
-  const [ambientAugmentedNote, setAmbientAugmentedNote] = useState('')
-  const [stage3Metadata, setStage3Metadata] = useState<any>(null)
-
   // ========== Workflow State ==========
-  const [currentStage, setCurrentStage] = useState<'input' | 'preliminary' | 'final' | 'ambient'>('input')
+  const [currentStage, setCurrentStage] = useState<'input' | 'preliminary' | 'final'>('input')
 
   // ========== Initialization ==========
   useEffect(() => {
@@ -95,7 +87,6 @@ export const NoteGeneration: React.FC = () => {
     // Clear any leftover PHI data from previous sessions
     localStorage.removeItem('vaucda_clinical_input')
     localStorage.removeItem('vaucda_draft_note')
-    localStorage.removeItem('vaucda_draft_note_ambient')
 
     // Load saved model selection (non-PHI, safe to persist)
     const savedModel = localStorage.getItem('vaucda_selected_model')
@@ -110,7 +101,6 @@ export const NoteGeneration: React.FC = () => {
     const handleBeforeUnload = () => {
       localStorage.removeItem('vaucda_clinical_input')
       localStorage.removeItem('vaucda_draft_note')
-      localStorage.removeItem('vaucda_draft_note_ambient')
     }
 
     window.addEventListener('beforeunload', handleBeforeUnload)
@@ -186,35 +176,6 @@ export const NoteGeneration: React.FC = () => {
     }
   }
 
-  // ========== Ambient Listening Callbacks ==========
-  const handleTranscription = (text: string) => {
-    setAmbientTranscription(prev => (prev ? `${prev} ${text}` : text))
-  }
-
-  const handleEntitiesExtracted = (entities: ExtractedEntity[]) => {
-    setExtractedEntities(prev => {
-      const merged = [...prev]
-      entities.forEach(entity => {
-        const existingIndex = merged.findIndex(e => e.field === entity.field)
-        if (existingIndex >= 0) {
-          if (entity.confidence > merged[existingIndex].confidence) {
-            merged[existingIndex] = entity
-          }
-        } else {
-          merged.push(entity)
-        }
-      })
-      return merged
-    })
-  }
-
-  const handleClinicalInputUpdate = (fullText: string) => {
-    setClinicalInput(prev => {
-      const manual = prev.replace(ambientTranscription, '').trim()
-      return manual ? `${manual}\n\n${fullText}` : fullText
-    })
-  }
-
   // ========== Document Upload Handler ==========
   const handleDocumentUploadComplete = (text: string, _response: DocumentUploadResponse) => {
     // Append extracted text to clinical input
@@ -223,10 +184,10 @@ export const NoteGeneration: React.FC = () => {
 
   // ========== Stage 1: Generate Preliminary Note ==========
   const handleGenerateInitial = async () => {
-    const combinedInput = [clinicalInput, ambientTranscription].filter(Boolean).join('\n\n')
+    const combinedInput = clinicalInput
 
     if (!combinedInput.trim()) {
-      alert('Please enter clinical input or use ambient listening')
+      alert('Please enter clinical input')
       return
     }
 
@@ -301,10 +262,10 @@ export const NoteGeneration: React.FC = () => {
   // Uses SSE streaming so the user sees per-phase progress instead of a
   // blank multi-minute spinner.
   const handleGenerateExpress = async () => {
-    const combinedInput = [clinicalInput, ambientTranscription].filter(Boolean).join('\n\n')
+    const combinedInput = clinicalInput
 
     if (!combinedInput.trim()) {
-      alert('Please enter clinical input or use ambient listening')
+      alert('Please enter clinical input')
       return
     }
 
@@ -381,7 +342,7 @@ export const NoteGeneration: React.FC = () => {
     setIsGeneratingFinal(true)
 
     try {
-      const combinedInput = [clinicalInput, ambientTranscription].filter(Boolean).join('\n\n')
+      const combinedInput = clinicalInput
 
       const request: FinalNoteRequest = {
         preliminary_note: stage1Note,
@@ -410,54 +371,6 @@ export const NoteGeneration: React.FC = () => {
       console.error('Stage 2 error:', error)
     } finally {
       setIsGeneratingFinal(false)
-    }
-  }
-
-  // ========== Stage 3: Generate Ambient-Augmented Note ==========
-  const handleGenerateAmbientAugmented = async () => {
-    if (!finalNote) {
-      alert('Please generate Stage 2 note first')
-      return
-    }
-
-    if (!ambientTranscription) {
-      alert('No ambient transcription available. Please use ambient listening first.')
-      return
-    }
-
-    setIsGeneratingAmbient(true)
-
-    try {
-      // Call Stage 3 endpoint with ambient augmentation
-      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/api/v1/notes/ambient-augment`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('access_token')}`
-        },
-        body: JSON.stringify({
-          stage2_note: finalNote,
-          transcription: ambientTranscription,
-          speaker_map: {} // TODO: Get from ambient listening component
-        })
-      })
-
-      if (!response.ok) {
-        throw new Error('Stage 3 generation failed')
-      }
-
-      const data = await response.json()
-
-      setAmbientAugmentedNote(data.final_note)
-      setStage3Metadata(data.metadata)
-      setCurrentStage('ambient')
-
-      alert('Ambient-augmented note generated successfully!')
-    } catch (error: any) {
-      alert(`Error generating ambient-augmented note: ${error.message || 'Unknown error'}`)
-      console.error('Stage 3 error:', error)
-    } finally {
-      setIsGeneratingAmbient(false)
     }
   }
 
@@ -535,12 +448,10 @@ export const NoteGeneration: React.FC = () => {
 
       // Clear all clinical input and context (CRITICAL for patient data separation)
       setClinicalInput('')
-      setAmbientTranscription('')
 
       // Clear all generated notes
       setPreliminaryNote('')
       setFinalNote('')
-      setAmbientAugmentedNote('')
       setUploadedStage1(null)
       setIsEditingStage1(false)
       setIsEditingStage2(false)
@@ -553,13 +464,9 @@ export const NoteGeneration: React.FC = () => {
       setRagSources([])
       setAdditionalInputs({})
 
-      // Clear Stage 3 state
-      setIsAmbientActive(false)
-
       // Clear metadata
       setStage1Metadata(null)
       setStage2Metadata(null)
-      setStage3Metadata(null)
 
       // Clear localStorage to prevent persistence
       localStorage.removeItem('vaucda_clinical_input')
@@ -578,7 +485,7 @@ export const NoteGeneration: React.FC = () => {
             Clinical Note Generation
           </h1>
           <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-            Two-stage workflow with ambient listening and intelligent calculator suggestions
+            Two-stage workflow with intelligent calculator suggestions
           </p>
         </div>
 
@@ -625,13 +532,6 @@ export const NoteGeneration: React.FC = () => {
           {/* STAGE 1: Clinical Data Collection */}
           {currentStage === 'input' && (
             <>
-              {/* Ambient Listening */}
-              <AmbientListening
-                onTranscription={handleTranscription}
-                onEntitiesExtracted={handleEntitiesExtracted}
-                onClinicalInputUpdate={handleClinicalInputUpdate}
-              />
-
               {/* Clinical Input */}
               <Card title="Clinical Input" description="Enter or paste clinical data (labs, imaging, history)">
                 <Textarea
@@ -656,7 +556,6 @@ export const NoteGeneration: React.FC = () => {
                     size="sm"
                     onClick={() => {
                       setClinicalInput('')
-                      setAmbientTranscription('')
                       localStorage.removeItem('vaucda_clinical_input')
                     }}
                   >
@@ -688,7 +587,7 @@ export const NoteGeneration: React.FC = () => {
                       icon={<FiPlay />}
                       onClick={handleGenerateInitial}
                       isLoading={isGeneratingInitial}
-                      disabled={(!clinicalInput.trim() && !ambientTranscription) || !selectedModel || isGeneratingInitial || isGeneratingExpress}
+                      disabled={!clinicalInput.trim() || !selectedModel || isGeneratingInitial || isGeneratingExpress}
                     >
                       {isGeneratingInitial ? 'Generating...' : 'Generate Note'}
                     </Button>
@@ -698,7 +597,7 @@ export const NoteGeneration: React.FC = () => {
                       icon={<FiZap />}
                       onClick={handleGenerateExpress}
                       isLoading={isGeneratingExpress}
-                      disabled={(!clinicalInput.trim() && !ambientTranscription) || !selectedModel || isGeneratingInitial || isGeneratingExpress}
+                      disabled={!clinicalInput.trim() || !selectedModel || isGeneratingInitial || isGeneratingExpress}
                       title="Run Stage 1 + Stage 2 in one step, skipping calculator selection"
                     >
                       {isGeneratingExpress ? 'Generating...' : 'Express Note'}
@@ -934,81 +833,6 @@ export const NoteGeneration: React.FC = () => {
                 </Card>
               )}
 
-              {/* Ambient Listening Stage 3 Option */}
-              {ambientTranscription && (
-                <Card className="bg-gradient-to-r from-purple-500/10 to-primary/10 border-purple-500/30">
-                  <div className="flex items-center justify-between p-4">
-                    <div>
-                      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-1">
-                        Ready for Ambient-Augmented Note?
-                      </h3>
-                      <p className="text-sm text-gray-600 dark:text-gray-400">
-                        Merge ambient transcription into final note with section-aware intelligence
-                      </p>
-                    </div>
-                    <Button
-                      variant="primary"
-                      size="lg"
-                      icon={<FiPlay />}
-                      onClick={handleGenerateAmbientAugmented}
-                      isLoading={isGeneratingAmbient}
-                      disabled={isGeneratingAmbient}
-                    >
-                      {isGeneratingAmbient ? 'Merging...' : 'Generate Stage 3 Note'}
-                    </Button>
-                  </div>
-                </Card>
-              )}
-            </>
-          )}
-
-          {/* STAGE 3: Ambient-Augmented Final Note */}
-          {currentStage === 'ambient' && (
-            <>
-              {/* Ambient-Augmented Note Display */}
-              <Card
-                title="Ambient-Augmented Clinical Note (Stage 3)"
-                description="Final note with intelligent section-aware transcription merging"
-                footer={
-                  <div className="flex gap-2">
-                    <Button variant="outline" size="sm" icon={<FiCopy />} onClick={() => handleCopy(ambientAugmentedNote)}>
-                      Copy
-                    </Button>
-                    <Button variant="outline" size="sm" icon={<FiDownload />} onClick={() => handleDownload(ambientAugmentedNote, `clinical-note-ambient-${new Date().toISOString().split('T')[0]}.txt`)}>
-                      Download
-                    </Button>
-                    {/* HIPAA COMPLIANCE: Removed "Save Draft" button
-                        Patient data should NOT be saved to localStorage
-                        Future: Implement secure server-side draft storage */}
-                  </div>
-                }
-              >
-                <div className="prose prose-sm dark:prose-invert max-w-none">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                    {ambientAugmentedNote}
-                  </ReactMarkdown>
-                </div>
-
-                {stage3Metadata && (
-                  <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-400 grid grid-cols-3 gap-2">
-                    <div>Workflow: {stage3Metadata.workflow}</div>
-                    <div>Transcription: {stage3Metadata.transcription_length} chars</div>
-                    <div>Segments: {stage3Metadata.segments_merged}</div>
-                  </div>
-                )}
-              </Card>
-
-              {/* Show Original Stage 2 Note for Comparison */}
-              <Card
-                title="Original Stage 2 Note (Before Ambient Merging)"
-                description="Compare with ambient-augmented version above"
-              >
-                <div className="prose prose-sm dark:prose-invert max-w-none opacity-70">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                    {finalNote}
-                  </ReactMarkdown>
-                </div>
-              </Card>
             </>
           )}
         </div>
