@@ -71,6 +71,23 @@ def _normalize_label(raw_label: str) -> str:
     return cleaned
 
 
+# Shared per-line parser for VistA stone-panel formats.
+#
+#   "<LABEL>(NNN)   <value> [H|L]   <unit?>   Ref: ..."
+#
+# Used by both the VA STONERISK PROFILE matcher (which gates on the
+# 'STONERISK PROFILE(24HR UR.)(442)' header) and the bare-'Specimen: URINE,
+# 24 HR' matcher (which sees the same line shapes under a different header).
+# Keeping a single pattern avoids per-matcher drift.
+_STONERISK_LINE_RE = re.compile(
+    r'^\s*([A-Z][A-Z\s]+?)\s*\(\d+\)\s+'
+    r'(\d+\.?\d*)\s*([HL])?'
+    r'(?:\s+[A-Za-z/]+)?'
+    r'(?:\s+\S.*)?$',
+    re.IGNORECASE,
+)
+
+
 def _lookup_label(raw_label: str) -> Optional[Tuple[str, str]]:
     """Look up a stonerisk label in the canonical map, accepting variants."""
     normalized = _normalize_label(raw_label)
@@ -260,6 +277,17 @@ def extract_stone_labs(clinical_document: str) -> str:
         stone_results.append(va_profile)
 
     # ==========================================================================
+    # 4b. VistA 'Specimen: URINE, 24 HR' bare-header format
+    # Same per-line shape as the STONERISK PROFILE, different enclosing header.
+    # Only run when the STONERISK PROFILE matcher did not fire, otherwise the
+    # same panel would render twice.
+    # ==========================================================================
+    if not va_profile:
+        specimen_panel = extract_specimen_24hr_urine_panel(clinical_document)
+        if specimen_panel:
+            stone_results.append(specimen_panel)
+
+    # ==========================================================================
     # 5. Plain-label 24-hour urine metabolic stone panel
     # ==========================================================================
     plain_panel = extract_plain_label_stone_panel(clinical_document)
@@ -274,11 +302,18 @@ def extract_stone_labs(clinical_document: str) -> str:
         stone_results.append(litholink_results)
 
     # ==========================================================================
-    # 7. Stone composition analysis
+    # 7. Stone composition analysis (header-style: STONE ANALYSIS:, etc.)
     # ==========================================================================
     composition = extract_stone_composition(clinical_document)
     if composition:
         stone_results.append(composition)
+
+    # ==========================================================================
+    # 7b. VistA 'Specimen: CALCULUS' stone composition block
+    # ==========================================================================
+    calculus = extract_specimen_calculus_composition(clinical_document)
+    if calculus:
+        stone_results.append(calculus)
 
     if not stone_results:
         return ""
@@ -371,18 +406,9 @@ def extract_va_stonerisk_profile(clinical_document: str) -> str:
     if date_match:
         date = date_match.group(1)
 
-    # Per-line parser: "<LABEL>(NNN)   <value> [H|L]   <unit?>   Ref: ..."
-    line_pattern = re.compile(
-        r'^\s*([A-Z][A-Z\s]+?)\s*\(\d+\)\s+'
-        r'(\d+\.?\d*)\s*([HL])?'
-        r'(?:\s+[A-Za-z/]+)?'
-        r'(?:\s+\S.*)?$',
-        re.IGNORECASE
-    )
-
     key_values = {}
     for line in profile_block.split('\n'):
-        m = line_pattern.match(line.rstrip())
+        m = _STONERISK_LINE_RE.match(line.rstrip())
         if not m:
             continue
         raw_label = m.group(1).strip()
@@ -396,6 +422,123 @@ def extract_va_stonerisk_profile(clinical_document: str) -> str:
         key_values[display_label] = {'value': formatted_value, 'category': category}
 
     return _format_stonerisk_block(key_values, date)
+
+
+def extract_specimen_24hr_urine_panel(clinical_document: str) -> str:
+    """
+    Extract VistA-style 24-hour urine metabolic stone panel introduced by a
+    bare 'Specimen: URINE, 24 HR' header (no 'STONERISK PROFILE' header).
+
+    Real-world VistA dumps frequently use:
+
+        Specimen: URINE, 24 HR..    QST 25 1205
+           Specimen Collection Date: Feb 14, 2025@08:57
+              Test name            Result   units    Ref.   range   Site Code
+        CALCIUM OXALATE(442)        0.86             Ref: SEE BELOW [11120]
+        BRUSHITE (442)              0.97             Ref: SEE BELOW [11120]
+        ...
+        AMMONIUM URINE (442)         29  mEq/day     14 - 62        [11120]
+        Comment: ...
+
+    The per-line shape is identical to the STONERISK PROFILE format; only the
+    enclosing header differs. We reuse ``_STONERISK_LINE_RE`` so the two
+    matchers cannot drift apart.
+    """
+    header_re = re.compile(
+        r'^[ \t]*Specimen:\s*URINE,\s*24\s*HR\b.*$',
+        re.IGNORECASE,
+    )
+    # Sentinels that mean "the 24-hr-urine block is over."
+    sentinel_re = re.compile(
+        r'^[ \t]*(?:'
+        r'Comment:'
+        r'|Report\s+Released'
+        r'|Provider:'
+        r'|Specimen:\s*(?!URINE,\s*24\s*HR)'  # another, different specimen
+        r'|={5,}'
+        r'|IMAGING\b'
+        r'|MEDICATIONS\b'
+        r'|ALLERGIES\b'
+        r'|ASSESSMENT:'
+        r'|PLAN:'
+        r'|PATHOLOGY\b'
+        r')',
+        re.IGNORECASE,
+    )
+    date_re = re.compile(
+        r'Specimen\s+Collection\s+Date:\s*'
+        r'([A-Za-z]{3}\s+\d{1,2},\s+\d{4})',
+        re.IGNORECASE,
+    )
+
+    lines = clinical_document.split('\n')
+    rendered_blocks = []
+    seen_label_sets = []  # for dedup across multiple headers
+    i = 0
+    while i < len(lines):
+        if not header_re.match(lines[i]):
+            i += 1
+            continue
+
+        # Walk forward; cap at 80 lines so a malformed dump can't run away.
+        date = ""
+        key_values = {}
+        j = i + 1
+        scanned = 0
+        while j < len(lines) and scanned < 80:
+            current = lines[j].rstrip()
+            if sentinel_re.match(current):
+                break
+            scanned += 1
+            j += 1
+
+            if not current.strip():
+                # Tolerate one blank line, then break if the next non-blank
+                # line is not a stone-panel value (avoids gobbling unrelated
+                # follow-on sections separated by a blank line).
+                # Look ahead one non-blank line:
+                k = j
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                if k >= len(lines) or sentinel_re.match(lines[k].rstrip()) \
+                        or not _STONERISK_LINE_RE.match(lines[k].rstrip()):
+                    break
+                continue
+
+            # Capture date once
+            if not date:
+                dm = date_re.search(current)
+                if dm:
+                    date = dm.group(1)
+
+            line_m = _STONERISK_LINE_RE.match(current)
+            if not line_m:
+                continue
+            raw_label = line_m.group(1).strip()
+            value = line_m.group(2)
+            flag = line_m.group(3) or ""
+            lookup = _lookup_label(raw_label)
+            if not lookup:
+                continue
+            display_label, category = lookup
+            formatted_value = f"{value} ({flag})" if flag else value
+            key_values[display_label] = {
+                'value': formatted_value,
+                'category': category,
+            }
+
+        if key_values:
+            label_set = frozenset(key_values.keys())
+            # Dedup: if a previous header rendered the same label set on the
+            # same date, skip. (Identical re-emission of one report.)
+            if not any(label_set == prev for prev in seen_label_sets):
+                block = _format_stonerisk_block(key_values, date)
+                if block:
+                    rendered_blocks.append(block)
+                    seen_label_sets.append(label_set)
+        i = j
+
+    return '\n\n'.join(rendered_blocks)
 
 
 def extract_plain_label_stone_panel(clinical_document: str) -> str:
@@ -586,6 +729,177 @@ def extract_litholink_format(clinical_document: str) -> str:
         date,
         header_prefix="Litholink 24-Hour Urine",
     )
+
+
+# Maps raw VistA calculus-analysis labels to their clinical names.
+# 'cls' tags the type:
+#   'phys'  - physical descriptor (color, size, weight)
+#   'comp'  - mineral/component composition
+_CALCULUS_LABEL_MAP = {
+    'COLOR-CALCULI':                  ('Color', 'phys'),
+    'SIZE-CALCULI':                   ('Size', 'phys'),
+    'WEIGHT-CALCULI':                 ('Weight', 'phys'),
+    'CA OXALATE DIHYDATE-CALCULI':    ('Calcium Oxalate Dihydrate', 'comp'),
+    'CA OXALATE DIHYDRATE-CALCULI':   ('Calcium Oxalate Dihydrate', 'comp'),
+    'CA OXALATE MONOHYDR.-CALCULI':   ('Calcium Oxalate Monohydrate', 'comp'),
+    'CA OXALATE MONOHYDRATE-CALCULI': ('Calcium Oxalate Monohydrate', 'comp'),
+    'CALCIUM PHOSPHATE-CALCULI':      ('Calcium Phosphate', 'comp'),
+    'SODIUM-ACID URATE':              ('Sodium Acid Urate', 'comp'),
+    'AMMONIUM ACID-URATE':            ('Ammonium Acid Urate', 'comp'),
+    'CYSTINE-CALCULI':                ('Cystine', 'comp'),
+    'CELLULAR MATERIAL-CACULI':       ('Cellular Material', 'comp'),  # source typo
+    'CELLULAR MATERIAL-CALCULI':      ('Cellular Material', 'comp'),
+    'URIC ACID DIHYDRATE':            ('Uric Acid Dihydrate', 'comp'),
+    'URIC ACID-CALCULI':              ('Uric Acid', 'comp'),
+    'HYDROXYAPATITE-CALCULI':         ('Hydroxyapatite', 'comp'),
+    'CAHPO4 (BRUSHITE)':              ('Brushite (CaHPO4)', 'comp'),
+}
+
+
+def extract_specimen_calculus_composition(clinical_document: str) -> str:
+    """
+    Extract VistA 'Specimen: CALCULUS' stone analysis blocks.
+
+    Real-world VistA dumps use:
+
+        Specimen: CALCULUS.         SFB 21 29360
+           Specimen Collection Date: Oct 08, 2021@08:00
+             Test name             Result   units      Ref. range   Site Code
+        COLOR-CALCULI               Brown                            [11401]
+        SIZE-CALCULI                  3x2  mm                        [11401]
+        WEIGHT-CALCULI                 70  mg                        [11401]
+        CA OXALATE DIHYDATE-CALCULI    20  %                         [11401]
+        CA OXALATE MONOHYDR.-CALCULI   80  %                         [11401]
+        CALCIUM PHOSPHATE-CALCULI     canc                           [11401]
+        ...
+        Comment: ...
+
+    Lines with a 'canc' (cancelled / not detected) result are omitted from
+    the rendered output - listing them adds noise without clinical signal.
+    The 'PLEASE NOTE-CALCULI' narrative anchor is also skipped.
+    """
+    header_re = re.compile(
+        r'^[ \t]*Specimen:\s*CALCULUS\b.*$',
+        re.IGNORECASE,
+    )
+    # Line: LABEL  (optional spaces)  value  (optional unit / flag / ref)  [NNNNN]
+    line_re = re.compile(
+        r'^\s*([A-Z][A-Z0-9\s/\.\-\(\)]+?)\s{2,}'
+        r'([A-Za-z0-9./\-]+)'
+        r'(?:\s+([HL]))?'
+        r'(?:\s+\S.*?)?'
+        r'\s*\[\d+\]\s*$',
+        re.IGNORECASE,
+    )
+    date_re = re.compile(
+        r'Specimen\s+Collection\s+Date:\s*'
+        r'([A-Za-z]{3}\s+\d{1,2},\s+\d{4})',
+        re.IGNORECASE,
+    )
+    sentinel_re = re.compile(
+        r'^[ \t]*(?:'
+        r'Comment:'
+        r'|={5,}'
+        r'|Report\s+Released'
+        r'|Provider:'
+        r'|Reporting\s+Lab:'
+        r'|Specimen:'  # next specimen block
+        r')',
+        re.IGNORECASE,
+    )
+
+    lines = clinical_document.split('\n')
+    rendered_blocks = []
+    seen_blocks = set()
+    i = 0
+    while i < len(lines):
+        if not header_re.match(lines[i]):
+            i += 1
+            continue
+
+        date = ""
+        physical = []   # ordered: color, size, weight
+        composition = []  # detected components only
+        j = i + 1
+        scanned = 0
+        while j < len(lines) and scanned < 60:
+            current = lines[j].rstrip()
+            # Sentinel terminates the block, but ONLY when we have already
+            # seen at least one composition line (otherwise the next
+            # 'Specimen:' header could be the same line we're walking past
+            # in a degenerate dump). In practice the header itself is at i,
+            # so 'Specimen:' here means the *next* block.
+            if scanned > 0 and sentinel_re.match(current):
+                break
+            scanned += 1
+            j += 1
+            if not current.strip():
+                continue
+
+            # Capture date once.
+            if not date:
+                dm = date_re.search(current)
+                if dm:
+                    date = dm.group(1)
+                    continue
+
+            m = line_re.match(current)
+            if not m:
+                continue
+            raw_label = re.sub(r'\s+', ' ', m.group(1)).strip().upper()
+            value = m.group(2).strip()
+            # Skip the narrative comment anchor.
+            if raw_label.startswith('PLEASE NOTE'):
+                continue
+            mapping = _CALCULUS_LABEL_MAP.get(raw_label)
+            if not mapping:
+                continue
+            display_label, cls = mapping
+            # Skip components reported as 'canc' (cancelled / not detected).
+            if cls == 'comp' and value.lower() in {'canc', 'cancelled', 'cancel'}:
+                continue
+            # Attach unit for composition % when not already present in value.
+            if cls == 'comp' and value.replace('.', '', 1).isdigit():
+                display_value = f"{value}%"
+            elif cls == 'phys' and display_label == 'Weight' and value.isdigit():
+                display_value = f"{value} mg"
+            elif cls == 'phys' and display_label == 'Size' and re.match(r'^\d', value):
+                display_value = f"{value} mm"
+            else:
+                display_value = value
+
+            entry = f"  {display_label}: {display_value}"
+            if cls == 'phys':
+                physical.append(entry)
+            else:
+                composition.append(entry)
+
+        if not (physical or composition):
+            i = j
+            continue
+
+        header = "Stone Composition (Calculus Analysis)"
+        if date:
+            header += f" ({date})"
+        header += ":"
+
+        parts = [header]
+        if physical:
+            parts.append("Physical:")
+            parts.extend(physical)
+        if composition:
+            parts.append("Composition:")
+            parts.extend(composition)
+        block = '\n'.join(parts)
+
+        # Dedup identical blocks (same date + same payload).
+        key = (date, tuple(physical), tuple(composition))
+        if key not in seen_blocks:
+            rendered_blocks.append(block)
+            seen_blocks.add(key)
+        i = j
+
+    return '\n\n'.join(rendered_blocks)
 
 
 def extract_stone_composition(clinical_document: str) -> str:
