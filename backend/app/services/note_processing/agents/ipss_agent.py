@@ -201,6 +201,63 @@ def _max_dates_for_width(max_width: int, symptom_col: int, value_col: int) -> in
     return max(1, available // (value_col + 1))
 
 
+def _parse_column_date_for_sort(date_str: str):
+    """
+    Convert an IPSS column-header date (e.g. '2/18/25', '02/18/2025', '2/18')
+    into a sortable ``datetime``. Unparseable headers sort to the epoch so
+    they end up at the left and are visually distinguishable as outliers.
+
+    Python's ``%y`` pivots at 1969 per POSIX, which is correct for clinical
+    dates (anything from a 2-digit year like '99' lands in 1999, '24' in
+    2024). Year-less headers like '2/18' are pinned to the current year
+    because most VA dumps that produce them refer to the active visit
+    cycle; this is rare in practice.
+    """
+    from datetime import datetime
+    s = (date_str or "").strip()
+    if not s:
+        return datetime.min
+    for fmt in ('%m/%d/%Y', '%m/%d/%y'):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    # Year-less fallback
+    try:
+        dt = datetime.strptime(s, '%m/%d')
+        return dt.replace(year=datetime.now().year)
+    except ValueError:
+        return datetime.min
+
+
+def _column_has_real_data(
+    col,
+    symptom_values: dict,
+    total_values: dict,
+    symptoms: list,
+    totals: list,
+) -> bool:
+    """
+    Return True if this date column has at least one non-placeholder value
+    across any symptom or total row. ``X``, ``N/A`` and empty strings are
+    treated as placeholders (no real data).
+    """
+    placeholders = {'X', 'N/A', '', '-', '--'}
+    for s in symptoms:
+        sv = symptom_values.get(s)
+        if isinstance(sv, dict):
+            v = sv.get(col)
+            if v is not None and str(v).strip().upper() not in placeholders:
+                return True
+    for t in totals:
+        tv = total_values.get(t)
+        if isinstance(tv, dict):
+            v = tv.get(col)
+            if v is not None and str(v).strip().upper() not in placeholders:
+                return True
+    return False
+
+
 def _format_visit_date_for_column(visit_date: str) -> str:
     """
     Format a visit date string into a short MM/DD/YY column header.
@@ -245,6 +302,7 @@ def _build_formatted_ipss_table(
         Properly formatted ASCII table(s)
     """
     SYMPTOMS = ['Empty', 'Frequency', 'Urgency', 'Hesitancy', 'Intermittency', 'Flow', 'Nocturia']
+    TOTALS = ['Total', 'BI']
 
     # Column widths
     symptom_col = 13  # Width for symptom names
@@ -253,8 +311,32 @@ def _build_formatted_ipss_table(
     # Calculate max dates that fit in width constraint
     max_dates = _max_dates_for_width(max_width, symptom_col, value_col)
 
-    # If no date columns or single date, build simple table
-    if not date_columns:
+    # Detect multi-date structured data (per-symptom dict-of-date->value).
+    # The flat-value path (single value per symptom, used by clean_ipss_table
+    # fallback) has nothing to filter or sort.
+    has_per_date_data = any(
+        isinstance(symptom_values.get(s), dict) for s in SYMPTOMS
+    ) or any(
+        isinstance(total_values.get(t), dict) for t in TOTALS
+    )
+
+    if has_per_date_data:
+        # Drop columns with no real data — providers don't want phantom
+        # 'X X X X' columns when an older visit's IPSS wasn't recorded.
+        date_columns = [
+            c for c in date_columns
+            if _column_has_real_data(c, symptom_values, total_values, SYMPTOMS, TOTALS)
+        ]
+        # Order columns oldest -> newest so the most-recent historical visit
+        # sits immediately to the left of the appended DOS (current-visit)
+        # column, matching how providers read trends L->R.
+        date_columns = sorted(date_columns, key=_parse_column_date_for_sort)
+
+    # If no date columns or single date, build simple table.
+    # Only fall back to a 'Score' placeholder column when caller passed in
+    # flat (non-dated) data — the multi-date path with empty columns is
+    # handled below by rendering a DOS-only table.
+    if not date_columns and not has_per_date_data:
         date_columns = ['Score']
 
     # Split into multiple tables if needed. Only the LAST table
@@ -263,9 +345,15 @@ def _build_formatted_ipss_table(
     # tables, which show purely historical IPSS scores, do not need
     # an empty DOS column repeated.
     tables = []
-    batches = []
-    for i in range(0, len(date_columns), max_dates):
-        batches.append(date_columns[i:i + max_dates])
+    if date_columns:
+        batches = [
+            date_columns[i:i + max_dates]
+            for i in range(0, len(date_columns), max_dates)
+        ]
+    else:
+        # All historical columns were filtered out. Render exactly one
+        # DOS-only table so the provider still has a column to fill in.
+        batches = [[]]
 
     last_idx = len(batches) - 1
     for idx, batch_dates in enumerate(batches):
@@ -406,7 +494,7 @@ def get_empty_ipss_template(visit_date: str = "") -> str:
     col_label = _format_visit_date_for_column(visit_date) if visit_date else "Date"
     # Pad/truncate to 7 chars to fit column width
     col_header = col_label[:7].center(7)
-    return f"""+------------------------+
+    return f"""+-----------------------+
 |         IPSS          |
 +---------------+-------+
 | Symptom       |{col_header}|
