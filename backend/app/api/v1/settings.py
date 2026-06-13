@@ -9,10 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_optional_user, get_current_user
-from app.database.sqlite_models import User, UserPreferences
+from app.database.sqlite_models import User, UserPreferences, UserRule
 from app.database.sqlite_session import get_db
 from app.config import settings
 from cryptography.fernet import Fernet
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
@@ -437,3 +438,126 @@ async def update_settings(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update user settings"
         )
+
+
+# =============================================================================
+# User Rules — directives injected into the Assessment & Plan LLM prompt
+# =============================================================================
+
+
+class UserRuleResponse(BaseModel):
+    """A single user-defined Assessment & Plan rule."""
+    id: int
+    rule_text: str
+    is_active: bool
+    sort_order: int
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserRuleCreate(BaseModel):
+    rule_text: str = Field(..., min_length=1, max_length=2000, description="The rule text to inject into the A&P prompt")
+    is_active: bool = Field(True, description="Whether to apply this rule")
+    sort_order: Optional[int] = Field(None, description="Display/application order; lower = earlier")
+
+
+class UserRuleUpdate(BaseModel):
+    rule_text: Optional[str] = Field(None, min_length=1, max_length=2000)
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+@router.get("/user-rules", response_model=list[UserRuleResponse])
+async def list_user_rules(
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List the authenticated user's Assessment & Plan rules (active + inactive)."""
+    if not current_user:
+        return []
+    stmt = (
+        select(UserRule)
+        .where(UserRule.user_id == current_user.user_id)
+        .order_by(UserRule.sort_order.asc(), UserRule.id.asc())
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.post("/user-rules", response_model=UserRuleResponse, status_code=status.HTTP_201_CREATED)
+async def create_user_rule(
+    payload: UserRuleCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new Assessment & Plan rule for the authenticated user."""
+    # Compute default sort_order = (max + 10) for stable append-at-end semantics.
+    if payload.sort_order is None:
+        max_stmt = select(UserRule).where(UserRule.user_id == current_user.user_id).order_by(UserRule.sort_order.desc()).limit(1)
+        existing = (await db.execute(max_stmt)).scalars().first()
+        next_order = (existing.sort_order + 10) if existing else 0
+    else:
+        next_order = payload.sort_order
+
+    rule = UserRule(
+        user_id=current_user.user_id,
+        rule_text=payload.rule_text.strip(),
+        is_active=payload.is_active,
+        sort_order=next_order,
+    )
+    db.add(rule)
+    await db.commit()
+    await db.refresh(rule)
+    logger.info(f"Created user rule {rule.id} for user {current_user.user_id}")
+    return rule
+
+
+@router.put("/user-rules/{rule_id}", response_model=UserRuleResponse)
+async def update_user_rule(
+    rule_id: int,
+    payload: UserRuleUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update fields on a single user rule. 404 if it does not belong to the caller."""
+    stmt = select(UserRule).where(
+        UserRule.id == rule_id,
+        UserRule.user_id == current_user.user_id,
+    )
+    rule = (await db.execute(stmt)).scalars().first()
+    if not rule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
+
+    if payload.rule_text is not None:
+        rule.rule_text = payload.rule_text.strip()
+    if payload.is_active is not None:
+        rule.is_active = payload.is_active
+    if payload.sort_order is not None:
+        rule.sort_order = payload.sort_order
+
+    await db.commit()
+    await db.refresh(rule)
+    return rule
+
+
+@router.delete("/user-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user_rule(
+    rule_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a single user rule. 404 if it does not belong to the caller."""
+    stmt = select(UserRule).where(
+        UserRule.id == rule_id,
+        UserRule.user_id == current_user.user_id,
+    )
+    rule = (await db.execute(stmt)).scalars().first()
+    if not rule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
+
+    await db.delete(rule)
+    await db.commit()
+    return None

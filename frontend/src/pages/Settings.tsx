@@ -5,8 +5,9 @@ import { Input } from '@/components/common/Input'
 import { Select } from '@/components/common/Select'
 import { Modal } from '@/components/common/Modal'
 import { Textarea } from '@/components/common/Textarea'
-import { settingsApi, llmApi, ragApi } from '@/api'
-import { FiSave, FiRefreshCw, FiLock, FiEye, FiEyeOff, FiCheckCircle, FiEdit3, FiAlertCircle } from 'react-icons/fi'
+import { settingsApi, llmApi, ragApi, userRulesApi } from '@/api'
+import type { UserRule } from '@/api'
+import { FiSave, FiRefreshCw, FiLock, FiEye, FiEyeOff, FiCheckCircle, FiEdit3, FiAlertCircle, FiPlus, FiTrash2, FiX } from 'react-icons/fi'
 import { useAuth } from '@/hooks/useAuth'
 import type { UpdateSettingsRequest } from '@/types/api.types'
 
@@ -121,10 +122,20 @@ export const Settings: React.FC = () => {
   const [isSavingPrompt, setIsSavingPrompt] = useState(false)
   const [promptLastModified, setPromptLastModified] = useState<number | null>(null)
 
+  // Assessment & Plan user-defined rules
+  const [userRules, setUserRules] = useState<UserRule[]>([])
+  const [newRuleText, setNewRuleText] = useState('')
+  const [isLoadingRules, setIsLoadingRules] = useState(false)
+  const [isSavingRule, setIsSavingRule] = useState(false)
+  const [editingRuleId, setEditingRuleId] = useState<number | null>(null)
+  const [editingRuleText, setEditingRuleText] = useState('')
+  const [rulesError, setRulesError] = useState<string | null>(null)
+
   useEffect(() => {
     loadSettings()
     loadSystemPrompt()
     loadAllProviderModels()  // Load models for all providers on mount
+    loadUserRules()
   }, [])
 
   useEffect(() => {
@@ -335,6 +346,87 @@ export const Settings: React.FC = () => {
       alert(`Failed to save system prompt: ${error.response?.data?.detail || error.message}`)
     } finally {
       setIsSavingPrompt(false)
+    }
+  }
+
+  const loadUserRules = async () => {
+    try {
+      setIsLoadingRules(true)
+      setRulesError(null)
+      const rules = await userRulesApi.list()
+      setUserRules(rules)
+    } catch (error: any) {
+      console.error('Error loading user rules:', error)
+      setRulesError(error?.response?.data?.detail || 'Failed to load rules')
+    } finally {
+      setIsLoadingRules(false)
+    }
+  }
+
+  const handleAddUserRule = async () => {
+    const text = newRuleText.trim()
+    if (!text) return
+    try {
+      setIsSavingRule(true)
+      setRulesError(null)
+      const created = await userRulesApi.create({ rule_text: text, is_active: true })
+      setUserRules(prev => [...prev, created])
+      setNewRuleText('')
+    } catch (error: any) {
+      console.error('Error creating rule:', error)
+      setRulesError(error?.response?.data?.detail || 'Failed to create rule')
+    } finally {
+      setIsSavingRule(false)
+    }
+  }
+
+  const handleToggleUserRule = async (rule: UserRule) => {
+    try {
+      const updated = await userRulesApi.update(rule.id, { is_active: !rule.is_active })
+      setUserRules(prev => prev.map(r => (r.id === rule.id ? updated : r)))
+    } catch (error: any) {
+      console.error('Error toggling rule:', error)
+      setRulesError(error?.response?.data?.detail || 'Failed to update rule')
+    }
+  }
+
+  const handleStartEditRule = (rule: UserRule) => {
+    setEditingRuleId(rule.id)
+    setEditingRuleText(rule.rule_text)
+  }
+
+  const handleCancelEditRule = () => {
+    setEditingRuleId(null)
+    setEditingRuleText('')
+  }
+
+  const handleSaveEditRule = async () => {
+    if (editingRuleId === null) return
+    const text = editingRuleText.trim()
+    if (!text) return
+    try {
+      setIsSavingRule(true)
+      const updated = await userRulesApi.update(editingRuleId, { rule_text: text })
+      setUserRules(prev => prev.map(r => (r.id === editingRuleId ? updated : r)))
+      setEditingRuleId(null)
+      setEditingRuleText('')
+    } catch (error: any) {
+      console.error('Error updating rule:', error)
+      setRulesError(error?.response?.data?.detail || 'Failed to update rule')
+    } finally {
+      setIsSavingRule(false)
+    }
+  }
+
+  const handleDeleteUserRule = async (rule: UserRule) => {
+    if (!confirm(`Delete this rule?\n\n"${rule.rule_text}"`)) return
+    try {
+      await userRulesApi.remove(rule.id)
+      setUserRules(prev => prev.filter(r => r.id !== rule.id))
+      if (editingRuleId === rule.id) handleCancelEditRule()
+    } catch (error: any) {
+      console.error('Error deleting rule:', error)
+      setRulesError(error?.response?.data?.detail || 'Failed to delete rule')
     }
   }
 
@@ -972,6 +1064,140 @@ export const Settings: React.FC = () => {
                   </div>
                 </div>
               </div>
+            </div>
+          </Card>
+
+          <Card
+            title="Assessment & Plan Rules"
+            description="Clinician-defined rules injected into the Assessment and Plan LLM prompt. The LLM is instructed to treat each active rule as a hard constraint."
+          >
+            <div className="space-y-3">
+              {rulesError && (
+                <div className="flex items-start gap-2 p-3 rounded bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-800 dark:text-red-200">
+                  <FiAlertCircle className="mt-0.5 flex-shrink-0" />
+                  <span>{rulesError}</span>
+                </div>
+              )}
+
+              {!user && (
+                <div className="p-3 rounded bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 text-sm text-yellow-800 dark:text-yellow-200">
+                  Sign in to create and manage rules.
+                </div>
+              )}
+
+              {isLoadingRules ? (
+                <div className="text-sm text-gray-500 dark:text-gray-400">Loading rules…</div>
+              ) : userRules.length === 0 ? (
+                <div className="text-sm text-gray-500 dark:text-gray-400 italic">
+                  No rules yet. Add one below — for example: "When ordering a TRUS biopsy, also order a urine culture and a rectal swab for quinolone-resistant rectal flora." or "Do not schedule follow-up sooner than 90 days unless urgent."
+                </div>
+              ) : (
+                <ul className="space-y-2">
+                  {userRules.map((rule) => (
+                    <li
+                      key={rule.id}
+                      className={`p-3 rounded border ${
+                        rule.is_active
+                          ? 'bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700'
+                          : 'bg-gray-50 dark:bg-gray-900 border-gray-200 dark:border-gray-700 opacity-60'
+                      }`}
+                    >
+                      {editingRuleId === rule.id ? (
+                        <div className="space-y-2">
+                          <Textarea
+                            value={editingRuleText}
+                            onChange={(e) => setEditingRuleText(e.target.value)}
+                            rows={3}
+                            className="font-mono text-sm"
+                            maxLength={2000}
+                          />
+                          <div className="flex justify-end gap-2">
+                            <Button size="sm" variant="outline" onClick={handleCancelEditRule} icon={<FiX />}>
+                              Cancel
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="primary"
+                              onClick={handleSaveEditRule}
+                              isLoading={isSavingRule}
+                              disabled={!editingRuleText.trim() || isSavingRule}
+                              icon={<FiSave />}
+                            >
+                              Save
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm text-gray-900 dark:text-gray-100 whitespace-pre-wrap break-words">
+                              {rule.rule_text}
+                            </p>
+                            <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                              {rule.is_active ? 'Active' : 'Inactive'} · #{rule.id}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1 flex-shrink-0">
+                            <label className="inline-flex items-center gap-1 text-xs text-gray-600 dark:text-gray-400 cursor-pointer select-none">
+                              <input
+                                type="checkbox"
+                                className="rounded"
+                                checked={rule.is_active}
+                                onChange={() => handleToggleUserRule(rule)}
+                              />
+                              On
+                            </label>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              icon={<FiEdit3 />}
+                              onClick={() => handleStartEditRule(rule)}
+                              aria-label="Edit rule"
+                            >
+                              Edit
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              icon={<FiTrash2 />}
+                              onClick={() => handleDeleteUserRule(rule)}
+                              aria-label="Delete rule"
+                            >
+                              Delete
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {user && (
+                <div className="pt-3 border-t border-gray-200 dark:border-gray-700 space-y-2">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                    Add a new rule
+                  </label>
+                  <Textarea
+                    value={newRuleText}
+                    onChange={(e) => setNewRuleText(e.target.value)}
+                    rows={3}
+                    placeholder='e.g. "When ordering a TRUS biopsy, also order a urine culture and a rectal swab for quinolone-resistant rectal flora."'
+                    className="font-mono text-sm"
+                    maxLength={2000}
+                  />
+                  <div className="flex justify-end">
+                    <Button
+                      onClick={handleAddUserRule}
+                      isLoading={isSavingRule}
+                      disabled={!newRuleText.trim() || isSavingRule}
+                      icon={<FiPlus />}
+                    >
+                      Add Rule
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           </Card>
 

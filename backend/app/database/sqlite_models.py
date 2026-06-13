@@ -192,6 +192,32 @@ class UserPreferences(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), nullable=True)
 
 
+class UserRule(Base):
+    """User-defined rules injected into the Assessment & Plan LLM prompt.
+
+    Each rule is a short natural-language directive (e.g. "When ordering
+    TRUS biopsy, also order a rectal swab for quinolone-resistant bacteria").
+    Rules are loaded by ``LLMConfigManager`` and rendered as a dedicated
+    "USER-DEFINED RULES" section in the Assessment and Plan agent prompts.
+    """
+
+    __tablename__ = "user_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(36), nullable=False, index=True)
+
+    rule_text = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), nullable=True)
+
+    __table_args__ = (
+        Index('ix_user_rules_user_active', 'user_id', 'is_active'),
+    )
+
+
 class TemplateVersion(Base):
     """Template version history."""
 

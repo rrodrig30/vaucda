@@ -24,7 +24,7 @@ silently override the resolved value before sending to the provider.
 import logging
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import httpx
 import json
 
@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database.sqlite_models import UserPreferences
+from app.database.sqlite_models import UserPreferences, UserRule
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +232,11 @@ class LLMTaskConfig:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
 
+    # User-defined directives injected into the Assessment & Plan prompts.
+    # Populated by LLMConfigManager from the user's UserRule rows (active only).
+    # Other task types (OCR, Stage 1) ignore this field.
+    user_rules: List[str] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {
@@ -246,6 +251,7 @@ class LLMTaskConfig:
             "top_p": self.top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "user_rules": list(self.user_rules),
         }
 
 
@@ -294,6 +300,23 @@ class LLMConfigManager:
             else:
                 self._load_from_preferences(prefs)
                 logger.info(f"Loaded LLM configs for user {self.user_id}")
+
+            # Load active user rules and attach to the Stage 2 config so the
+            # Assessment & Plan agents see them via task_config.user_rules.
+            try:
+                rules_stmt = (
+                    select(UserRule)
+                    .where(UserRule.user_id == self.user_id, UserRule.is_active == True)  # noqa: E712
+                    .order_by(UserRule.sort_order.asc(), UserRule.id.asc())
+                )
+                rules_result = await db.execute(rules_stmt)
+                rule_texts = [r.rule_text.strip() for r in rules_result.scalars().all() if r.rule_text and r.rule_text.strip()]
+                if rule_texts and LLMTaskType.STAGE2 in self._configs:
+                    self._configs[LLMTaskType.STAGE2].user_rules = rule_texts
+                    logger.info(f"Loaded {len(rule_texts)} active user rules for Stage 2 A&P")
+            except Exception as rules_err:
+                # Don't fail config load if the rules table is missing or query errors.
+                logger.warning(f"Failed to load user rules for {self.user_id}: {rules_err}")
 
             self._loaded = True
 

@@ -116,6 +116,20 @@ Read the ENTIRE note below carefully. Every section contains information that ma
     if prior_ap_context and prior_ap_context.strip():
         context_parts.append(f"=== PRIOR ASSESSMENT & PLAN CONTEXT ===\n{prior_ap_context}\n")
 
+    # Add user-defined rules (from Settings → Assessment & Plan Rules).
+    # Plan-shaped directives (e.g. "When ordering TRUS Bx, also order rectal swab",
+    # "No follow-up sooner than 90 days unless urgent") apply most strongly here.
+    user_rules = list(getattr(task_config, "user_rules", []) or []) if task_config else []
+    if user_rules:
+        numbered = "\n".join(f"{i+1}. {r}" for i, r in enumerate(user_rules))
+        context_parts.append(
+            "=== USER-DEFINED RULES (MANDATORY — MUST BE FOLLOWED) ===\n"
+            "The following rules were explicitly set by the clinician for THIS deployment.\n"
+            "They override default guideline phrasing and any prior-visit habits.\n"
+            "Apply every rule that is clinically relevant to this patient's plan.\n\n"
+            f"{numbered}\n"
+        )
+
     # If only prior plans and no other context, return the single plan
     if len(all_plans) == 1 and not any([stage1_note, ambient_transcript, calculator_results, rag_content]):
         return all_plans[0]
@@ -158,11 +172,26 @@ CALCULATOR RESULTS:
 - Do NOT state "unable to calculate" or "calculator not provided" for any calculator
 """
 
+    user_rules_directive = ""
+    if user_rules:
+        user_rules_directive = (
+            "\nUSER-DEFINED RULES (HIGHEST PRIORITY — MANDATORY):\n"
+            "Read the 'USER-DEFINED RULES' section above. Every rule listed there was set by the\n"
+            "clinician and is a HARD CONSTRAINT on this plan. Examples of how to apply:\n"
+            "  - If a rule says 'when ordering TRUS biopsy, also order X', and your plan includes\n"
+            "    a TRUS biopsy, you MUST add bullet items ordering X in that same problem block.\n"
+            "  - If a rule says 'no follow-up sooner than N days unless urgent', any follow-up\n"
+            "    interval you write must be >= N days unless the clinical picture is urgent and\n"
+            "    you explicitly note the urgency.\n"
+            "Apply every rule that is relevant. Do NOT silently ignore them.\n"
+        )
+
     instructions = f"""
 You are synthesizing a comprehensive TREATMENT PLAN for a urology patient.
 
 AVAILABLE INFORMATION:
 {full_context}
+{user_rules_directive}
 
 CRITICAL - READ THE CHIEF COMPLAINT FIRST (MANDATORY):
 Look at the "CC:" line in the Stage 1 note. The Chief Complaint is the PRIMARY reason for this visit.

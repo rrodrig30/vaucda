@@ -275,6 +275,18 @@ Read the ENTIRE note below carefully. Every section contains information that ma
     if prior_ap_context and prior_ap_context.strip():
         context_parts.append(f"=== PRIOR ASSESSMENT & PLAN CONTEXT ===\n{prior_ap_context}\n")
 
+    # Add user-defined rules (from Settings → Assessment & Plan Rules).
+    # These are clinician-authored directives that MUST be enforced.
+    user_rules = list(getattr(task_config, "user_rules", []) or []) if task_config else []
+    if user_rules:
+        numbered = "\n".join(f"{i+1}. {r}" for i, r in enumerate(user_rules))
+        context_parts.append(
+            "=== USER-DEFINED RULES (MANDATORY — MUST BE FOLLOWED) ===\n"
+            "The following rules were explicitly set by the clinician for THIS deployment.\n"
+            "They override default behavior. Apply every rule that is relevant to this patient.\n\n"
+            f"{numbered}\n"
+        )
+
     # If only prior assessments and no other context, return the single assessment
     if len(all_assessments) == 1 and not any([stage1_note, ambient_transcript, calculator_results, rag_content]):
         return all_assessments[0]
@@ -373,12 +385,22 @@ CALCULATOR RESULTS:
 - Do NOT state "unable to calculate" or "calculator not provided" for any calculator
 """
 
+    user_rules_directive = ""
+    if user_rules:
+        user_rules_directive = (
+            "\nUSER-DEFINED RULES (HIGHEST PRIORITY — MANDATORY):\n"
+            "Read the 'USER-DEFINED RULES' section above. Every rule listed there was set by the\n"
+            "clinician and must be applied wherever clinically relevant to this patient. These\n"
+            "rules take precedence over general guideline phrasing. Do NOT silently ignore them.\n"
+        )
+
     instructions = f"""
 You are synthesizing a comprehensive clinical ASSESSMENT for a urology patient.
 
 AVAILABLE INFORMATION:
 {full_context}
 {psa_context}
+{user_rules_directive}
 
 TASK:
 Using THIS PATIENT'S specific Chief Complaint, HPI, history, labs, imaging, medications, and surgical history from the Stage 1 note above, create a 4-8 sentence narrative assessment that summarizes the patient's current urologic clinical status.
