@@ -324,15 +324,21 @@ def extract_patient_status_facts(stage1_note: str) -> PatientStatusFacts:
     pathology = extract_section(stage1_note, "PATHOLOGY RESULTS")
     psh = extract_section(stage1_note, "PAST SURGICAL HISTORY") or \
         extract_section(stage1_note, "PSH")
-    hpi = extract_section(stage1_note, "HPI")
 
-    # Search spaces are narrowed deliberately:
-    #   cancer evidence -> PMH + pathology + PSH + HPI
-    #   treatment evidence -> PMH + PSH + HPI (NOT pathology — pathology
-    #     reports never declare a treatment was performed; using them as
-    #     a treatment source produced false positives in testing).
-    cancer_search = "\n".join(filter(None, (pmh, pathology, psh, hpi)))
-    treatment_search = "\n".join(filter(None, (pmh, psh, hpi)))
+    # Search spaces are narrowed to DETERMINISTIC sources only.
+    #   cancer evidence  -> PMH + pathology + PSH
+    #   treatment evidence -> PMH + PSH (NOT pathology — pathology reports
+    #     never declare a treatment was performed; using them as a
+    #     treatment source produced false positives in testing).
+    # HPI is excluded deliberately even though it sits inside the Stage 1
+    # note: the HPI is LLM-synthesized by the upstream HPI agent and
+    # may itself contain confabulated treatments (e.g. "completed
+    # definitive focal therapy"). Reading HPI as ground truth would let
+    # that hallucination flip treatment_naive to False and silently
+    # poison the rest of this layer. The HPI agent has its own
+    # protection (it also receives the authoritative_facts block).
+    cancer_search = "\n".join(filter(None, (pmh, pathology, psh)))
+    treatment_search = "\n".join(filter(None, (pmh, psh)))
 
     cancer_evidence = find_cancer_evidence(cancer_search)
     treatments = find_completed_treatments(treatment_search)
@@ -340,7 +346,7 @@ def extract_patient_status_facts(stage1_note: str) -> PatientStatusFacts:
     biopsy_all_negative = (
         biopsy_count > 0 and neg_count > 0 and not cancer_evidence
     )
-    asap = find_asap(pathology) or find_asap(hpi)
+    asap = find_asap(pathology)
 
     if cancer_evidence:
         status = "TREATED" if treatments else "PRESENT"

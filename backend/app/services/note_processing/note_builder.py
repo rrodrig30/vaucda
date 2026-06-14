@@ -49,6 +49,11 @@ from .extractors.specialty_urologic_scanner import (
     format_cross_specialty_context
 )
 from .visit_progression_analyzer import analyze_visit_progression
+from .patient_status_facts import (
+    extract_patient_status_facts,
+    format_facts_for_prompt,
+    sanitize_context_against_facts,
+)
 from .llm_helper import (
     set_current_task_config,
     get_current_task_config,
@@ -279,6 +284,26 @@ def build_urology_note(
     print(f"      Dietary: {'Found' if document_dietary else 'None'}")
     print(f"      Allergies: {'Found' if document_allergies else 'None'}")
     print(f"      Sexual: {'Found' if document_sexual else 'None'}")
+
+    # Pre-LLM defense layer for the HPI agent.
+    # Compose a deterministic-only Stage 1 stub from the just-extracted
+    # PMH + PSH + pathology and run the fact extractor on it. The HPI
+    # agent receives the rendered ground-truth block at the top of its
+    # context plus an ABSOLUTE-RULES directive in its instructions, and
+    # the prior-context artifacts that get fed into the HPI prompt
+    # (visit_progression / prior_ap_context_for_hpi / cross_specialty)
+    # are sanitized against the verdict to break the feedback loop where
+    # last visit's hallucinated A&P resurfaces as this visit's HPI.
+    _deterministic_stub_for_hpi = (
+        "PAST MEDICAL HISTORY:\n" + (document_pmh or "") + "\n\n"
+        "PAST SURGICAL HISTORY:\n" + (document_psh or "") + "\n\n"
+        "PATHOLOGY RESULTS:\n" + (document_pathology or "") + "\n"
+    )
+    _hpi_patient_facts = extract_patient_status_facts(_deterministic_stub_for_hpi)
+    _hpi_authoritative_facts = format_facts_for_prompt(_hpi_patient_facts)
+    print(f"      Patient facts (for HPI): cancer={_hpi_patient_facts.cancer_status}, "
+          f"naive={_hpi_patient_facts.treatment_naive}, "
+          f"phoenix={_hpi_patient_facts.phoenix_applicable}")
 
     # Step 4: Synthesize all sections
     print("\n[4/5] Synthesizing sections...")
@@ -561,9 +586,24 @@ def build_urology_note(
     _pcp_note_content = pcp_note_content
     _pcp_data = pcp_data
     _prov_uro_context = provider_urologic_context
-    _cross_specialty_context = cross_specialty_context
-    _visit_progression = visit_progression
-    _prior_ap_for_hpi = prior_ap_context_for_hpi
+    # Sanitize prior-derived contexts against the ground-truth facts BEFORE
+    # they reach the HPI synthesis closure. This is the prior-LLM-hallucination
+    # firewall: a previous run's "completed focal therapy" sentence sitting in
+    # the visit_progression analysis or prior_ap_context cannot resurface as
+    # this run's HPI claim if the ground-truth verdict contradicts it.
+    def _sanitize_for_hpi(label: str, text: str) -> str:
+        if not text or not text.strip():
+            return text
+        cleaned, stripped = sanitize_context_against_facts(text, _hpi_patient_facts)
+        for s in stripped:
+            print(f"      ✂ stripped from {label} (HPI input): {s[:140]}")
+        return cleaned
+
+    _cross_specialty_context = _sanitize_for_hpi("cross_specialty_context", cross_specialty_context)
+    _visit_progression = _sanitize_for_hpi("visit_progression", visit_progression)
+    _prior_ap_for_hpi = _sanitize_for_hpi("prior_ap_context_for_hpi", prior_ap_context_for_hpi)
+    _hpi_auth_facts = _hpi_authoritative_facts
+    _hpi_pf = _hpi_patient_facts
 
     _doc_psh_cc = document_psh
     _clinical_doc_cc = clinical_document
@@ -630,6 +670,8 @@ def build_urology_note(
             patient_name=_patient_name_val,
             patient_age=_patient_age_val,
             patient_sex=_patient_sex_val,
+            authoritative_facts=_hpi_auth_facts,
+            patient_facts=_hpi_pf,
         )
 
     synthesis_tasks['cc'] = _build_cc

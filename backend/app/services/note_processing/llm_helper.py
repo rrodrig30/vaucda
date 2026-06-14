@@ -545,7 +545,8 @@ def combine_sections_with_llm(
     section_instances: list,
     instructions: str,
     model: Optional[str] = None,
-    task_config: Optional["LLMTaskConfig"] = None
+    task_config: Optional["LLMTaskConfig"] = None,
+    force_llm: bool = False,
 ) -> str:
     """
     Combine multiple instances of a section using LLM.
@@ -556,6 +557,11 @@ def combine_sections_with_llm(
         instructions: Specific instructions for how to combine
         model: Model name (ignored if task_config provided)
         task_config: Optional LLMTaskConfig for multi-provider routing
+        force_llm: If True, do NOT short-circuit on single-instance input.
+            Callers set this when the LLM must run the instructions even
+            for a single prior note — e.g. the HPI agent uses it so the
+            authoritative-facts enforcement block can rewrite a single
+            contaminated prior HPI rather than passing it through verbatim.
 
     Returns:
         Combined section text
@@ -566,8 +572,9 @@ def combine_sections_with_llm(
     if not valid_instances:
         return ""
 
-    # If only one instance, return it directly
-    if len(valid_instances) == 1:
+    # If only one instance, return it directly UNLESS the caller demands
+    # the LLM run (e.g. to apply authoritative-facts rewriting).
+    if len(valid_instances) == 1 and not force_llm:
         return valid_instances[0]
 
     # Build prompt for LLM
