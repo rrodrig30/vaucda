@@ -29,6 +29,11 @@ from .agents.prior_ap_agent import (
     format_prior_ap_for_plan
 )
 from .extractors import extract_assessment, extract_plan
+from .patient_status_facts import (
+    extract_patient_status_facts,
+    format_facts_for_prompt,
+    sanitize_context_against_facts,
+)
 from .session_manager import get_session_manager, SessionIsolatedFactVerifier
 from .time_template import format_patient_header, get_time_template
 from .visit_progression_analyzer import analyze_visit_progression_stage2
@@ -399,6 +404,59 @@ def build_stage2_note(
     else:
         print("      No non-GU notes provided")
 
+    # Step 1d: Pre-LLM defense layer.
+    # Build a deterministic ground-truth verdict from the Stage 1 note,
+    # then sanitize every downstream context artifact (prior assessments
+    # / plans / visit progression / prior A&P context / cross-specialty
+    # context) by stripping sentences that contradict the verdict. This
+    # breaks the prior-LLM-hallucination feedback loop: a prior visit's
+    # "completed focal therapy" confabulation cannot resurface in this
+    # visit's Assessment because it gets stripped before transmission.
+    print("\n[1d/6] Extracting authoritative patient status facts...")
+    patient_facts = extract_patient_status_facts(stage1_note)
+    authoritative_facts = format_facts_for_prompt(patient_facts)
+    print(f"      Cancer status:    {patient_facts.cancer_status}")
+    print(f"      Treatment naive:  {patient_facts.treatment_naive}")
+    print(f"      Phoenix applic.:  {patient_facts.phoenix_applicable}")
+    print(f"      Biopsy count:     {patient_facts.biopsy_count} "
+          f"(all-negative={patient_facts.biopsy_all_negative})")
+    print(f"      ASAP present:     {patient_facts.asap_present}")
+    if patient_facts.confirmed_urologic_treatments:
+        print(f"      Confirmed Tx:     "
+              f"{patient_facts.confirmed_urologic_treatments[:3]}")
+    if patient_facts.cancer_evidence:
+        print(f"      Cancer evidence: {patient_facts.cancer_evidence[:3]}")
+    if patient_facts.inconsistencies:
+        for inc in patient_facts.inconsistencies:
+            print(f"      ⚠ INCONSISTENCY: {inc}")
+
+    def _sanitize_one(label: str, text: str) -> str:
+        if not text or not text.strip():
+            return text
+        cleaned, stripped = sanitize_context_against_facts(text, patient_facts)
+        for s in stripped:
+            print(f"      ✂ stripped from {label}: {s[:140]}")
+        return cleaned
+
+    prior_assessments = [
+        _sanitize_one(f"prior_assessment_{i}", a)
+        for i, a in enumerate(prior_assessments or [])
+    ]
+    prior_plans = [
+        _sanitize_one(f"prior_plan_{i}", p)
+        for i, p in enumerate(prior_plans or [])
+    ]
+    visit_progression = _sanitize_one("visit_progression", visit_progression)
+    prior_ap_context_for_assessment = _sanitize_one(
+        "prior_ap_context_for_assessment", prior_ap_context_for_assessment
+    )
+    prior_ap_context_for_plan = _sanitize_one(
+        "prior_ap_context_for_plan", prior_ap_context_for_plan
+    )
+    cross_specialty_context = _sanitize_one(
+        "cross_specialty_context", cross_specialty_context
+    )
+
     # Step 2: Synthesize Assessment
     print("\n[2/6] Synthesizing Assessment (clinical impression)...")
     assessment = synthesize_assessment(
@@ -411,7 +469,8 @@ def build_stage2_note(
         task_config=task_config,  # Pass full task_config for multi-provider LLM support
         visit_progression=visit_progression,
         cross_specialty_context=cross_specialty_context,
-        prior_ap_context=prior_ap_context_for_assessment
+        prior_ap_context=prior_ap_context_for_assessment,
+        authoritative_facts=authoritative_facts,
     )
     print(f"      Assessment: {len(assessment) if assessment else 0} chars")
 
@@ -457,7 +516,8 @@ def build_stage2_note(
         task_config=task_config,  # Pass full task_config for multi-provider LLM support
         visit_progression=visit_progression,
         cross_specialty_context=cross_specialty_context,
-        prior_ap_context=prior_ap_context_for_plan
+        prior_ap_context=prior_ap_context_for_plan,
+        authoritative_facts=authoritative_facts,
     )
     print(f"      Plan: {len(plan) if plan else 0} chars")
 

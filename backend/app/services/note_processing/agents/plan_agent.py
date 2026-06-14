@@ -30,7 +30,8 @@ def synthesize_plan(
     task_config: Optional["LLMTaskConfig"] = None,
     visit_progression: Optional[str] = None,
     cross_specialty_context: Optional[str] = None,
-    prior_ap_context: Optional[str] = None
+    prior_ap_context: Optional[str] = None,
+    authoritative_facts: Optional[str] = None,
 ) -> str:
     """
     Synthesize treatment plan for Stage 2 (post-visit).
@@ -63,6 +64,14 @@ def synthesize_plan(
 
     # Build comprehensive context for LLM synthesis
     context_parts = []
+
+    # AUTHORITATIVE GROUND TRUTH must appear FIRST so the LLM treats every
+    # subsequent context block as subordinate to it. This block is built
+    # deterministically by patient_status_facts and lists the verdicts
+    # (cancer status, treatment-naive status, Phoenix applicability) plus
+    # explicit ABSOLUTE RULES the LLM must follow.
+    if authoritative_facts and authoritative_facts.strip():
+        context_parts.append(authoritative_facts + "\n")
 
     # Add Stage 1 note context (if provided) - THIS IS THE PRIMARY PATIENT DATA
     if stage1_note and stage1_note.strip():
@@ -186,11 +195,34 @@ CALCULATOR RESULTS:
             "Apply every rule that is relevant. Do NOT silently ignore them.\n"
         )
 
+    authoritative_directive = ""
+    if authoritative_facts:
+        authoritative_directive = (
+            "\n=== AUTHORITATIVE GROUND TRUTH ENFORCEMENT (READ THIS FIRST) ===\n"
+            "The FIRST context block above (titled 'PATIENT GROUND TRUTH') was\n"
+            "derived deterministically from the source documents. It is the\n"
+            "single source of truth for this patient's cancer status, treatment\n"
+            "history, and whether Phoenix biochemical-recurrence vocabulary is\n"
+            "applicable. The ABSOLUTE RULES listed at the end of that block are\n"
+            "non-negotiable. If your plan contains ANY phrase forbidden by those\n"
+            "rules, your answer is wrong.\n"
+            "\n"
+            "In particular: if TREATMENT_NAIVE is True, the patient has NEVER\n"
+            "received prostate-cancer treatment. Do NOT title any problem\n"
+            "'Biochemical recurrence', 'Rising PSA after <treatment>', or\n"
+            "'Salvage therapy'. Do NOT recommend salvage / post-treatment\n"
+            "interventions. For rising PSA in such a patient, the appropriate\n"
+            "Problem #1 framing is 'Episodic PSA elevation' or 'Elevated PSA,\n"
+            "workup' with plan to repeat PSA, free/total PSA, and consider\n"
+            "MRI / biopsy per AUA.\n"
+        )
+
     instructions = f"""
 You are synthesizing a comprehensive TREATMENT PLAN for a urology patient.
 
 AVAILABLE INFORMATION:
 {full_context}
+{authoritative_directive}
 {user_rules_directive}
 
 CRITICAL - READ THE CHIEF COMPLAINT FIRST (MANDATORY):

@@ -179,7 +179,8 @@ def synthesize_assessment(
     task_config: Optional["LLMTaskConfig"] = None,
     visit_progression: Optional[str] = None,
     cross_specialty_context: Optional[str] = None,
-    prior_ap_context: Optional[str] = None
+    prior_ap_context: Optional[str] = None,
+    authoritative_facts: Optional[str] = None,
 ) -> str:
     """
     Synthesize clinical assessment for Stage 2 (post-visit).
@@ -211,6 +212,14 @@ def synthesize_assessment(
 
     # Build comprehensive context for LLM synthesis
     context_parts = []
+
+    # AUTHORITATIVE GROUND TRUTH must appear FIRST so the LLM treats every
+    # subsequent context block as subordinate to it. This block is built
+    # deterministically by patient_status_facts and lists the verdicts
+    # (cancer status, treatment-naive status, Phoenix applicability) plus
+    # explicit ABSOLUTE RULES the LLM must follow.
+    if authoritative_facts and authoritative_facts.strip():
+        context_parts.append(authoritative_facts + "\n")
 
     # ROOT CAUSE #3 FIX: Add structured lab interpretation BEFORE Stage 1 note
     # This provides clear, unambiguous lab values to prevent LLM hallucinations
@@ -394,12 +403,32 @@ CALCULATOR RESULTS:
             "rules take precedence over general guideline phrasing. Do NOT silently ignore them.\n"
         )
 
+    authoritative_directive = ""
+    if authoritative_facts:
+        authoritative_directive = (
+            "\n=== AUTHORITATIVE GROUND TRUTH ENFORCEMENT (READ THIS FIRST) ===\n"
+            "The FIRST context block above (titled 'PATIENT GROUND TRUTH') was\n"
+            "derived deterministically from the source documents. It is the\n"
+            "single source of truth for this patient's cancer status, treatment\n"
+            "history, and whether Phoenix biochemical-recurrence vocabulary is\n"
+            "applicable. The ABSOLUTE RULES listed at the end of that block are\n"
+            "non-negotiable. If your output contains ANY phrase forbidden by\n"
+            "those rules, your answer is wrong.\n"
+            "\n"
+            "In particular: if TREATMENT_NAIVE is True, the patient has NEVER\n"
+            "received prostate-cancer treatment. Do NOT invent any. If\n"
+            "PROSTATE_CANCER_STATUS is ABSENT, the patient has NO cancer\n"
+            "diagnosis. Do NOT diagnose one. Rising PSA in such a patient is a\n"
+            "workup question for new disease, not biochemical recurrence.\n"
+        )
+
     instructions = f"""
 You are synthesizing a comprehensive clinical ASSESSMENT for a urology patient.
 
 AVAILABLE INFORMATION:
 {full_context}
 {psa_context}
+{authoritative_directive}
 {user_rules_directive}
 
 TASK:
