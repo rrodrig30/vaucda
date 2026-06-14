@@ -20,11 +20,19 @@ def synthesize_imaging(document_imaging: str, gu_notes: List[Dict[str, str]]) ->
     Returns:
         Summarized imaging results in reverse chronological order
     """
+    # Document-level extraction wins when available. extract_imaging()
+    # already produces the canonical "STUDY (DATE):\nIMPRESSION: ..."
+    # format with cross-note dedup and reverse-chronological sort. Feeding
+    # this PLUS each gu_note's per-note "Imaging" field to the LLM
+    # combiner produced an output where the LLM kept "Impression: ..."
+    # lines but dropped every study-name and date header — turning a
+    # 4-study clinical record into four anonymous impressions. The
+    # document-level extractor already aggregates across all source notes,
+    # so the per-note path is redundant when it succeeds.
+    if document_imaging and document_imaging.strip():
+        return document_imaging
+
     all_imaging = []
-
-    if document_imaging:
-        all_imaging.append(document_imaging)
-
     for note in gu_notes:
         if note.get("Imaging"):
             all_imaging.append(note["Imaging"])

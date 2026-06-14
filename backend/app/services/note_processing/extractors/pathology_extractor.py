@@ -306,18 +306,45 @@ def extract_prostate_biopsy(clinical_document: str) -> str:
         summary_parts.extend(core_results)
         all_biopsies.append('\n'.join(summary_parts))
 
-    # Deduplicate: if same biopsy appears twice (e.g., repeated in input), keep unique
+    # Deduplicate. Two passes:
+    # 1. Exact-core-text dedup: identical biopsies repeated verbatim in the
+    #    source collapse to one.
+    # 2. Per-date dedup: when two biopsies share a date but differ in
+    #    granularity (e.g. an 11-core per-specimen breakdown alongside a
+    #    "Left / Right negative" summary of the SAME report), keep the
+    #    block with the most core lines — the per-specimen detail is the
+    #    clinically useful one. The summary form is dropped.
     seen = set()
     unique_biopsies = []
     for biopsy in all_biopsies:
-        # Use the core results portion for comparison (skip date which may differ slightly)
         lines = biopsy.split('\n')
         core_key = '\n'.join(sorted(lines[1:])) if len(lines) > 1 else biopsy
         if core_key not in seen:
             seen.add(core_key)
             unique_biopsies.append(biopsy)
 
-    return '\n\n'.join(unique_biopsies)
+    def _biopsy_date_and_detail(b: str) -> tuple:
+        first = b.split('\n', 1)[0]
+        m = re.match(r'^(\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}/\d{4})\s+', first)
+        date = m.group(1) if m else ""
+        core_lines = sum(1 for ln in b.split('\n')[1:] if ln.strip().startswith('-'))
+        return date, core_lines
+
+    by_date: dict = {}
+    dateless = []
+    for b in unique_biopsies:
+        date, detail = _biopsy_date_and_detail(b)
+        if not date:
+            dateless.append(b)
+            continue
+        # Keep the entry with more core lines; ties broken by length.
+        if date not in by_date or detail > by_date[date][1] or (
+            detail == by_date[date][1] and len(b) > len(by_date[date][0])
+        ):
+            by_date[date] = (b, detail)
+
+    deduped = [b for b, _ in by_date.values()] + dateless
+    return '\n\n'.join(deduped)
 
 
 def extract_turbt_pathology(clinical_document: str) -> str:
@@ -890,6 +917,24 @@ def extract_pathology(clinical_document: str) -> str:
             if not diagnosis or len(diagnosis) < 5:
                 continue
 
+            # Skip if the captured "diagnosis" is actually the FDA / lab-
+            # disclaimer paragraph that rides along with IHC stain reports.
+            # The DIAGNOSIS regex can grab this paragraph when the real
+            # diagnosis ends with an unfortunate phrase and the disclaimer
+            # text follows without a clean section break. Detection: the
+            # text starts with (or is mostly composed of) the canonical
+            # disclaimer phrasings rather than a clinical finding.
+            _disclaimer_markers = (
+                'determined by the Anatomic Pathology Laboratory',
+                'has not been cleared or approved',
+                'IHC test was developed',
+                'IHC study was developed',
+                'premarket FDA review',
+            )
+            _diag_head = diagnosis[:200].lower()
+            if any(m.lower() in _diag_head for m in _disclaimer_markers):
+                continue
+
             # Skip if diagnosis is just punctuation or whitespace
             if re.match(r'^[\s\.\,\;\:\-\*]+$', diagnosis):
                 continue
@@ -907,6 +952,19 @@ def extract_pathology(clinical_document: str) -> str:
                     line.startswith('-' * 5),  # Dash separators
                     line.startswith('=' * 5),  # Equals separators
                     not line,  # Empty lines
+                    # FDA / lab-disclaimer boilerplate. This text rides
+                    # along with IHC stain reports as a regulatory
+                    # footer and contains zero clinical information.
+                    # Without these filters the disclaimer paragraph
+                    # gets emitted as a phantom "diagnosis" entry —
+                    # often twice — for every report that had IHC.
+                    'determined by the Anatomic Pathology Laboratory' in line,
+                    'has not been cleared or approved' in line,
+                    'Food and Drug Administration' in line.lower(),
+                    'premarket FDA review' in line,
+                    'this test is used for' in line.lower(),
+                    'IHC test was developed' in line,
+                    'performance characteristics' in line,
                     re.match(r'^[\.\,\;\:\-\*\s]+$', line),  # Lines with only punctuation
                     'OPERATIVE FINDINGS' in line.upper(),
                     'POSTOPERATIVE DIAGNOSIS' in line.upper(),
