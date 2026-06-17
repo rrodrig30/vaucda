@@ -636,6 +636,10 @@ def build_urology_note(
             document_psa=_doc_psa,
             document_psh=_doc_psh_cc,
             clinical_document=_clinical_doc_cc,
+            current_phase=_hpi_pf.current_phase if _hpi_pf else None,
+            current_active_treatments=(
+                _hpi_pf.current_active_treatments if _hpi_pf else None
+            ),
         )
 
     def _build_hpi():

@@ -447,6 +447,82 @@ def _reframe_post_treatment_cc(
     return f"Follow-up for biochemical recurrence after {label} for prostate cancer"
 
 
+def _phase_driven_cc(
+    current_phase: Optional[str],
+    current_active_treatments: Optional[List[str]],
+) -> Optional[str]:
+    """Generate a CC directly from the deterministic phase verdict.
+
+    Phase-driven CCs are clinically correct by construction: when the
+    timeline + phase classifier say the patient is on mCRPC combination
+    therapy, the CC must say so — regardless of what stale prior-visit
+    CCs are floating around. This bypasses the LLM-combine path that
+    has been producing wrong CCs like "Follow-up for prostate cancer on
+    ADT with rising PSA" for a patient whose PSA is actually falling.
+
+    Returns None for phases where the CC depends on more nuanced context
+    (TREATMENT_NAIVE / POST_TREATMENT_SURVEILLANCE / UNCERTAIN) — the
+    existing logic handles those well.
+    """
+    if not current_phase:
+        return None
+
+    def _has(meds_keyword: str) -> bool:
+        if not current_active_treatments:
+            return False
+        kw = meds_keyword.lower()
+        return any(kw in m.lower() for m in current_active_treatments)
+
+    has_ar = any(_has(k) for k in ("abiraterone", "enzalutamide", "apalutamide", "darolutamide"))
+    has_adt = any(_has(k) for k in ("eligard", "leuprolide", "lupron", "degarelix"))
+
+    if current_phase == "METASTATIC_CASTRATION_RESISTANT":
+        bits = []
+        if has_adt:
+            bits.append("Eligard/ADT")
+        if has_ar:
+            ar_names = []
+            if _has("abiraterone"):
+                ar_names.append("abiraterone")
+            if _has("enzalutamide"):
+                ar_names.append("enzalutamide")
+            if _has("apalutamide"):
+                ar_names.append("apalutamide")
+            if _has("darolutamide"):
+                ar_names.append("darolutamide")
+            if ar_names:
+                bits.append(" + ".join(ar_names))
+        suffix = f" on {' + '.join(bits)}" if bits else ""
+        return f"Follow-up of metastatic castration-resistant prostate cancer{suffix}"
+
+    if current_phase == "METASTATIC_HORMONE_SENSITIVE":
+        suffix = " on ADT" if has_adt else ""
+        if has_ar:
+            suffix += " with AR-pathway intensification"
+        return f"Follow-up of metastatic prostate cancer{suffix}"
+
+    if current_phase == "SALVAGE_OR_RESTART":
+        return "Follow-up after restart of androgen-deprivation therapy for prostate cancer"
+
+    if current_phase == "BIOCHEMICAL_RECURRENCE":
+        return "Evaluation of biochemical recurrence after prior treatment for prostate cancer"
+
+    if current_phase == "ON_INITIAL_TREATMENT":
+        if has_adt and has_ar:
+            return "Follow-up during ADT and AR-pathway therapy for prostate cancer"
+        if has_adt:
+            return "Follow-up during androgen-deprivation therapy for prostate cancer"
+        return "Follow-up during treatment for prostate cancer"
+
+    if current_phase == "PROGRESSION":
+        return "Follow-up of prostate cancer with disease progression on prior therapy"
+
+    # POST_TREATMENT_SURVEILLANCE / TREATMENT_NAIVE / UNCERTAIN — let the
+    # existing logic handle these; they depend on more context than the
+    # phase verdict alone.
+    return None
+
+
 def synthesize_cc(
     gu_notes: List[Dict[str, str]],
     non_gu_notes: List[Dict[str, str]],
@@ -455,6 +531,8 @@ def synthesize_cc(
     document_psa: Optional[str] = None,
     document_psh: Optional[str] = None,
     clinical_document: Optional[str] = None,
+    current_phase: Optional[str] = None,
+    current_active_treatments: Optional[List[str]] = None,
 ) -> str:
     """Synthesize a urology Chief Complaint.
 
@@ -493,6 +571,20 @@ def synthesize_cc(
         Non-empty urologic CC string. Never "" — falls back to
         "Urology follow-up" as the final safety net.
     """
+    # Phase-driven CC short-circuit. When the deterministic phase
+    # classifier has a high-confidence verdict (mCRPC, mHSPC, salvage,
+    # biochemical recurrence, on-initial-treatment, progression), the CC
+    # is computed directly from the phase + active treatments. This
+    # bypasses the LLM-combine path that was producing stale CCs like
+    # "Follow-up for prostate cancer on ADT with rising PSA" for a
+    # patient now on mCRPC combination therapy whose PSA is actually
+    # responding. The post-treatment-surveillance / treatment-naive /
+    # uncertain phases fall through to the existing logic which handles
+    # them well.
+    phase_cc = _phase_driven_cc(current_phase, current_active_treatments)
+    if phase_cc:
+        return _apply_terminology(phase_cc)
+
     # Pre-compute treatment + PSA signals once; the reframe step uses
     # both regardless of which extraction path produced the CC.
     treatment = _detect_treatment_history(document_psh, clinical_document)

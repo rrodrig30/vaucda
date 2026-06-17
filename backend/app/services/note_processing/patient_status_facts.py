@@ -579,6 +579,38 @@ class PatientStatusFacts:
     inconsistencies: List[str] = field(default_factory=list)
     """Source-internal contradictions surfaced for the provider."""
 
+    clinical_timeline: List["TimelineEvent"] = field(default_factory=list)
+    """Chronologically-sorted dated clinical events extracted from raw
+    source text. Includes DIAGNOSIS, TREATMENT_STARTED / COMPLETED /
+    RESTARTED / DECLINED, PATHOLOGY, IMAGING, PROCEDURE (cystoscopy /
+    urodynamics / biopsy / TURBT / DEXA / etc.), STAGING_DECISION
+    (mCRPC / mHSPC / biochemical recurrence). The CC / HPI / Assessment /
+    Plan agents anchor their narrative to this timeline so events that
+    happened at different times (e.g. ADT completed 04/2025, then
+    RESTARTED 03/2026 for mCRPC) are not averaged into a single static
+    'on ADT' or 'off ADT' frame."""
+
+    current_phase: str = "UNCERTAIN"
+    """Deterministic disease/treatment-phase verdict from the timeline.
+    One of: TREATMENT_NAIVE | ON_INITIAL_TREATMENT |
+    POST_TREATMENT_SURVEILLANCE | BIOCHEMICAL_RECURRENCE |
+    SALVAGE_OR_RESTART | METASTATIC_HORMONE_SENSITIVE |
+    METASTATIC_CASTRATION_RESISTANT | PROGRESSION | UNCERTAIN.
+    Surfaces in the GROUND TRUTH block to steer the narrative arc.
+    mCRPC verdict in particular tells the Plan agent that ADT is
+    indefinite — preventing the 'no further ADT is planned' error."""
+
+    current_active_treatments: List[str] = field(default_factory=list)
+    """Meds the patient is currently taking, anchored to the most-recent
+    medications list in the source. Used by the Plan agent so it does
+    not drop a continuing med (Eligard / abiraterone / prednisone) from
+    the continuation list."""
+
+    procedure_findings: List["ProcedureFinding"] = field(default_factory=list)
+    """Key findings from urologic procedures (cystoscopy, urodynamics,
+    biopsy, TURBT, DEXA, etc.). Surfaced separately because these were
+    frequently missed by synthesis agents despite being decision-driving."""
+
     treatment_active_status: Dict[str, str] = field(default_factory=dict)
     """Per-category current-status verdict for the HPI agent. Categories:
     'adt' (DISCONTINUED | ACTIVE), 'radiation'/'prostatectomy'/'focal'
@@ -704,6 +736,28 @@ def extract_patient_status_facts(
             active_search, confirmed_treatments=treatments,
         )
 
+    # Clinical timeline + phase classifier + current active treatments
+    # + procedure findings. Built from the raw clinician text so the
+    # CC/HPI/Assessment/Plan agents see a structured chronological view
+    # of the patient rather than having to infer ordering from prose.
+    # Lazy import keeps patient_status_facts importable in isolation.
+    timeline: List = []
+    current_phase = "UNCERTAIN"
+    active_meds: List[str] = []
+    proc_findings: List = []
+    raw_for_timeline = raw_clinical_text or stage1_note or ""
+    if raw_for_timeline:
+        from .clinical_timeline import (
+            extract_clinical_timeline,
+            classify_current_phase,
+            detect_current_active_treatments,
+            extract_procedure_findings,
+        )
+        timeline = extract_clinical_timeline(raw_for_timeline)
+        current_phase = classify_current_phase(timeline)
+        active_meds = detect_current_active_treatments(raw_for_timeline)
+        proc_findings = extract_procedure_findings(raw_for_timeline)
+
     return PatientStatusFacts(
         cancer_status=status,
         cancer_evidence=cancer_evidence,
@@ -715,6 +769,10 @@ def extract_patient_status_facts(
         asap_present=asap,
         inconsistencies=inconsistencies,
         treatment_active_status=treatment_active,
+        clinical_timeline=timeline,
+        current_phase=current_phase,
+        current_active_treatments=active_meds,
+        procedure_findings=proc_findings,
     )
 
 
@@ -899,6 +957,55 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
                 "recent injection date from the source before writing "
                 "'continues on' / 'remains on'."
             )
+
+    # Clinical phase + current active treatments + timeline + procedure
+    # findings. These four sections are the structured-state foundation
+    # the synthesis agents must anchor to.
+    if facts.current_phase and facts.current_phase != "UNCERTAIN":
+        lines.append("")
+        lines.append(f"CURRENT_PHASE: {facts.current_phase}")
+        from .clinical_timeline import phase_guidance
+        for ln in phase_guidance(facts.current_phase).split(". "):
+            ln = ln.strip()
+            if ln:
+                lines.append(f"  -> {ln.rstrip('.')}.")
+
+    if facts.current_active_treatments:
+        lines.append("")
+        lines.append("CURRENT_ACTIVE_TREATMENTS (last-known-active per source):")
+        for med in facts.current_active_treatments[:8]:
+            lines.append(f"  - {med}")
+        lines.append(
+            "  Note: the Plan MUST keep every continuing med listed above on "
+            "the patient's regimen unless the source explicitly documents "
+            "discontinuation."
+        )
+
+    if facts.clinical_timeline:
+        lines.append("")
+        lines.append("CLINICAL_TIMELINE (chronologically-sorted dated events):")
+        from .clinical_timeline import format_timeline_for_prompt
+        for ln in format_timeline_for_prompt(facts.clinical_timeline, limit=25).split("\n"):
+            lines.append(ln)
+        lines.append(
+            "  The HPI narrative MUST walk this timeline in order. Each treatment "
+            "event the HPI mentions must trace to a TREATMENT_* entry above. Do "
+            "NOT collapse multiple distinct dated events into one (e.g. an ADT "
+            "course completed 04/2025 AND an ADT RESTARTED 03/2026 are TWO "
+            "separate events and must both appear in the narrative)."
+        )
+
+    if facts.procedure_findings:
+        lines.append("")
+        lines.append("KEY_PROCEDURE_FINDINGS (often missed by synthesis — surface these):")
+        from .clinical_timeline import format_procedures_for_prompt
+        for ln in format_procedures_for_prompt(facts.procedure_findings, limit=12).split("\n"):
+            lines.append(ln)
+        lines.append(
+            "  Cystoscopy, urodynamics, biopsy / pathology, TURBT, and DEXA "
+            "findings drive clinical decisions. The Assessment and Plan MUST "
+            "reference these by date when relevant — do not omit them."
+        )
 
     lines.append("")
     lines.append(f"PHOENIX_CRITERIA_APPLICABLE: {facts.phoenix_applicable}")
