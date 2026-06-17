@@ -299,7 +299,15 @@ def build_urology_note(
         "PAST SURGICAL HISTORY:\n" + (document_psh or "") + "\n\n"
         "PATHOLOGY RESULTS:\n" + (document_pathology or "") + "\n"
     )
-    _hpi_patient_facts = extract_patient_status_facts(_deterministic_stub_for_hpi)
+    # Pass the raw clinical_document too. This catches treatments that are
+    # documented only in narrative HPI / prior-Assessment / problem-list
+    # text — the most common shape for radiation and ADT histories. The
+    # raw scanner is gated by strict prostate-cancer co-occurrence rules
+    # so dermatology cryotherapy etc. cannot trip it.
+    _hpi_patient_facts = extract_patient_status_facts(
+        _deterministic_stub_for_hpi,
+        raw_clinical_text=clinical_document,
+    )
     _hpi_authoritative_facts = format_facts_for_prompt(_hpi_patient_facts)
     print(f"      Patient facts (for HPI): cancer={_hpi_patient_facts.cancer_status}, "
           f"naive={_hpi_patient_facts.treatment_naive}, "

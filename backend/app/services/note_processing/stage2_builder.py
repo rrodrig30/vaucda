@@ -413,7 +413,26 @@ def build_stage2_note(
     # "completed focal therapy" confabulation cannot resurface in this
     # visit's Assessment because it gets stripped before transmission.
     print("\n[1d/6] Extracting authoritative patient status facts...")
-    patient_facts = extract_patient_status_facts(stage1_note)
+    # Stitch raw clinician-written text from all source notes (GU + non-GU).
+    # Each note's HPI / Assessment / Plan fields hold the clinician's
+    # original prose where treatment status often lives ("Problem #1:
+    # prostate adenocarcinoma, status post radiation therapy and ADT").
+    # Passing this raw text to the fact extractor catches treatments that
+    # PMH alone (often just "Prostate cancer" as a bare entry) does not
+    # capture. The raw scanner is gated by strict prostate-cancer
+    # co-occurrence rules, so unrelated cross-specialty mentions cannot
+    # produce false-positive treatment detections.
+    _raw_for_facts_parts: List[str] = []
+    for n in (gu_notes or []) + list(non_gu_notes or []):
+        for key in ("HPI", "Assessment", "Plan", "PMH"):
+            v = n.get(key) if isinstance(n, dict) else None
+            if v:
+                _raw_for_facts_parts.append(v)
+    _raw_for_facts = "\n\n".join(_raw_for_facts_parts)
+    patient_facts = extract_patient_status_facts(
+        stage1_note,
+        raw_clinical_text=_raw_for_facts or None,
+    )
     authoritative_facts = format_facts_for_prompt(patient_facts)
     print(f"      Cancer status:    {patient_facts.cancer_status}")
     print(f"      Treatment naive:  {patient_facts.treatment_naive}")

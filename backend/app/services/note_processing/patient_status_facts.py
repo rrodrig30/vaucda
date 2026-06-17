@@ -217,6 +217,178 @@ def find_completed_treatments(text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Raw clinical-document treatment-status scanner.
+#
+# The PMH + PSH + pathology search above is intentionally conservative —
+# it ignores narrative text because LLM-synthesized HPI / Assessment
+# content can contain confabulated treatments. The cost of that
+# conservatism: when the clinician writes the treatment history ONLY in
+# the narrative ("...subsequently received high-dose radiation therapy in
+# Atlanta...", "Problem #1: prostate adenocarcinoma, status post
+# radiation therapy and intermittent ADT..."), the verdict comes back as
+# TREATMENT_NAIVE=True. The downstream ABSOLUTE-RULES block then tells
+# the LLM to NOT mention radiation / Phoenix / recurrence — actively
+# suppressing real clinical history. This is the failure mode the
+# scanner below closes.
+#
+# Safety: the scanner ONLY emits a treatment when an explicit completion
+# verb + treatment word sit inside a prostate-cancer context window. A
+# stray "cryotherapy of actinic keratoses" (dermatology) does NOT match
+# because no prostate-cancer marker sits within ±300 chars of it.
+# ---------------------------------------------------------------------------
+
+# Markers that signal we're in a prostate-cancer paragraph. Any one of
+# these within ±300 chars of a treatment match licenses the match.
+_PROSTATE_CONTEXT_RE = re.compile(
+    r"(?:\bprostate\s+(?:cancer|adenocarcinoma|carcinoma|Ca|CaP)\b|"
+    r"\bprostatic\s+adenocarcinoma\b|"
+    r"\bGleason\b|\bGrade\s+Group\b|\bGG[1-5]\b|"
+    r"\bCAPRA\b|\bD[''`]Amico\b)",
+    re.IGNORECASE,
+)
+
+# Wide completion-verb vocabulary used only inside the raw-text scanner.
+# Adds verbs that the conservative PMH/PSH search omits ("initiated",
+# "started", "began", "opted for", "treated with", "is on", "was on",
+# "has been on", "history of") because in narrative text those reliably
+# mark a real prior treatment.
+_WIDE_COMPLETION_VERB_RE = re.compile(
+    r"(?:s/p|status\s+post|underwent|completed|received|"
+    r"following|after|prior|"
+    r"initiated|started|began|opted\s+for|treated\s+with|"
+    r"is\s+(?:on|s/p)|was\s+(?:on|s/p)|has\s+been\s+on|history\s+of(?!\s+no))",
+    re.IGNORECASE,
+)
+
+# Treatment-keyword patterns scanned in raw clinical text. Each requires
+# a wide completion verb within 80 chars BEFORE the keyword AND a
+# prostate-cancer context marker within ±300 chars (verified separately).
+_RAW_TREATMENT_TOKENS: Tuple[str, ...] = (
+    # Radiation (any form). Pattern allows "high-dose radiation",
+    # "definitive radiation", "external beam radiation", "XRT", "EBRT",
+    # "radiation therapy", or bare "radiation" — but only when a wide
+    # completion verb sits before it.
+    r"(?:high[\-\s]?dose\s+|definitive\s+|external\s+beam\s+|"
+    r"intensity[\-\s]?modulated\s+)?radiation(?:\s+therapy)?",
+    r"\bXRT\b",
+    r"\bEBRT\b",
+    r"\bIMRT\b",
+    r"\bSBRT\b",
+    r"\bIGRT\b",
+    r"\bbrachytherapy\b",
+    r"seed\s+implant(?:ation)?",
+    # Surgery
+    r"radical\s+prostatectomy",
+    r"\bprostatectomy\b",
+    r"\bRALP\b",
+    r"\bRARP\b",
+    r"\bRRP\b",
+    # ADT / hormonal
+    r"androgen\s+deprivation(?:\s+therapy)?",
+    r"\bADT\b",
+    r"\bleuprolide\b",
+    r"\bLupron\b",
+    r"\bEligard\b",
+    r"\bdegarelix\b",
+    r"\babiraterone\b",
+    r"\benzalutamide\b",
+    r"\bapalutamide\b",
+    r"\bdarolutamide\b",
+    # Focal
+    r"focal\s+(?:therapy|ablation|cryoablation|cryotherapy|laser\s+ablation)",
+    r"\bHIFU\b",
+    r"\bTULSA(?:-PRO)?\b",
+)
+
+# Treatment effect / atypia markers that imply prior radiation even
+# without a co-located completion verb (the pathologist commenting on
+# "post-radiation atypia" is direct evidence radiation occurred).
+_POST_RADIATION_EVIDENCE_RE = re.compile(
+    r"(?:post[\-\s]?radiation|radiation)\s+(?:atypia|effect|change|fibrosis)|"
+    r"treatment\s+effect[^.]{0,30}(?:radiation|XRT|EBRT)",
+    re.IGNORECASE,
+)
+
+
+def _in_prostate_context(text: str, match_pos: int, window: int = 300) -> bool:
+    """True if a prostate-cancer marker appears within ±window chars."""
+    snippet = text[max(0, match_pos - window):match_pos + window]
+    return bool(_PROSTATE_CONTEXT_RE.search(snippet))
+
+
+def find_treatment_in_raw_clinical_text(text: str) -> List[str]:
+    """Scan raw clinician-written clinical text for prostate-cancer
+    treatment-status statements.
+
+    Returns quoted assertions (e.g. "underwent prior radiation therapy",
+    "initiated androgen deprivation therapy with Eligard"). The list is
+    non-empty only when the patient has documented prior urologic cancer
+    treatment.
+
+    Safety guards (all must hold for a match):
+      1. A wide completion verb sits within 80 chars BEFORE the treatment
+         keyword (filters "considering radiation", "options include
+         brachytherapy", "discussion of focal therapy").
+      2. The match is not preceded by a negation token ("no", "denies",
+         "declined", "refused").
+      3. The match falls inside a prostate-cancer context window
+         (filters dermatology cryotherapy, stone-cryoablation, etc.).
+    """
+    if not text:
+        return []
+
+    declined_re = re.compile(
+        r"\b(?:declined|declines|refuses|refused|deferred|not\s+a\s+candidate)\b",
+        re.IGNORECASE,
+    )
+
+    found: List[str] = []
+    for tx_pattern in _RAW_TREATMENT_TOKENS:
+        for m in re.finditer(tx_pattern, text, re.IGNORECASE):
+            if _preceded_by_negation(text, m.start()):
+                continue
+            # Wide completion verb within 80 chars BEFORE the match.
+            preceding_80 = text[max(0, m.start() - 80):m.start()]
+            if not _WIDE_COMPLETION_VERB_RE.search(preceding_80):
+                continue
+            # Reject "declined / refused / deferred" in the same window
+            # (these mean the patient did NOT receive the treatment).
+            if declined_re.search(preceding_80):
+                continue
+            # Require prostate-cancer context within ±300 chars.
+            if not _in_prostate_context(text, m.start()):
+                continue
+            # Capture a readable quote: from the completion verb to the
+            # end of the treatment keyword.
+            verb_match = _WIDE_COMPLETION_VERB_RE.search(preceding_80)
+            quote_start = max(0, m.start() - 80) + (verb_match.start() if verb_match else 0)
+            quote = text[quote_start:m.end()].strip()
+            quote = re.sub(r"\s+", " ", quote)
+            found.append(quote)
+
+    # Direct evidence of past radiation via post-radiation atypia in a
+    # pathology specimen. The pathologist describing "viable tumor with
+    # no radiation atypia" or "post-radiation atypia in non-neoplastic
+    # cells" is reporting on tissue from a patient who definitely had
+    # radiation.
+    for m in _POST_RADIATION_EVIDENCE_RE.finditer(text):
+        if _preceded_by_negation(text, m.start()):
+            continue
+        if not _in_prostate_context(text, m.start()):
+            continue
+        found.append(f"pathology cites {m.group(0)!r}")
+
+    # Dedup while preserving first-seen order
+    seen, deduped = set(), []
+    for q in found:
+        k = q.lower().strip()
+        if k and k not in seen:
+            seen.add(k)
+            deduped.append(q)
+    return deduped
+
+
+# ---------------------------------------------------------------------------
 # Biopsy / ASAP detection
 # ---------------------------------------------------------------------------
 _BIOPSY_HEADER_RE = re.compile(
@@ -307,14 +479,28 @@ class PatientStatusFacts:
     """Source-internal contradictions surfaced for the provider."""
 
 
-def extract_patient_status_facts(stage1_note: str) -> PatientStatusFacts:
-    """Compute deterministic ground-truth facts from the Stage 1 note.
+def extract_patient_status_facts(
+    stage1_note: str,
+    raw_clinical_text: Optional[str] = None,
+) -> PatientStatusFacts:
+    """Compute deterministic ground-truth facts from clinical sources.
 
-    The Stage 1 note is the authoritative source. We deliberately do NOT
-    scan raw input documents here — that's where dermatology cryotherapy
-    and other cross-specialty noise lives, and the whole point of this
-    layer is to avoid the LLM seeing those tokens as if they were part of
-    the urologic story.
+    Args:
+        stage1_note: The structured Stage 1 note text (PMH, PSH, pathology
+            sections deterministically extracted). This is the conservative
+            search space.
+        raw_clinical_text: Optional raw clinician-written document. When
+            provided, the function additionally scans it for explicit
+            prior-treatment-status statements in narrative HPI / Assessment
+            / Problem-list text. Matches require BOTH a wide completion
+            verb adjacent to the treatment keyword AND a prostate-cancer
+            context marker within ±300 chars, which filters dermatology /
+            stone / other-specialty noise. Pass the raw input whenever
+            available — without it, patients whose only treatment record
+            lives in narrative ("underwent high-dose radiation in Atlanta")
+            will be mis-classified as treatment-naive and the downstream
+            ABSOLUTE-RULES block will actively suppress correct clinical
+            framing.
     """
     if not stage1_note:
         return PatientStatusFacts(cancer_status="UNCERTAIN")
@@ -342,6 +528,27 @@ def extract_patient_status_facts(stage1_note: str) -> PatientStatusFacts:
 
     cancer_evidence = find_cancer_evidence(cancer_search)
     treatments = find_completed_treatments(treatment_search)
+
+    # Raw clinical-document augmentation. The PMH/PSH/pathology search
+    # above is conservative; treatments described only in narrative
+    # ("Problem #1: prostate cancer s/p radiation", "received Eligard in
+    # November 2023") would be missed. The raw scanner closes that gap
+    # using strict co-occurrence requirements that filter cross-specialty
+    # noise. Run only when raw_clinical_text was supplied; merge findings
+    # into the treatment list.
+    if raw_clinical_text:
+        raw_treatments = find_treatment_in_raw_clinical_text(raw_clinical_text)
+        for t in raw_treatments:
+            if t.lower() not in {x.lower() for x in treatments}:
+                treatments.append(t)
+        # Also broaden cancer-evidence pickup: an explicit prostate-cancer
+        # diagnosis in the raw narrative (e.g. prior assessment problem
+        # list) is reliable ground truth that PMH may have logged only as
+        # the bare phrase "Prostate cancer".
+        for ev in find_cancer_evidence(raw_clinical_text):
+            if ev.lower() not in {x.lower() for x in cancer_evidence}:
+                cancer_evidence.append(ev)
+
     biopsy_count, neg_count = count_biopsies_and_negatives(pathology)
     biopsy_all_negative = (
         biopsy_count > 0 and neg_count > 0 and not cancer_evidence
@@ -359,8 +566,14 @@ def extract_patient_status_facts(stage1_note: str) -> PatientStatusFacts:
     else:
         status = "UNCERTAIN"
 
+    # Phoenix criteria apply post-radiation. Match any radiation phrasing
+    # the raw-text scanner might produce: bare "radiation", "high-dose
+    # radiation", "external beam", IMRT/SBRT/IGRT/XRT, brachytherapy,
+    # plus pathology-cited post-radiation atypia (which directly evidences
+    # prior radiation even when treatment history wasn't otherwise stated).
     radiation_re = re.compile(
-        r"(?:radiation\s+therapy|EBRT|IMRT|SBRT|IGRT|XRT|brachytherapy)",
+        r"(?:radiation|EBRT|IMRT|SBRT|IGRT|XRT|brachytherapy|"
+        r"seed\s+implant|post[\-\s]?radiation\s+atypia)",
         re.IGNORECASE,
     )
     phoenix = any(radiation_re.search(t) for t in treatments)
