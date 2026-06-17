@@ -32,6 +32,7 @@ def synthesize_plan(
     cross_specialty_context: Optional[str] = None,
     prior_ap_context: Optional[str] = None,
     authoritative_facts: Optional[str] = None,
+    assessment_text: Optional[str] = None,
 ) -> str:
     """
     Synthesize treatment plan for Stage 2 (post-visit).
@@ -72,6 +73,22 @@ def synthesize_plan(
     # explicit ABSOLUTE RULES the LLM must follow.
     if authoritative_facts and authoritative_facts.strip():
         context_parts.append(authoritative_facts + "\n")
+
+    # The Assessment was just generated immediately before this Plan call.
+    # It contains the clinical reasoning AND the recommendation set the
+    # Assessment narrative ends on (e.g. "recommend MRI in 6-12 months",
+    # "continue surveillance with PSA in 3 months"). The Plan MUST be
+    # congruent with those recommendations — diverging produces a clinical
+    # note whose Assessment and Plan disagree (Assessment says MRI 6-12 mo,
+    # Plan says MRI + biopsy now) and that is a real provider-trust bug.
+    # Surface the Assessment text up front so the Plan LLM treats it as
+    # the contract its Problem #N items must implement.
+    if assessment_text and assessment_text.strip():
+        context_parts.append(
+            "=== ASSESSMENT NARRATIVE (your Plan MUST be congruent with this) ===\n"
+            + assessment_text.strip()
+            + "\n=== END ASSESSMENT NARRATIVE ===\n"
+        )
 
     # Add Stage 1 note context (if provided) - THIS IS THE PRIMARY PATIENT DATA
     if stage1_note and stage1_note.strip():
@@ -217,12 +234,55 @@ CALCULATOR RESULTS:
             "MRI / biopsy per AUA.\n"
         )
 
+    assessment_congruence_directive = ""
+    if assessment_text and assessment_text.strip():
+        assessment_congruence_directive = (
+            "\n=== CONGRUENCE WITH THE ASSESSMENT (MANDATORY) ===\n"
+            "The 'ASSESSMENT NARRATIVE' block above is the clinical reasoning\n"
+            "produced for THIS same visit moments ago. Your Plan is the\n"
+            "actionable form of the same decisions the Assessment describes.\n"
+            "They MUST agree.\n"
+            "\n"
+            "Hard rules:\n"
+            "  1. Every workup / imaging / biopsy / referral / medication / \n"
+            "     follow-up interval named in the Assessment MUST appear in\n"
+            "     the Plan, with the SAME interval and SAME scope. If the\n"
+            "     Assessment says 'mpMRI in 6-12 months' the Plan says 'mpMRI\n"
+            "     in 6-12 months' — NOT 'mpMRI now' and NOT 'mpMRI plus\n"
+            "     biopsy'.\n"
+            "  2. The Plan MUST NOT introduce a new test, treatment, or\n"
+            "     referral that the Assessment did not name or imply. If the\n"
+            "     Assessment is silent about biopsy, the Plan does not\n"
+            "     recommend biopsy. If the Assessment recommends 'continue\n"
+            "     surveillance', the Plan recommends 'continue surveillance'\n"
+            "     — not 'restart ADT' or 'order PSMA-PET'.\n"
+            "  3. The Plan MAY add operational detail to what the Assessment\n"
+            "     names — exact dose, exact follow-up date, billing-correct\n"
+            "     test name, ordering provider, instruction wording — but it\n"
+            "     may NOT change the CLINICAL DECISION.\n"
+            "  4. If the Assessment recommends an interval (e.g. 'in 6\n"
+            "     months') and the Plan needs to state a date, compute the\n"
+            "     date from the visit date and the Assessment's interval.\n"
+            "     Do not substitute a different interval.\n"
+            "  5. Treatment-status / cancer-status framing in your Plan MUST\n"
+            "     match the Assessment exactly. If the Assessment frames\n"
+            "     rising PSA as 'episodic elevation, workup' do NOT title\n"
+            "     Problem #1 'biochemical recurrence'. If the Assessment\n"
+            "     frames the patient as TREATMENT-NAIVE do NOT plan salvage.\n"
+            "  6. If, while drafting the Plan, you believe the Assessment\n"
+            "     missed a clinically necessary recommendation, you still\n"
+            "     follow the Assessment. The Plan is NOT the place to\n"
+            "     correct the Assessment. (Provider review will catch any\n"
+            "     real gap during signoff.)\n"
+        )
+
     instructions = f"""
 You are synthesizing a comprehensive TREATMENT PLAN for a urology patient.
 
 AVAILABLE INFORMATION:
 {full_context}
 {authoritative_directive}
+{assessment_congruence_directive}
 {user_rules_directive}
 
 CRITICAL - READ THE CHIEF COMPLAINT FIRST (MANDATORY):

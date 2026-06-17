@@ -422,10 +422,16 @@ def build_stage2_note(
     # capture. The raw scanner is gated by strict prostate-cancer
     # co-occurrence rules, so unrelated cross-specialty mentions cannot
     # produce false-positive treatment detections.
+    # identify_notes() returns each note with keys 'title', 'date',
+    # 'content' — 'content' is the full raw note text from the clinician.
+    # Also fall back to the per-section keys (HPI, Assessment, Plan, PMH)
+    # in case downstream code populates those forms.
     _raw_for_facts_parts: List[str] = []
     for n in (gu_notes or []) + list(non_gu_notes or []):
-        for key in ("HPI", "Assessment", "Plan", "PMH"):
-            v = n.get(key) if isinstance(n, dict) else None
+        if not isinstance(n, dict):
+            continue
+        for key in ("content", "HPI", "Assessment", "Plan", "PMH"):
+            v = n.get(key)
             if v:
                 _raw_for_facts_parts.append(v)
     _raw_for_facts = "\n\n".join(_raw_for_facts_parts)
@@ -537,6 +543,11 @@ def build_stage2_note(
         cross_specialty_context=cross_specialty_context,
         prior_ap_context=prior_ap_context_for_plan,
         authoritative_facts=authoritative_facts,
+        # Pass the just-generated Assessment so the Plan can be congruent
+        # with the recommendations the Assessment narrative makes. Without
+        # this the two sections drift (e.g. Assessment says "MRI 6-12
+        # months", Plan says "MRI + biopsy").
+        assessment_text=assessment,
     )
     print(f"      Plan: {len(plan) if plan else 0} chars")
 
