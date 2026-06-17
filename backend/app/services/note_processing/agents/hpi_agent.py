@@ -629,6 +629,67 @@ STRUCTURE:
    the same facts (PSA value, treatments, labs) — that pattern is
    the most common reason this HPI gets sent back for rewrite.
 
+TEMPORAL ANCHORING (MANDATORY — every clinical event needs a date):
+- Every PSA value, biopsy result, imaging study, and treatment event MUST
+  carry an explicit date (month + year, or year if month is unknown).
+  Bad: "subsequent MRI demonstrated...". Good: "MRI in April 2025
+  demonstrated...". Bad: "recent biopsy showed Gleason 4+3". Good:
+  "July 2023 biopsy showed Gleason 4+3".
+- The words "recent", "recently", "lately", and "just" are FORBIDDEN as
+  descriptors of any finding more than 6 months before today's visit.
+  An MRI from 2023 is not "recent" in 2026. State the date instead.
+- "Recent" is acceptable ONLY for events within the last ~3 months
+  AND only when an explicit date follows or has just been stated.
+- Use one consistent date format throughout the narrative (e.g. always
+  "Sep 2023" or always "September 2023" — do not mix).
+- Group findings by recency: TODAY's symptoms and current PSA → present
+  tense; events from the past 3-6 months → past tense with date; older
+  diagnostic / staging / treatment events → past tense with month-year.
+
+CURRENT vs PRIOR TREATMENT (MANDATORY — read TREATMENT_ACTIVE_STATUS):
+- If the GROUND TRUTH block lists a CURRENT_TREATMENT_STATUS section,
+  every treatment claim you make MUST match its verdict.
+- 'DISCONTINUED' for ADT/hormonal therapy means the patient is NOT
+  currently receiving it. You MUST NOT write "remains on ADT",
+  "continues on ADT", "continuous androgen deprivation therapy", or
+  "currently on Eligard/Lupron/leuprolide" for such a patient. Correct
+  framings: "previously received [N months/years] of ADT and elected
+  against restart in favor of monitoring", "completed a course of ADT
+  in [year]", "off ADT since [date]", "intermittent ADT, most recent
+  injection [month year]".
+- 'COMPLETED' for radiation / prostatectomy / focal therapy means the
+  event is in the past — frame as "status post" or "completed in [year]".
+  Do NOT write "is undergoing radiation" or "remains on focal therapy".
+- 'ACTIVE' means treatment is currently being administered — confirm with
+  the most recent dose/injection date in the source before asserting
+  "continues on" / "remains on".
+
+INTERNAL CONSISTENCY (MANDATORY — no self-contradiction):
+- Read your draft and ensure no two sentences contradict each other.
+  Do NOT say "on continuous ADT" in one sentence and "transitioned to
+  intermittent" / "declined ADT restart" in another. Pick the framing
+  supported by the most recent source statement and stick to it.
+- Do NOT both apply Phoenix criteria and state the patient is on
+  surveillance with no biochemical recurrence (the latter is consistent
+  with Phoenix-not-met; the former implies recurrence). Pick one
+  reading and present it cleanly.
+- If a treatment is listed as DISCONTINUED above, your entire narrative
+  must speak of it in the past tense. Do not slip "currently on" or
+  "remains on" anywhere — including the final summary clause.
+
+POST-TREATMENT NARRATIVE ARC (for TREATED patients only):
+When the patient has CANCER_STATUS=TREATED, structure the HPI as:
+  1. One opening sentence anchoring the diagnosis (year, Gleason/Grade
+     Group, key tumor characteristics from source).
+  2. Treatment history with dates: what was performed, when, and the
+     current status (ACTIVE / DISCONTINUED / COMPLETED) of each.
+  3. Post-treatment trajectory: PSA arc with dated values, surveillance
+     imaging with dates, and the patient's documented preferences /
+     decisions.
+  4. Today's reason for visit and current symptom set.
+- Each beat should flow into the next chronologically. No backward
+  jumps that re-state earlier facts.
+
 NON-REDUNDANCY (MANDATORY — output is rejected if violated):
 - Each clinically distinct fact appears EXACTLY ONCE. If a PSA value
   (e.g. "0.22 ng/mL"), a treatment ("monthly Degarelix injections"),

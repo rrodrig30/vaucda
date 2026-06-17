@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -389,6 +389,107 @@ def find_treatment_in_raw_clinical_text(text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Treatment current/discontinued status detection.
+#
+# A confirmed prior treatment is not the same thing as a currently active
+# one. Hormonal therapy in particular can be intermittent: the patient
+# received an LHRH agonist in November 2023, took the last injection in
+# May 2024, then "declined restart in favor of monitoring." Without this
+# distinction, the HPI agent writes "He remains on continuous androgen
+# deprivation therapy" — directly contradicting the source. The detector
+# below identifies the most common discontinuation language so the
+# downstream prompt can frame each treatment category correctly.
+# ---------------------------------------------------------------------------
+_ADT_DISCONTINUED_RE = re.compile(
+    r"(?:declined|declines|refused|refuses|elected\s+against|opted\s+against|"
+    r"opt(?:ed)?\s+for\s+monitoring|favor\s+of\s+monitoring|"
+    r"transition(?:ed)?\s+to\s+monitoring|"
+    r"discontinued|stopped|held|off|"
+    r"completed)\s+"
+    r"(?:.{0,40}?)?"
+    r"(?:repeat\s+|restart\s+|further\s+)?"
+    r"(?:ADT|androgen\s+deprivation|Lupron|Eligard|leuprolide|degarelix)",
+    re.IGNORECASE,
+)
+_ADT_DISCONTINUED_BY_FOLLOWING_RE = re.compile(
+    r"(?:ADT|androgen\s+deprivation|Lupron|Eligard|leuprolide|degarelix)\s+"
+    r"(?:.{0,40}?)?"
+    r"(?:was\s+discontinued|was\s+stopped|was\s+held|was\s+completed|"
+    r"is\s+off|now\s+off|currently\s+off|holiday|"
+    r"declined\s+(?:restart|repeat)|elected\s+against\s+(?:restart|repeat))",
+    re.IGNORECASE,
+)
+_ADT_ACTIVE_RE = re.compile(
+    r"(?:currently\s+on|continues?\s+on|ongoing|monthly|every\s+\d+\s+months?|"
+    r"q\d+\s+month)\s+"
+    r"(?:.{0,30}?)?"
+    r"(?:ADT|androgen\s+deprivation|Lupron|Eligard|leuprolide|degarelix)",
+    re.IGNORECASE,
+)
+
+
+def _detect_treatment_active_status(
+    raw_text: str,
+    confirmed_treatments: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Return per-category treatment status verdict.
+
+    Only categories backed by at least one entry in ``confirmed_treatments``
+    are emitted — this prevents false positives from template / checkbox
+    text ("Radical prostatectomy: [ ]") or option-list discussions
+    ("treatment options include focal therapy") that the upstream
+    treatment validator already filtered out.
+
+    Categories: 'adt', 'radiation', 'prostatectomy', 'focal', 'chemo'.
+    Verdicts: 'ACTIVE' | 'DISCONTINUED' | 'COMPLETED' | 'UNCERTAIN'.
+    """
+    out: Dict[str, str] = {}
+    if not raw_text:
+        return out
+    if not confirmed_treatments:
+        return out
+    joined = "\n".join(confirmed_treatments).lower()
+
+    # ADT — explicit discontinuation language dominates over active language.
+    # Only emit a verdict when a confirmed ADT-class treatment was detected.
+    if re.search(
+        r"\b(?:adt|androgen\s+deprivation|leuprolide|lupron|eligard|"
+        r"degarelix|abiraterone|enzalutamide|apalutamide|darolutamide)\b",
+        joined,
+    ):
+        has_adt_discontinued = bool(
+            _ADT_DISCONTINUED_RE.search(raw_text)
+            or _ADT_DISCONTINUED_BY_FOLLOWING_RE.search(raw_text)
+        )
+        has_adt_active = bool(_ADT_ACTIVE_RE.search(raw_text))
+        if has_adt_discontinued:
+            out['adt'] = 'DISCONTINUED'
+        elif has_adt_active:
+            out['adt'] = 'ACTIVE'
+        else:
+            out['adt'] = 'UNCERTAIN'
+
+    # One-time treatments — confirmed-list membership IS the COMPLETED signal.
+    if re.search(
+        r"\b(?:radiation|xrt|ebrt|imrt|sbrt|igrt|brachytherapy|"
+        r"seed\s+implant)\b",
+        joined,
+    ):
+        out['radiation'] = 'COMPLETED'
+    if re.search(r"\b(?:radical\s+)?prostatectomy|\bralp\b|\brarp\b|\brrp\b",
+                 joined):
+        out['prostatectomy'] = 'COMPLETED'
+    if re.search(
+        r"\bfocal\s+(?:therapy|ablation|cryoablation|cryotherapy|laser\s+ablation)|"
+        r"\bhifu\b|\btulsa\b",
+        joined,
+    ):
+        out['focal'] = 'COMPLETED'
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Biopsy / ASAP detection
 # ---------------------------------------------------------------------------
 _BIOPSY_HEADER_RE = re.compile(
@@ -477,6 +578,14 @@ class PatientStatusFacts:
 
     inconsistencies: List[str] = field(default_factory=list)
     """Source-internal contradictions surfaced for the provider."""
+
+    treatment_active_status: Dict[str, str] = field(default_factory=dict)
+    """Per-category current-status verdict for the HPI agent. Categories:
+    'adt' (DISCONTINUED | ACTIVE), 'radiation'/'prostatectomy'/'focal'
+    (COMPLETED if present). Empty when no treatments detected. The HPI
+    prompt uses this to distinguish 'remains on continuous ADT' (wrong
+    when status is DISCONTINUED) from the correct 'previously received
+    ADT and elected against restart in favor of monitoring' framing."""
 
 
 def extract_patient_status_facts(
@@ -585,6 +694,16 @@ def extract_patient_status_facts(
             " but pathology shows no cancer evidence."
         )
 
+    # Per-category current-vs-discontinued verdict. Computed from raw
+    # clinical text + the already-validated treatments list so checkbox /
+    # template / option-list mentions cannot trip a false COMPLETED.
+    treatment_active = {}
+    if treatments:
+        active_search = raw_clinical_text or stage1_note
+        treatment_active = _detect_treatment_active_status(
+            active_search, confirmed_treatments=treatments,
+        )
+
     return PatientStatusFacts(
         cancer_status=status,
         cancer_evidence=cancer_evidence,
@@ -595,6 +714,7 @@ def extract_patient_status_facts(
         biopsy_all_negative=biopsy_all_negative,
         asap_present=asap,
         inconsistencies=inconsistencies,
+        treatment_active_status=treatment_active,
     )
 
 
@@ -745,6 +865,40 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
             lines.append(f"    - {tx}")
     else:
         lines.append("  No confirmed prior urologic treatments in the source.")
+
+    if facts.treatment_active_status:
+        lines.append("")
+        lines.append("CURRENT_TREATMENT_STATUS (per category):")
+        # Stable display order for readability
+        for cat in ("radiation", "prostatectomy", "focal", "adt", "chemo"):
+            verdict = facts.treatment_active_status.get(cat)
+            if not verdict:
+                continue
+            human = {
+                "radiation": "Radiation",
+                "prostatectomy": "Prostatectomy",
+                "focal": "Focal therapy",
+                "adt": "Androgen-deprivation therapy",
+                "chemo": "Chemotherapy",
+            }[cat]
+            lines.append(f"  {human}: {verdict}")
+        # ADT-specific guidance because the active/discontinued distinction
+        # is what most commonly trips the LLM.
+        if facts.treatment_active_status.get("adt") == "DISCONTINUED":
+            lines.append(
+                "    -> Frame ADT as PRIOR therapy that has been discontinued. "
+                "Do NOT write 'remains on ADT', 'continues on ADT', or "
+                "'currently on androgen deprivation therapy'. The correct "
+                "framing is 'previously received ADT' or 'completed a course "
+                "of ADT' or 'declined ADT restart in favor of monitoring' — "
+                "whichever phrasing the source supports."
+            )
+        elif facts.treatment_active_status.get("adt") == "ACTIVE":
+            lines.append(
+                "    -> ADT appears to be ongoing. Confirm with the most "
+                "recent injection date from the source before writing "
+                "'continues on' / 'remains on'."
+            )
 
     lines.append("")
     lines.append(f"PHOENIX_CRITERIA_APPLICABLE: {facts.phoenix_applicable}")
