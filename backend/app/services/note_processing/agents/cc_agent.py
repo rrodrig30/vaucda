@@ -517,9 +517,100 @@ def _phase_driven_cc(
     if current_phase == "PROGRESSION":
         return "Follow-up of prostate cancer with disease progression on prior therapy"
 
-    # POST_TREATMENT_SURVEILLANCE / TREATMENT_NAIVE / UNCERTAIN — let the
-    # existing logic handle these; they depend on more context than the
-    # phase verdict alone.
+    # POST_TREATMENT_SURVEILLANCE: name the prior modality (radiation /
+    # prostatectomy / focal therapy / brachytherapy) when the timeline
+    # can identify it from the most recent COMPLETED treatment event.
+    if current_phase == "POST_TREATMENT_SURVEILLANCE":
+        # Modality inference is done by the caller via the patient_facts
+        # timeline; here we return the templated baseline and let the
+        # caller's reframe-step append modality detail if available.
+        return "Follow-up for prostate cancer surveillance after prior treatment"
+
+    # TREATMENT_NAIVE / UNCERTAIN — fall through to the existing logic
+    # which derives the CC from PMH / pathology / PSA candidates plus the
+    # multi-CC reconciliation path.
+    return None
+
+
+# Mapping of (PMH keyword regex, canonical CC phrase) — ordered by
+# clinical priority. The first match wins. Used for TREATMENT_NAIVE
+# patients where there is no prior cancer-directed therapy to anchor
+# the CC and we need to derive it from the primary urologic concern.
+_TX_NAIVE_CC_RULES: Tuple[Tuple[str, str], ...] = (
+    (r"\bhematuria\b", "Follow-up for hematuria"),
+    (r"\belevated\s+PSA\b|\brising\s+PSA\b|\bPSA\s+elevation\b",
+     "Follow-up for elevated PSA"),
+    (r"\b(?:bladder|urothelial)\s+cancer\b|\bTCC\b",
+     "Follow-up for bladder cancer"),
+    (r"\b(?:renal|kidney)\s+(?:mass|cell|cancer)\b|\bRCC\b",
+     "Follow-up for renal mass"),
+    (r"\b(?:nephrolithiasis|urolithiasis|kidney\s+stone|renal\s+stone)\b",
+     "Follow-up for nephrolithiasis"),
+    (r"\b(?:BPH|benign\s+prostatic\s+hyperplasia|LUTS|lower\s+urinary\s+tract|"
+     r"outflow\s+obstruction)\b",
+     "Follow-up for benign prostatic hyperplasia and lower urinary tract symptoms"),
+    (r"\b(?:overactive\s+bladder|OAB|urgency\s+incontinence|"
+     r"urge\s+incontinence)\b",
+     "Follow-up for overactive bladder"),
+    (r"\b(?:stress\s+incontinence|SUI|urinary\s+incontinence)\b",
+     "Follow-up for urinary incontinence"),
+    (r"\b(?:erectile\s+dysfunction|ED)\b",
+     "Follow-up for erectile dysfunction"),
+    (r"\b(?:recurrent\s+UTI|chronic\s+UTI|urinary\s+tract\s+infection)\b",
+     "Follow-up for recurrent urinary tract infection"),
+    (r"\bvaricocele\b", "Follow-up for varicocele"),
+    (r"\bhypogonadism\b|\blow\s+testosterone\b",
+     "Follow-up for hypogonadism"),
+    (r"\bperonie\w*\s+disease\b", "Follow-up for Peyronie's disease"),
+    (r"\b(?:male\s+)?infertility\b|\bsemen\s+analysis\b",
+     "Follow-up for male infertility"),
+)
+
+
+def _most_recent_completed_modality(timeline: List) -> Optional[str]:
+    """Identify the most recent definitive treatment for naming in the
+    POST_TREATMENT_SURVEILLANCE CC. Maps the raw modality token to a
+    human-readable phrase.
+    """
+    if not timeline:
+        return None
+
+    def _canon(m: str) -> Optional[str]:
+        s = (m or "").lower()
+        if "radiation" in s or s in ("xrt", "ebrt", "imrt", "sbrt", "igrt"):
+            return "radiation therapy"
+        if "brachytherapy" in s or "seed" in s:
+            return "brachytherapy"
+        if "prostatectomy" in s or s in ("ralp", "rarp", "rrp"):
+            return "radical prostatectomy"
+        if "focal" in s or s in ("hifu", "tulsa"):
+            return "focal therapy"
+        return None
+
+    # Walk events latest-first
+    best: Optional[Tuple[str, str]] = None
+    for e in timeline:
+        if getattr(e, "event_type", "") != "TREATMENT_COMPLETED":
+            continue
+        canon = _canon(getattr(e, "modality", ""))
+        if not canon:
+            continue
+        dk = getattr(e, "date_key", "") or ""
+        if best is None or dk > best[0]:
+            best = (dk, canon)
+    return best[1] if best else None
+
+
+def _treatment_naive_cc_from_pmh(document_pmh: str) -> Optional[str]:
+    """Derive a CC for a treatment-naive patient from PMH + pathology
+    keywords. Returns None when no recognizable urologic primary
+    concern is present (the caller falls back to the existing path).
+    """
+    if not document_pmh:
+        return None
+    for pattern, cc in _TX_NAIVE_CC_RULES:
+        if re.search(pattern, document_pmh, re.IGNORECASE):
+            return cc
     return None
 
 
@@ -533,6 +624,7 @@ def synthesize_cc(
     clinical_document: Optional[str] = None,
     current_phase: Optional[str] = None,
     current_active_treatments: Optional[List[str]] = None,
+    clinical_timeline: Optional[List] = None,
 ) -> str:
     """Synthesize a urology Chief Complaint.
 
@@ -583,7 +675,27 @@ def synthesize_cc(
     # them well.
     phase_cc = _phase_driven_cc(current_phase, current_active_treatments)
     if phase_cc:
+        # For POST_TREATMENT_SURVEILLANCE, prefer to name the specific
+        # modality (radiation / prostatectomy / focal / brachytherapy)
+        # when the timeline lets us identify the most recent COMPLETED
+        # treatment. The phase CC alone says "after prior treatment";
+        # naming the modality makes the CC clinically informative.
+        if current_phase == "POST_TREATMENT_SURVEILLANCE" and clinical_timeline:
+            mod = _most_recent_completed_modality(clinical_timeline)
+            if mod:
+                phase_cc = f"Follow-up for prostate cancer surveillance after {mod}"
         return _apply_terminology(phase_cc)
+
+    # TREATMENT_NAIVE: derive the CC from the primary urologic concern
+    # in PMH. This bypasses the LLM-combine path for the common cases
+    # (BPH, elevated PSA workup, nephrolithiasis, ED, hematuria) where
+    # the source notes' prior CCs frequently drift toward stale or
+    # unrelated complaints. When PMH does not contain a recognizable
+    # urologic concern, fall through to the existing logic.
+    if current_phase == "TREATMENT_NAIVE":
+        naive_cc = _treatment_naive_cc_from_pmh(document_pmh or "")
+        if naive_cc:
+            return _apply_terminology(naive_cc)
 
     # Pre-compute treatment + PSA signals once; the reframe step uses
     # both regardless of which extraction path produced the CC.

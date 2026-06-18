@@ -181,6 +181,7 @@ def synthesize_assessment(
     cross_specialty_context: Optional[str] = None,
     prior_ap_context: Optional[str] = None,
     authoritative_facts: Optional[str] = None,
+    hpi_skeleton: Optional[str] = None,
 ) -> str:
     """
     Synthesize clinical assessment for Stage 2 (post-visit).
@@ -220,6 +221,12 @@ def synthesize_assessment(
     # explicit ABSOLUTE RULES the LLM must follow.
     if authoritative_facts and authoritative_facts.strip():
         context_parts.append(authoritative_facts + "\n")
+
+    # PHASE 2.1: The HPI was just rendered from this same skeleton.
+    # Surface it here so the Assessment uses the same chronological view
+    # and same current-regimen list — no drift between sections.
+    if hpi_skeleton and hpi_skeleton.strip():
+        context_parts.append(hpi_skeleton + "\n")
 
     # ROOT CAUSE #3 FIX: Add structured lab interpretation BEFORE Stage 1 note
     # This provides clear, unambiguous lab values to prevent LLM hallucinations
@@ -422,6 +429,45 @@ CALCULATOR RESULTS:
             "workup question for new disease, not biochemical recurrence.\n"
         )
 
+    skeleton_directive = ""
+    if hpi_skeleton and hpi_skeleton.strip():
+        skeleton_directive = (
+            "\n=== HPI SKELETON ALIGNMENT (MANDATORY) ===\n"
+            "An HPI STORY SKELETON appears in the context above. The HPI section\n"
+            "of this note was just rendered from that same skeleton. Your\n"
+            "Assessment MUST stay aligned with it:\n"
+            "  - Open by naming the disease phase the skeleton's INTRO states\n"
+            "    (e.g. 'metastatic castration-resistant prostate cancer on\n"
+            "    combination systemic therapy').\n"
+            "  - Summarize the trajectory using only the events the skeleton\n"
+            "    lists (diagnosis, treatment history, PSA trajectory, key\n"
+            "    procedure findings). Do NOT introduce events the skeleton\n"
+            "    does not name.\n"
+            "  - Reference the CURRENT REGIMEN from the skeleton when\n"
+            "    describing what the patient is doing now. Do NOT call the\n"
+            "    patient 'off treatment' if the skeleton's CURRENT REGIMEN\n"
+            "    has active oncology meds.\n"
+            "  - Close with the phase-appropriate next step. The Plan agent\n"
+            "    receives your Assessment text as the contract its Problem\n"
+            "    #N items must implement, so your closing recommendation\n"
+            "    sentence is what the Plan will execute. Make it explicit\n"
+            "    and singular: name the interval, the next test, the\n"
+            "    referral, and whether to continue / hold / escalate\n"
+            "    therapy. Examples of phase-appropriate closings:\n"
+            "      mCRPC: 'Continue Eligard q6mo plus abiraterone/prednisone;\n"
+            "             monitor PSA q6-8 weeks; consider bone-protective\n"
+            "             therapy given documented metastasis.'\n"
+            "      Biochemical recurrence (post-radiation, treatment-naive\n"
+            "             for salvage): 'Obtain PSMA-PET to restage; refer to\n"
+            "             radiation oncology / medical oncology for salvage\n"
+            "             discussion.'\n"
+            "      Post-treatment surveillance with stable PSA: 'Continue PSA\n"
+            "             surveillance every 6 months; mpMRI if PSA crosses\n"
+            "             threshold.'\n"
+            "      Treatment-naive with rising PSA: 'Repeat PSA in 3 months;\n"
+            "             consider mpMRI / targeted biopsy if PSA persists.'\n"
+        )
+
     instructions = f"""
 You are synthesizing a comprehensive clinical ASSESSMENT for a urology patient.
 
@@ -429,6 +475,7 @@ AVAILABLE INFORMATION:
 {full_context}
 {psa_context}
 {authoritative_directive}
+{skeleton_directive}
 {user_rules_directive}
 
 TASK:

@@ -667,6 +667,9 @@ def build_urology_note(
             current_active_treatments=(
                 _hpi_pf.current_active_treatments if _hpi_pf else None
             ),
+            clinical_timeline=(
+                _hpi_pf.clinical_timeline if _hpi_pf else None
+            ),
         )
 
     def _build_hpi():

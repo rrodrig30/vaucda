@@ -440,6 +440,35 @@ def build_stage2_note(
         raw_clinical_text=_raw_for_facts or None,
     )
     authoritative_facts = format_facts_for_prompt(patient_facts)
+
+    # PHASE 2.1: rebuild the HPI skeleton at Stage 2 so the Assessment
+    # agent sees the same structured story the HPI was rendered from.
+    # Without this the Assessment can drift away from the HPI by relying
+    # on raw context alone. The skeleton is the contract.
+    _stage2_skeleton_text: Optional[str] = None
+    try:
+        from .hpi_skeleton import build_hpi_skeleton, format_skeleton_for_prompt
+        # Extract demographics from the Stage 1 note's patient header
+        _name_m = re.search(r"^Patient:\s*([^\n|(]+)", stage1_note, re.MULTILINE)
+        _age_m = re.search(r"Age:\s*(\d+)", stage1_note)
+        _sex_m = re.search(r"Sex:\s*(\w+)", stage1_note)
+        _skel = build_hpi_skeleton(
+            facts=patient_facts,
+            raw_clinical_text=_raw_for_facts,
+            patient_name=(_name_m.group(1).strip().title() if _name_m else (patient_name or "")),
+            age=(_age_m.group(1) if _age_m else ""),
+            sex=(_sex_m.group(1) if _sex_m else ""),
+            pathology_data="",  # not directly available here; cancer_evidence covers it
+            gu_notes=gu_notes,
+        )
+        _stage2_skeleton_text = format_skeleton_for_prompt(_skel)
+        print(
+            f"      Stage 2 skeleton: phase={_skel.phase}, "
+            f"timeline events={len(_skel.prior_treatment_events)}, "
+            f"regimen items={len(_skel.current_regimen)}"
+        )
+    except Exception as _e:
+        logger.warning(f"Stage 2 HPI skeleton build failed (non-fatal): {_e}")
     print(f"      Cancer status:    {patient_facts.cancer_status}")
     print(f"      Treatment naive:  {patient_facts.treatment_naive}")
     print(f"      Phoenix applic.:  {patient_facts.phoenix_applicable}")
@@ -496,6 +525,7 @@ def build_stage2_note(
         cross_specialty_context=cross_specialty_context,
         prior_ap_context=prior_ap_context_for_assessment,
         authoritative_facts=authoritative_facts,
+        hpi_skeleton=_stage2_skeleton_text,
     )
     print(f"      Assessment: {len(assessment) if assessment else 0} chars")
 
