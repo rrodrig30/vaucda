@@ -282,8 +282,13 @@ def _find_treatment_events(
         for m in re.finditer(tx_pattern, text, re.IGNORECASE):
             if _preceded_by_negation(text, m.start()):
                 continue
+            # Trigger may appear either BEFORE the modality
+            # ("Restarted ADT") or AFTER it ("ADT was restarted"). Check
+            # both windows so we don't miss the post-modality-trigger
+            # phrasing that dominates real clinician prose.
             preceding = text[max(0, m.start() - 80):m.start()]
-            if not trigger_re.search(preceding):
+            trailing = text[m.end():m.end() + 60]
+            if not (trigger_re.search(preceding) or trigger_re.search(trailing)):
                 continue
             if event_type == "TREATMENT_DECLINED":
                 # The decline trigger and treatment word together are the event.

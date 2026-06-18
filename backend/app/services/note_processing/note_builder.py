@@ -613,6 +613,33 @@ def build_urology_note(
     _hpi_auth_facts = _hpi_authoritative_facts
     _hpi_pf = _hpi_patient_facts
 
+    # PHASE 2: build the deterministic HPI story skeleton and pass it to
+    # the HPI agent as a structured rendering target. The agent's prompt
+    # now treats the skeleton as authoritative — every event in the
+    # skeleton must appear in the rendered HPI, and the agent may not
+    # invent events not in the skeleton.
+    try:
+        from .hpi_skeleton import build_hpi_skeleton, format_skeleton_for_prompt
+        _hpi_skeleton_obj = build_hpi_skeleton(
+            facts=_hpi_pf,
+            raw_clinical_text=clinical_document,
+            patient_name=patient_name or "",
+            age=str(patient_age or ""),
+            sex=patient_sex or "",
+            pathology_data=document_pathology or "",
+            gu_notes=gu_notes,
+        )
+        _hpi_skeleton_text = format_skeleton_for_prompt(_hpi_skeleton_obj)
+        print(
+            f"      HPI skeleton built: phase={_hpi_skeleton_obj.phase}, "
+            f"timeline events={len(_hpi_skeleton_obj.prior_treatment_events)}, "
+            f"regimen items={len(_hpi_skeleton_obj.current_regimen)}, "
+            f"procedure findings={len(_hpi_skeleton_obj.procedure_findings_text)}"
+        )
+    except Exception as _e:
+        logger.warning(f"HPI skeleton build failed (non-fatal): {_e}")
+        _hpi_skeleton_text = None
+
     _doc_psh_cc = document_psh
     _clinical_doc_cc = clinical_document
 
@@ -684,6 +711,7 @@ def build_urology_note(
             patient_sex=_patient_sex_val,
             authoritative_facts=_hpi_auth_facts,
             patient_facts=_hpi_pf,
+            hpi_skeleton=_hpi_skeleton_text,
         )
 
     synthesis_tasks['cc'] = _build_cc

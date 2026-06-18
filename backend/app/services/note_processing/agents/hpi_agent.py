@@ -332,6 +332,7 @@ def synthesize_hpi(
     patient_sex: Optional[str] = None,
     authoritative_facts: Optional[str] = None,
     patient_facts: Optional["PatientStatusFacts"] = None,
+    hpi_skeleton: Optional[str] = None,
 ) -> Union[str, Tuple[str, Optional[HPIVerificationResult]]]:
     """
     Synthesize HPI from GU notes with clinical context.
@@ -495,6 +496,16 @@ def synthesize_hpi(
     if authoritative_facts and authoritative_facts.strip():
         context_parts.append(authoritative_facts)
 
+    # PHASE 2: deterministic HPI story skeleton — placed AFTER the ground-
+    # truth block so the LLM sees both. The skeleton is the structured
+    # story (intro / diagnosis / treatment timeline / PSA trajectory /
+    # procedure findings / current regimen / today symptoms) the LLM is
+    # required to render. It collapses the "synthesize from prior HPIs"
+    # failure mode where ADT-restart events were lost because the source
+    # prose came from prior visits written before the restart.
+    if hpi_skeleton and hpi_skeleton.strip():
+        context_parts.append(hpi_skeleton)
+
     demo_lines = []
     if patient_name:
         demo_lines.append(f"Name: {patient_name}")
@@ -579,12 +590,52 @@ def synthesize_hpi(
             "disease, not recurrence of treated disease.\n"
         )
 
+    # PHASE 2 directive: when a deterministic skeleton was provided, the
+    # LLM's job is to RENDER it, not to synthesize from scratch. Strong
+    # framing on this dramatically reduces drift compared to free-form
+    # synthesis from prior-visit prose.
+    skeleton_directive = ""
+    if hpi_skeleton and hpi_skeleton.strip():
+        skeleton_directive = (
+            "\n=== HPI RENDERING MODE (READ BEFORE WRITING) ===\n"
+            "A deterministic HPI STORY SKELETON appears inside CLINICAL DATA\n"
+            "CONTEXT above (look for '=== HPI STORY SKELETON ==='). That\n"
+            "skeleton is the authoritative structure of TODAY's HPI. Your\n"
+            "task is to RENDER the skeleton into fluent clinical prose, not\n"
+            "to invent additional structure or facts.\n"
+            "\n"
+            "Hard rules for skeleton rendering:\n"
+            "  1. Walk skeleton sections 1-7 IN ORDER. Do not reorder them\n"
+            "     and do not skip a section that has content.\n"
+            "  2. Every TREATMENT HISTORY bullet must appear in the prose,\n"
+            "     with its date and verb. A RESTARTED event MUST be\n"
+            "     rendered as a restart — never as 'continued' or\n"
+            "     'completed' or 'finished'. A DECLINED event MUST be\n"
+            "     rendered as a decline — never as 'received'.\n"
+            "  3. Every entry in CURRENT REGIMEN must be acknowledged in\n"
+            "     the prose (the patient is taking those medications now —\n"
+            "     downstream agents will drop them if you do not).\n"
+            "  4. PROCEDURE FINDINGS (cystoscopy / urodynamics / biopsy /\n"
+            "     DEXA / TURBT / cystolitholapaxy / etc.) must be cited by\n"
+            "     date and finding when present in the skeleton.\n"
+            "  5. PSA TRAJECTORY in the skeleton is the only allowed PSA\n"
+            "     narrative. Do not introduce different PSA values.\n"
+            "  6. Do NOT invent dates, treatments, biopsies, imaging\n"
+            "     findings, or clinical decisions that are not in the\n"
+            "     skeleton. If you would otherwise need to do so, omit\n"
+            "     the claim.\n"
+            "  7. Output 1-2 paragraphs of fluent narrative prose. No\n"
+            "     bullets, no meta-commentary. Start directly with the\n"
+            "     INTRO sentence.\n"
+        )
+
     # Use LLM to synthesize comprehensive HPI
     instructions = f"""
 Create a current, comprehensive UROLOGY HPI that synthesizes all available urologic information from the source notes into a cohesive narrative for TODAY'S visit.
 
 {clinical_context}
 {authoritative_directive}
+{skeleton_directive}
 
 CRITICAL TEMPORAL INVARIANTS (read before doing anything else):
 - The HPI entries below are PRIOR-VISIT SNAPSHOTS, each labeled with
