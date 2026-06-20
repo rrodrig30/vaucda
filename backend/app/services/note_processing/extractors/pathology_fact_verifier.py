@@ -649,48 +649,61 @@ class PathologyFactVerifier:
         Returns:
             Corrected text with hallucinations marked
         """
+        # Per provider direction: do NOT emit "[UNVERIFIED: ...]" markers
+        # in the rendered note. When a pathology claim cannot be verified
+        # against the source, drop the sentence containing it rather than
+        # leave a bracketed comment in the clinical text. The verifier's
+        # numeric report still surfaces the unverified count in metadata
+        # for audit, but the prose stays clean.
         corrected = original_text
 
+        # Build per-hallucination patterns that locate the offending value
+        drop_patterns: List[re.Pattern] = []
         for hallucination in hallucinations:
-            # Extract the specific value
             match = re.search(r'^(.*?)\s*\(not in source\)$', hallucination)
-            if match:
-                value = match.group(1)
-                # Mark the hallucination in the text
-                # Pattern to find and mark
-                if 'Gleason' in value:
-                    gleason_val = value.replace('Gleason ', '')
-                    corrected = re.sub(
-                        rf'Gleason[\'s]?\s+(?:score\s+)?{re.escape(gleason_val)}',
-                        f'[UNVERIFIED: Gleason {gleason_val}]',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
-                elif 'Grade Group' in value:
-                    gg_val = value.replace('Grade Group ', '')
-                    corrected = re.sub(
-                        rf'Grade\s+Group\s+{re.escape(gg_val)}',
-                        f'[UNVERIFIED: Grade Group {gg_val}]',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
-                elif '%' in value:
-                    pct_val = value.replace('%', '')
-                    corrected = re.sub(
-                        rf'\b{re.escape(pct_val)}\s*%',
-                        f'[UNVERIFIED: {pct_val}%]',
-                        corrected
-                    )
-                elif 'cores' in value:
-                    cores_val = value.replace(' cores', '')
-                    corrected = re.sub(
-                        rf'\b{re.escape(cores_val)}\s*(?:of|/)',
-                        f'[UNVERIFIED: {cores_val}] of',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
+            if not match:
+                continue
+            value = match.group(1)
+            if 'Gleason' in value:
+                gleason_val = value.replace('Gleason ', '')
+                drop_patterns.append(re.compile(
+                    rf"Gleason[\'s]?\s+(?:score\s+)?{re.escape(gleason_val)}",
+                    re.IGNORECASE,
+                ))
+            elif 'Grade Group' in value:
+                gg_val = value.replace('Grade Group ', '')
+                drop_patterns.append(re.compile(
+                    rf"Grade\s+Group\s+{re.escape(gg_val)}",
+                    re.IGNORECASE,
+                ))
+            elif '%' in value:
+                pct_val = value.replace('%', '')
+                drop_patterns.append(re.compile(
+                    rf"\b{re.escape(pct_val)}\s*%",
+                ))
+            elif 'cores' in value:
+                cores_val = value.replace(' cores', '')
+                drop_patterns.append(re.compile(
+                    rf"\b{re.escape(cores_val)}\s*(?:of|/)",
+                    re.IGNORECASE,
+                ))
 
-        return corrected
+        if not drop_patterns:
+            return corrected
+
+        # Sentence-level drop: split on terminators, keep sentences whose
+        # text does NOT contain any of the unverified-value patterns.
+        # Joining with a single space preserves readable prose.
+        sentences = re.split(r"(?<=[.!?])\s+", corrected)
+        kept: List[str] = []
+        for s in sentences:
+            if not s.strip():
+                continue
+            if any(p.search(s) for p in drop_patterns):
+                # Drop entire sentence containing an unverified claim.
+                continue
+            kept.append(s)
+        return " ".join(kept).strip()
 
     def get_verified_pathology(self, synthesized_text: str) -> Tuple[str, VerificationResult]:
         """

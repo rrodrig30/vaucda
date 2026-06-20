@@ -758,87 +758,80 @@ class HPIFactVerifier:
         Returns:
             Corrected text with hallucinations marked
         """
+        # Per provider direction: never emit "[UNVERIFIED: ...]" markers
+        # in the rendered HPI. When a claim cannot be verified against
+        # the source, drop the SENTENCE containing it from the prose
+        # rather than wrap the value in a bracketed comment. The
+        # numeric verification report still surfaces the unverified
+        # count in metadata for audit, but the rendered text stays clean.
         corrected = original_text
 
+        drop_patterns: List[re.Pattern] = []
         for hallucination in hallucinations:
-            # Extract the specific value
             match = re.search(r'^(.*?)\s*\(not in source\)$', hallucination)
-            if match:
-                claim = match.group(1)
+            if not match:
+                continue
+            claim = match.group(1)
 
-                if claim.startswith('PSA '):
-                    psa_val = claim.replace('PSA ', '')
-                    # Handle both "12.50" and "12.5" formats. Dedupe so
-                    # the for-loop doesn't run with the same pattern
-                    # twice — when it did, the second iteration matched
-                    # the already-wrapped "[UNVERIFIED PSA: X]" and
-                    # produced "[UNVERIFIED [UNVERIFIED PSA: X]]".
-                    psa_val_stripped = psa_val.rstrip('0').rstrip('.')
-                    psa_patterns = [psa_val, psa_val_stripped]
-                    if '.' not in psa_val_stripped:
-                        psa_patterns.append(psa_val_stripped + '.0')
-                    psa_patterns = list(dict.fromkeys(psa_patterns))
+            if claim.startswith('PSA '):
+                psa_val = claim.replace('PSA ', '')
+                psa_val_stripped = psa_val.rstrip('0').rstrip('.')
+                psa_variants = [psa_val, psa_val_stripped]
+                if '.' not in psa_val_stripped:
+                    psa_variants.append(psa_val_stripped + '.0')
+                psa_variants = list(dict.fromkeys(psa_variants))
+                for pv in psa_variants:
+                    drop_patterns.append(re.compile(
+                        rf"PSA[:\s]+{re.escape(pv)}(?:\s*ng/mL)?",
+                        re.IGNORECASE,
+                    ))
+                    drop_patterns.append(re.compile(
+                        rf"PSA\s+(?:of\s+)?{re.escape(pv)}",
+                        re.IGNORECASE,
+                    ))
+            elif claim.startswith('Gleason '):
+                gleason_val = claim.replace('Gleason ', '')
+                drop_patterns.append(re.compile(
+                    rf"Gleason[\'s]?\s+(?:score\s+)?{re.escape(gleason_val)}",
+                    re.IGNORECASE,
+                ))
+            elif claim.startswith('Grade Group '):
+                gg_val = claim.replace('Grade Group ', '')
+                drop_patterns.append(re.compile(
+                    rf"Grade\s+Group\s+{re.escape(gg_val)}",
+                    re.IGNORECASE,
+                ))
+            elif claim.startswith('IPSS '):
+                ipss_val = claim.replace('IPSS ', '')
+                drop_patterns.append(re.compile(
+                    rf"IPSS[:\s]+{re.escape(ipss_val)}",
+                    re.IGNORECASE,
+                ))
+            elif claim.startswith('Creatinine '):
+                cr_val = claim.replace('Creatinine ', '')
+                drop_patterns.append(re.compile(
+                    rf"Creatinine[:\s]+{re.escape(cr_val)}",
+                    re.IGNORECASE,
+                ))
+            elif claim.startswith('Testosterone '):
+                t_val = claim.replace('Testosterone ', '')
+                drop_patterns.append(re.compile(
+                    rf"Testosterone[:\s]+{re.escape(t_val)}",
+                    re.IGNORECASE,
+                ))
 
-                    for pv in psa_patterns:
-                        # Skip if this value is already wrapped by a
-                        # prior iteration — negative lookbehind for
-                        # "[UNVERIFIED PSA: " immediately before the
-                        # match guards against re-wrapping.
-                        corrected = re.sub(
-                            rf'(?<!\[UNVERIFIED PSA: )PSA[:\s]+{re.escape(pv)}(?:\s*ng/mL)?',
-                            f'[UNVERIFIED PSA: {pv}]',
-                            corrected,
-                            flags=re.IGNORECASE
-                        )
-                        # "PSA of X" format — same guard.
-                        corrected = re.sub(
-                            rf'(?<!\[UNVERIFIED PSA: )PSA\s+(?:of\s+)?{re.escape(pv)}',
-                            f'[UNVERIFIED PSA: {pv}]',
-                            corrected,
-                            flags=re.IGNORECASE
-                        )
-                elif claim.startswith('Gleason '):
-                    gleason_val = claim.replace('Gleason ', '')
-                    corrected = re.sub(
-                        rf'Gleason[\'s]?\s+(?:score\s+)?{re.escape(gleason_val)}',
-                        f'[UNVERIFIED: Gleason {gleason_val}]',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
-                elif claim.startswith('Grade Group '):
-                    gg_val = claim.replace('Grade Group ', '')
-                    corrected = re.sub(
-                        rf'Grade\s+Group\s+{re.escape(gg_val)}',
-                        f'[UNVERIFIED: Grade Group {gg_val}]',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
-                elif claim.startswith('IPSS '):
-                    ipss_val = claim.replace('IPSS ', '')
-                    corrected = re.sub(
-                        rf'IPSS[:\s]+{re.escape(ipss_val)}',
-                        f'[UNVERIFIED: IPSS {ipss_val}]',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
-                elif claim.startswith('Creatinine '):
-                    cr_val = claim.replace('Creatinine ', '')
-                    corrected = re.sub(
-                        rf'Creatinine[:\s]+{re.escape(cr_val)}',
-                        f'[UNVERIFIED: Creatinine {cr_val}]',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
-                elif claim.startswith('Testosterone '):
-                    t_val = claim.replace('Testosterone ', '')
-                    corrected = re.sub(
-                        rf'Testosterone[:\s]+{re.escape(t_val)}',
-                        f'[UNVERIFIED: Testosterone {t_val}]',
-                        corrected,
-                        flags=re.IGNORECASE
-                    )
+        if not drop_patterns:
+            return corrected
 
-        return corrected
+        sentences = re.split(r"(?<=[.!?])\s+", corrected)
+        kept: List[str] = []
+        for s in sentences:
+            if not s.strip():
+                continue
+            if any(p.search(s) for p in drop_patterns):
+                continue
+            kept.append(s)
+        return " ".join(kept).strip()
 
     def get_verified_hpi(self, synthesized_text: str) -> Tuple[str, HPIVerificationResult]:
         """

@@ -76,6 +76,52 @@ def _preceded_by_negation(text: str, match_start: int, window: int = 80) -> bool
     return bool(_NEGATION_TOKEN_RE.search(snippet))
 
 
+# Family-history relatives. A positive cancer mention in the same window
+# as one of these is a relative's history, NOT the patient's.
+_FAMILY_HISTORY_RE = re.compile(
+    r"\b(?:"
+    r"father|mother|brother|sister|son|daughter|"
+    r"uncle|aunt|cousin|nephew|niece|grandfather|grandmother|"
+    r"grandparent|paternal|maternal|"
+    r"half[\s-]?brother|half[\s-]?sister|step[\s-]?brother|step[\s-]?sister|"
+    r"family\s+history\s+of|positive\s+family\s+history|fhx|fh\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+# Hedging vocabulary — markers of uncertainty, suspicion, or comparison
+# that do NOT establish a confirmed diagnosis. A "prostate cancer"
+# mention preceded by one of these is NOT cancer evidence.
+_HEDGING_RE = re.compile(
+    r"\b(?:"
+    r"possible|suspected|suspicious(?:\s+for)?|"
+    r"concern(?:ing)?(?:\s+for)?|may\s+have|might\s+have|"
+    r"such\s+as|e\.?g\.?|for\s+example|including|like|"
+    r"rule[\sd]?\s*out|r/o|to\s+evaluate\s+for|"
+    r"workup\s+for|screening\s+for|risk\s+of|"
+    r"prevention\s+of|prophylaxis\s+(?:against|for)|"
+    r"high[\s-]?risk\s+(?:for|of)|elevated\s+risk\s+(?:for|of)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_family_history_or_hedged(text: str, match_start: int, window: int = 80) -> bool:
+    """True if the span at ``match_start`` is a family-history mention or
+    a hedged/suspected/comparison reference rather than a confirmed
+    diagnosis. Both contexts must be excluded from cancer evidence —
+    otherwise "PATERNAL GREAT GRANDFATHER died of prostate cancer" and
+    "workup for possible prostate cancer" would falsely promote
+    cancer_status to PRESENT."""
+    snippet = text[max(0, match_start - window):match_start]
+    if _FAMILY_HISTORY_RE.search(snippet):
+        return True
+    if _HEDGING_RE.search(snippet):
+        return True
+    return False
+
+
 def find_cancer_evidence(text: str) -> List[str]:
     """Return positive (un-negated) cancer evidence quotes from ``text``.
 
@@ -88,6 +134,11 @@ def find_cancer_evidence(text: str) -> List[str]:
     for pattern in _CANCER_POSITIVE_PATTERNS:
         for m in pattern.finditer(text):
             if _preceded_by_negation(text, m.start()):
+                continue
+            # Family-history mentions are about a relative, not the
+            # patient. Hedged / suspected / comparison mentions are not
+            # confirmed diagnoses. Both must be excluded.
+            if _is_family_history_or_hedged(text, m.start()):
                 continue
             found.append(m.group(0))
     # Dedup case-insensitively while preserving first-seen order

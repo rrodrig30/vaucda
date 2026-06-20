@@ -16,7 +16,7 @@ invariant by:
 """
 
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from ..llm_helper import combine_sections_with_llm
 from .history_cleaners import clean_llm_commentary
 

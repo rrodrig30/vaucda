@@ -5,6 +5,7 @@ Extracts pathology reports from SURGICAL PATHOLOGY format.
 """
 
 import re
+from typing import Optional
 
 
 def extract_prostate_biopsy(clinical_document: str) -> str:
@@ -165,14 +166,62 @@ def extract_prostate_biopsy(clinical_document: str) -> str:
                 if spec_dates:
                     date = spec_dates[-1].group(1)
 
-            # 2. Numeric date prefix (M/D, M/D/YY, M/YYYY) — legacy format
+            # 1b. NEW: SURGICAL PATHOLOGY format uses "Date obtained:" or
+            # "Received MMM DD, YYYY" inside the report header instead of
+            # "Specimen Collection Date:". Search the scoped slice — the
+            # window between the closest preceding report boundary and
+            # the MICROSCOPIC EXAM block — for either header. This is
+            # the AUTHORITATIVE date for SURGICAL PATHOLOGY reports and
+            # was being missed entirely, which forced the date inference
+            # to fall through to the Strategy 2 fallback that grabs
+            # unrelated MRI/imaging dates from elsewhere in the document.
             if not date:
-                date_match = re.search(
-                    r'(\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}/\d{4}):\s*$',
-                    preceding, re.MULTILINE,
+                surg_scope = scoped if 'scoped' in locals() else preceding[-2500:]
+                surg_dates = list(re.finditer(
+                    r'(?:Date\s+obtained|Received)\s*:?\s*'
+                    r'([A-Za-z]{3}\s+\d{1,2},\s+\d{4})',
+                    surg_scope,
+                    re.IGNORECASE,
+                ))
+                if surg_dates:
+                    date = surg_dates[-1].group(1)
+
+            # 2. Numeric date prefix (M/D, M/D/YY, M/YYYY) — legacy format.
+            # IMPORTANT GUARDS:
+            #   - Use the CLOSEST match (last in document order before the
+            #     MICROSCOPIC EXAM block), not the first match in the
+            #     whole document. The old re.search behavior produced
+            #     systematic wrong-date attribution when an unrelated
+            #     imaging report earlier in the document used the
+            #     "MRI Prostate <date>:" line pattern.
+            #   - SKIP matches whose line begins with a non-pathology
+            #     modality marker (MRI / CT / US / PSMA / PET / X-ray /
+            #     ultrasound / nuclear / bone scan) — those are imaging
+            #     dates, not biopsy dates.
+            if not date:
+                imaging_line_re = re.compile(
+                    r"^\s*(?:MRI|CT|U[/\s]?S\b|PSMA|PET|"
+                    r"X[\s\-]?ray|ultrasound|nuclear|bone\s+scan)\b",
+                    re.IGNORECASE,
                 )
-                if date_match:
-                    date = date_match.group(1)
+                date_re = re.compile(
+                    r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}/\d{4}):\s*$",
+                    re.MULTILINE,
+                )
+                # Scan the preceding text and keep only matches whose
+                # line does NOT start with an imaging-modality token.
+                best: Optional[re.Match] = None
+                for cand in date_re.finditer(preceding):
+                    line_start = preceding.rfind("\n", 0, cand.start()) + 1
+                    line_end = preceding.find("\n", cand.start())
+                    if line_end == -1:
+                        line_end = len(preceding)
+                    line = preceding[line_start:line_end]
+                    if imaging_line_re.match(line):
+                        continue
+                    best = cand  # keep updating so we end with the LAST valid match
+                if best:
+                    date = best.group(1)
             # 3. "Date Reported:" or "Report Released" lines (also scoped
             # to same report when possible — same rationale as Strategy 1).
             if not date:
