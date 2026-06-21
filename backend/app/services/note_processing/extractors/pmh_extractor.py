@@ -187,14 +187,24 @@ def _strip_diagnostic_codes(diagnosis: str) -> str:
     Returns:
         Clean diagnosis text without codes
     """
-    # Remove (SCT XXXXXX) patterns
+    # Remove (SCT XXXXXX) patterns — strict
     cleaned = re.sub(r'\s*\(SCT\s+\d+\)', '', diagnosis)
-    # Remove (ICD-10-CM XXXXX) patterns
+    # Remove (ICD-10-CM XXXXX) patterns — strict shape first
     cleaned = re.sub(r'\s*\(ICD-10-CM\s+[A-Z]\d{1,2}\.?\d*\w*\)', '', cleaned)
-    # Remove (ICD-9-CM XXXXX) patterns
+    # Remove (ICD-9-CM XXXXX) patterns — strict shape first
     cleaned = re.sub(r'\s*\(ICD-9-CM\s+[\d.]+\w*\)', '', cleaned)
-    # Remove trailing asterisks
-    cleaned = cleaned.rstrip('*').strip()
+    # Aggressive sweep: drop ANY remaining (SCT ...) / (ICD-... ...) /
+    # malformed half-open variants ("(ICD-9-CM" with no closing paren).
+    # VistA exports occasionally truncate code fragments mid-line; these
+    # would otherwise leak into the rendered PMH as e.g.
+    # "Conjunctivitis, Allergic * (ICD-9-CM" or
+    # "Allergic rhinitis (SNOMED CT 61582004)".
+    cleaned = re.sub(r'\s*\(SCT[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*\(SNOMED\s+CT[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*\(ICD-10-CM[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*\(ICD-9-CM[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
+    # Remove trailing asterisks and stray punctuation
+    cleaned = cleaned.rstrip('*').strip().rstrip(',').strip()
     return cleaned
 
 

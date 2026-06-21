@@ -211,11 +211,32 @@ def _render_pmh_from_pll(pll_body: str) -> str:
         if diagnosis.lower() in seen:
             continue
         seen.add(diagnosis.lower())
-        # Build a Provider Narrative block with synthetic ICD marker so
-        # the existing extractor's diagnosis regex matches.
+        # Build a Provider Narrative block with a synthetic ICD-10-CM code
+        # so the extractor's diagnosis regex matches AND its strip-codes
+        # post-processor removes it from the rendered output. The strip
+        # regex requires the code to be shaped [A-Z]\d{1,2}\.?\d*\w* (i.e.
+        # real ICD-10) — placeholders like "VISTA.PLL" or "Z00.00" would
+        # leak (the former isn't stripped; the latter is on the
+        # administrative drop list and would delete every PMH row).
+        #
+        # N99.89 (other postprocedural complications of genitourinary
+        # system) is a real ICD-10-CM code that matches the strip regex,
+        # is NOT on any administrative/Z-code drop list, and is
+        # urology-adjacent so an unstripped fallthrough would still look
+        # plausible. The visible PMH the provider sees is the diagnosis
+        # text only; the code is purely a parser anchor that the
+        # extractor strips before rendering.
+        # Append the year from the LAST MOD date to the diagnosis text
+        # so the rendered PMH carries temporal context. After the
+        # extractor's strip pass removes the "(ICD-10-CM ...)" anchor,
+        # the line reads e.g. "Hyperlipidemia (2024)" — clean and
+        # informative, no junk codes. The full date sits in the
+        # Date Modified field below for downstream code that wants it.
+        year_match = re.search(r"\b(19|20)\d{2}\b", date_mod)
+        year_suffix = f" ({year_match.group(0)})" if year_match else ""
         out_lines.append("=" * 79)
         out_lines.append("Provider Narrative")
-        out_lines.append(f" {diagnosis} (ICD-10-CM VISTA.PLL)")
+        out_lines.append(f" {diagnosis}{year_suffix} (ICD-10-CM N99.89)")
         out_lines.append("Date of Onset")
         out_lines.append("")
         out_lines.append("Date Modified")
