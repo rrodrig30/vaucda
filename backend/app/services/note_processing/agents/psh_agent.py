@@ -83,6 +83,135 @@ def _format_surgery_entry(surgery: str, date: str, number: int) -> str:
         return f"{number}. {surgery}"
 
 
+# Canonical-name aliases. Surgical history coming from multiple sources
+# (VistA SR section, per-visit prior-note PSH blurbs, HPI narrative
+# scrapings) routinely names the same procedure several different ways:
+#   "TURP"  /  "transurethral resection of prostate"  /  "TUR-P"
+#   "Robotic prostatectomy"  /  "RALP"  /  "robot-assisted laparoscopic prostatectomy"
+#   "TURBT" / "transurethral resection of bladder tumor"
+# Exact-match dedup leaves all variants visible, so the rendered PSH
+# shows the same procedure three times in a row. Each (regex, canonical
+# name) pair below collapses to ONE canonical surgery for dedup
+# purposes. The first variant seen still drives the displayed text.
+_SURGERY_ALIASES: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\b(?:robot[\s\-]?assisted|robotic)\s+(?:laparoscopic\s+)?"
+                r"(?:radical\s+)?prostatectomy\b|\bRALP\b|\bRARP\b",
+                re.IGNORECASE),
+     "robotic prostatectomy"),
+    (re.compile(r"\b(?:open\s+)?radical\s+prostatectomy\b|\bRRP\b",
+                re.IGNORECASE),
+     "radical prostatectomy"),
+    (re.compile(r"\btrans[\s\-]?urethral\s+resection\s+of\s+(?:the\s+)?prostate\b|"
+                r"\bTUR[\s\-]?P\b",
+                re.IGNORECASE),
+     "TURP"),
+    (re.compile(r"\btrans[\s\-]?urethral\s+resection\s+of\s+(?:the\s+)?bladder"
+                r"(?:\s+tumou?r)?\b|\bTURBT\b",
+                re.IGNORECASE),
+     "TURBT"),
+    (re.compile(r"\b(?:laser\s+)?enucleation\s+of\s+(?:the\s+)?prostate\b|"
+                r"\bHoLEP\b|\bThuLEP\b",
+                re.IGNORECASE),
+     "laser prostate enucleation (HoLEP/ThuLEP)"),
+    (re.compile(r"\bUreteroscop(?:y|ies)\b|\bURS\b", re.IGNORECASE),
+     "ureteroscopy"),
+    (re.compile(r"\b(?:percutaneous\s+nephrolithotomy|PCNL)\b", re.IGNORECASE),
+     "PCNL"),
+    (re.compile(r"\b(?:shock\s+wave\s+lithotripsy|extracorporeal\s+shock\s+wave"
+                r"\s+lithotripsy|ESWL|SWL)\b", re.IGNORECASE),
+     "SWL"),
+    (re.compile(r"\bcystolitholapaxy\b|\bcystolithotripsy\b|"
+                r"\bbladder\s+stone\s+removal\b",
+                re.IGNORECASE),
+     "cystolitholapaxy"),
+    (re.compile(r"\b(?:radical|partial|simple)?\s*nephrectomy\b", re.IGNORECASE),
+     "nephrectomy"),
+    (re.compile(r"\b(?:radical\s+)?cystectomy\b", re.IGNORECASE),
+     "cystectomy"),
+    (re.compile(r"\bvasectomy\b", re.IGNORECASE),
+     "vasectomy"),
+    (re.compile(r"\bcircumcision\b", re.IGNORECASE),
+     "circumcision"),
+    (re.compile(r"\borchiectomy\b|\borchidectomy\b", re.IGNORECASE),
+     "orchiectomy"),
+    (re.compile(r"\bhydrocelectomy\b", re.IGNORECASE),
+     "hydrocelectomy"),
+    (re.compile(r"\bvaricocelectomy\b", re.IGNORECASE),
+     "varicocelectomy"),
+    (re.compile(r"\bprostate\s+biops(?:y|ies)\b|\bTRUS\s*[-/]?\s*Bx\b|"
+                r"\bMRI[\s\-]?fusion\s+biopsy\b|\bfusion\s+biopsy\b",
+                re.IGNORECASE),
+     "prostate biopsy"),
+    (re.compile(r"\bcystoscop(?:y|ies)\b", re.IGNORECASE),
+     "cystoscopy"),
+    (re.compile(r"\bappendectomy\b", re.IGNORECASE),
+     "appendectomy"),
+    (re.compile(r"\bcholecystectomy\b", re.IGNORECASE),
+     "cholecystectomy"),
+    (re.compile(r"\binguinal\s+hernia\s+repair\b|\bherniorrhaphy\b",
+                re.IGNORECASE),
+     "inguinal hernia repair"),
+    (re.compile(r"\bcataract\s+(?:extraction|surgery|removal)\b",
+                re.IGNORECASE),
+     "cataract surgery"),
+]
+
+
+def _surgery_canonical_key(surgery_name: str) -> str:
+    """Return the canonical key for a surgery name, used purely for
+    dedup. If no alias matches, fall back to an aggressive token-set
+    normalization (lowercase, drop punctuation, drop laterality and
+    common modifier words, sort tokens) so trivial wording differences
+    collapse.
+    """
+    if not surgery_name:
+        return ""
+    # 1. Alias-table match
+    for pat, canonical in _SURGERY_ALIASES:
+        if pat.search(surgery_name):
+            return canonical
+    # 2. Aggressive token-set normalization
+    s = surgery_name.lower()
+    s = re.sub(r"\b(?:s/p|status\s+post|history\s+of|hx\s+of|"
+               r"prior|remote|past)\b", "", s)
+    s = re.sub(r"\b(?:left|right|bilateral|lt|rt|bilat|"
+               r"approximately|around|circa|about|approx)\b", "", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    tokens = sorted(t for t in s.split() if t and not t.isdigit())
+    return " ".join(tokens) or surgery_name.lower().strip()
+
+
+def _prefer_more_specific(a: Tuple[str, str], b: Tuple[str, str]) -> Tuple[str, str]:
+    """When two surgery entries share a canonical key, keep the more
+    informative one. Prefer:
+      1. The one that carries a date (vs no date)
+      2. Among dated entries, the one with the more-precise date
+         (full MM/DD/YYYY beats MM/YYYY beats YYYY)
+      3. The one with the longer surgery-name text (e.g.
+         "Left partial nephrectomy" beats "nephrectomy")
+    """
+    name_a, date_a = a
+    name_b, date_b = b
+
+    def _date_precision(d: str) -> int:
+        if not d:
+            return 0
+        if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", d):
+            return 3
+        if re.match(r"^\d{1,2}/\d{4}$", d):
+            return 2
+        if re.match(r"^\d{4}$", d):
+            return 1
+        return 1
+
+    pa, pb = _date_precision(date_a), _date_precision(date_b)
+    if pa != pb:
+        return a if pa > pb else b
+    if len(name_a) != len(name_b):
+        return a if len(name_a) > len(name_b) else b
+    return a
+
+
 def synthesize_psh(gu_notes: List[Dict[str, str]], non_gu_notes: List[Dict[str, str]]) -> str:
     """
     Synthesize Past Surgical History from all notes.
@@ -117,9 +246,13 @@ def synthesize_psh(gu_notes: List[Dict[str, str]], non_gu_notes: List[Dict[str, 
     if not all_psh:
         return ""
 
-    # Parse all surgeries and their dates
-    surgeries_with_dates = []  # List of (surgery_name, date_string)
-    seen_surgeries = set()  # For deduplication (lowercase surgery name)
+    # Parse all surgeries and their dates. Canonical-key dedup: when
+    # two entries normalize to the same canonical surgery (e.g. "TURP"
+    # and "transurethral resection of prostate"), keep the more
+    # informative one (longer name and/or more precise date) and drop
+    # the other.
+    by_canonical: Dict[str, Tuple[str, str]] = {}  # canon_key -> (name, date)
+    canon_order: List[str] = []                    # first-seen order
 
     for psh_block in all_psh:
         lines = psh_block.split('\n')
@@ -135,15 +268,26 @@ def synthesize_psh(gu_notes: List[Dict[str, str]], non_gu_notes: List[Dict[str, 
             # Parse surgery and date
             surgery_name, date_str = _parse_surgery_with_date(line)
 
-            if surgery_name:
-                # Normalize for deduplication
-                normalized = surgery_name.lower().strip()
-                # Remove common prefixes for comparison
-                normalized = re.sub(r'^(s/p|status post|history of)\s+', '', normalized)
+            if not surgery_name:
+                continue
 
-                if normalized not in seen_surgeries:
-                    seen_surgeries.add(normalized)
-                    surgeries_with_dates.append((surgery_name, date_str))
+            canon_key = _surgery_canonical_key(surgery_name)
+            if not canon_key:
+                continue
+
+            new_entry = (surgery_name, date_str)
+            if canon_key in by_canonical:
+                # Duplicate canonical procedure — keep whichever entry
+                # carries the better date / longer name.
+                by_canonical[canon_key] = _prefer_more_specific(
+                    by_canonical[canon_key], new_entry,
+                )
+            else:
+                by_canonical[canon_key] = new_entry
+                canon_order.append(canon_key)
+
+    surgeries_with_dates = [by_canonical[k] for k in canon_order]
+    seen_surgeries = set(by_canonical.keys())  # used by the LLM-path branch below
 
     # If we couldn't parse any surgeries locally, use LLM
     if not surgeries_with_dates and len(all_psh) > 1:
@@ -174,17 +318,33 @@ Appendectomy (2015)
             synthesized_psh = re.sub(r'^(Here is|Here are|I have combined|Note:).*?\n', '', synthesized_psh, flags=re.MULTILINE | re.IGNORECASE)
             synthesized_psh = re.sub(r'\n(Note:|I removed|Since there).*$', '', synthesized_psh, flags=re.DOTALL | re.IGNORECASE)
 
-            # Re-parse the LLM output
+            # Re-parse the LLM output using the same canonical-key
+            # dedup so the LLM cannot reintroduce duplicates the
+            # deterministic pass already removed.
             for line in synthesized_psh.split('\n'):
                 line = line.strip()
-                if line:
-                    surgery_name, date_str = _parse_surgery_with_date(line)
-                    if surgery_name:
-                        normalized = surgery_name.lower().strip()
-                        normalized = re.sub(r'^(s/p|status post|history of)\s+', '', normalized)
-                        if normalized not in seen_surgeries:
-                            seen_surgeries.add(normalized)
-                            surgeries_with_dates.append((surgery_name, date_str))
+                if not line:
+                    continue
+                surgery_name, date_str = _parse_surgery_with_date(line)
+                if not surgery_name:
+                    continue
+                canon_key = _surgery_canonical_key(surgery_name)
+                if not canon_key:
+                    continue
+                new_entry = (surgery_name, date_str)
+                if canon_key in by_canonical:
+                    merged = _prefer_more_specific(by_canonical[canon_key], new_entry)
+                    # If we picked up a better entry, replace in the
+                    # ordered list in place.
+                    if merged != by_canonical[canon_key]:
+                        idx = canon_order.index(canon_key)
+                        by_canonical[canon_key] = merged
+                        surgeries_with_dates[idx] = merged
+                else:
+                    by_canonical[canon_key] = new_entry
+                    canon_order.append(canon_key)
+                    surgeries_with_dates.append(new_entry)
+                    seen_surgeries.add(canon_key)
 
     # Sort by date (most recent first)
     def sort_key(item):
