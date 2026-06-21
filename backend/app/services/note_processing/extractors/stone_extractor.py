@@ -248,9 +248,13 @@ def extract_stone_labs(clinical_document: str) -> str:
                 header += f" ({current_collection_date})"
             stone_results.append(f"{header}:\n{cmp_results}")
 
+    # PTH must be a word boundary on the LEFT so 'SQ.EPTH' (urinalysis
+    # squamous epithelial cells) cannot match the 'PTH' suffix. Also
+    # require a unit OR a date afterward — bare numbers next to anything
+    # ending in 'PTH' inside a urinalysis grid are not parathyroid hormone.
     pth_pattern = (
-        r'(?:PTH|Parathyroid\s+Hormone)[:\s]+(\d+\.?\d*)\s*'
-        r'(pg/mL|pg/ml)?(?:\s*\(?'
+        r'(?:(?<![A-Za-z.])PTH|Parathyroid\s+Hormone)\s*[:\s]+(\d+\.?\d*)\s*'
+        r'(pg/mL|pg/ml)(?:\s*\(?'
         r'([A-Za-z]{3}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})\)?)?'
     )
 

@@ -71,12 +71,18 @@ _KNOWN_CODES = (
 # (e.g. when the section is the first / last in the document). We accept
 # either form. The description portion is captured up to the first run
 # of trailing dashes or end of line.
+# Description can contain internal dashes (e.g. "OUTPT RX-ACTIVE ONLY",
+# "All Problems", "Chem & Hematology (max 20 occurrences or 6 months)").
+# We use a non-greedy capture and require the trailing dash-padding to be
+# at least 2 dashes to distinguish "padding dashes" from a "hyphen inside
+# the description". The leading prefix requires at least 2 dashes for the
+# same reason.
 _HEADER_RE = re.compile(
-    r"^(?:-+\s+)?"
+    r"^(?:-{2,}\s+)?"
     r"(?P<code>(?:" + "|".join(re.escape(c) for c in _KNOWN_CODES) + r"))"
-    r"\s*-\s*"
-    r"(?P<desc>[A-Za-z][^\n-]*?(?:\([^)]*\)[^\n-]*?)?)"
-    r"\s*(?:-+\s*)?$",
+    r"\s+-\s+"
+    r"(?P<desc>[A-Za-z][^\n]*?)"
+    r"\s*(?:-{2,}\s*)?$",
     re.MULTILINE,
 )
 
@@ -232,26 +238,150 @@ def _render_pmh_from_pll(pll_body: str) -> str:
 def _render_psh_from_sr(sr_body: str) -> str:
     """Render the CPRS PAST SURGICAL HISTORY section from VistA SR body.
 
-    Per provider: SR is the authoritative source for dated surgeries.
-    Other dates/surgeries can be added later. Pass-through with a CPRS
-    section header for now.
+    Per provider direction: SR is the authoritative source for dated
+    surgeries. When SR exists but contains only the literal "No data
+    available", we still emit the PSH section header so downstream
+    extractors / agents see an explicit "no surgeries documented"
+    signal instead of falling back to scraping arbitrary surgical-
+    sounding phrases from the rest of the document.
     """
-    if not sr_body or not sr_body.strip():
+    if not sr_body:
         return ""
-    return "==================== PAST SURGICAL HISTORY ====================\n" + sr_body.strip() + "\n"
+    body = sr_body.strip()
+    if not body:
+        return ""
+    if re.fullmatch(r"no\s+data\s+available", body, re.IGNORECASE):
+        body = "No prior surgical procedures documented."
+    return "==================== PAST SURGICAL HISTORY ====================\n" + body + "\n"
 
 
 def _render_medications_from_rxop(rxop_body: str) -> str:
     """Render the CPRS MEDICATIONS section from VistA RXOP body.
 
-    TODO: VistA's RXOP column layout differs from CPRS — fill in column
-    parser once a real RXOP sample is provided. Until then, emit the
-    canonical CPRS 'Active Outpatient Medications' header followed by
-    the raw body so the medications extractor can still find the block.
+    VistA RXOP format (real):
+        Drug....................................                         Last
+                          Rx #         Stat          Qty      Issued     Filled  Rem
+        TIRZEPATIDE WL 5MG/0.5ML SOLN INJ PEN
+                          34396659A    ACTIVE        8        05/27/2026 05/30/2026 (0)
+          SIG: INJECT 5MG (0.5ML) SUBCUTANEOUSLY EVERY WEEK FOR WEIGHT LOSS
+            Indication: FOR WEIGHT LOSS
+            Provider: DOE,JANE MARIE     Cost/Fill: $582.24
+
+        GABAPENTIN 100MG CAP
+                          43406880A    ACTIVE        540      11/06/2025 ...
+
+    Each med starts at column 0 with the drug name; subsequent indented
+    lines carry the Rx# / SIG / Indication / Provider. Blocks are
+    separated by a blank line.
+
+    The CPRS extract_medications() parses VA-formatted blocks shaped:
+        ===============================================================================
+        Drug Name
+         <NAME>
+        Issue Date
+         <MM/DD/YYYY>
+        SIG
+         <SIG TEXT>
+        Facility: <FAC>
+        ===============================================================================
+
+    We rewrite each RXOP med into that shape.
     """
     if not rxop_body or not rxop_body.strip():
         return ""
-    return "Active Outpatient Medications (including Supplies):\n" + rxop_body.strip() + "\n"
+
+    blocks: List[str] = []
+    cur_name = ""
+    cur_issued = ""
+    cur_sig_lines: List[str] = []
+    in_sig = False
+
+    def _flush():
+        if cur_name:
+            block = [
+                "=" * 79,
+                "Drug Name",
+                f" {cur_name}",
+                "Issue Date",
+                f" {cur_issued}",
+                "SIG",
+                f" {' '.join(cur_sig_lines).strip()}",
+                "Facility: VISTA EXPORT",
+            ]
+            blocks.append("\n".join(block))
+
+    for raw_line in rxop_body.split("\n"):
+        line = raw_line.rstrip()
+        if not line.strip():
+            # Blank line ends the current med
+            if cur_name:
+                _flush()
+                cur_name = ""
+                cur_issued = ""
+                cur_sig_lines = []
+                in_sig = False
+            continue
+
+        # New drug starts at column 0 with all-caps text (not "Drug...."
+        # / "Rx #" header).
+        if (not raw_line.startswith(" ")
+                and not raw_line.startswith("\t")
+                and line.upper() == line
+                and not line.startswith("DRUG..")
+                and "RX #" not in line.upper()
+                and re.match(r"^[A-Z][A-Z0-9 /,.%()'\-]+$", line)):
+            # New med — flush prior
+            if cur_name:
+                _flush()
+                cur_issued = ""
+                cur_sig_lines = []
+                in_sig = False
+            cur_name = line.title()
+            continue
+
+        # Rx# line: capture issue date from "ACTIVE  QTY  MM/DD/YYYY"
+        m_rx = re.search(
+            r"\bACTIVE\b.*?\b(\d{1,2}/\d{1,2}/\d{4})\b",
+            line,
+        )
+        if m_rx and not cur_issued and cur_name:
+            cur_issued = m_rx.group(1)
+            continue
+
+        # SIG line(s)
+        m_sig = re.match(r"\s+SIG:\s*(.*)$", raw_line, re.IGNORECASE)
+        if m_sig:
+            in_sig = True
+            cur_sig_lines = [m_sig.group(1).strip()]
+            continue
+
+        # SIG continuation: indented non-section line while in_sig
+        if in_sig:
+            stripped = line.strip()
+            # Stop on Indication / Provider / Cost lines
+            if re.match(r"(?i)^(indication|provider|cost|status|refills?):",
+                        stripped):
+                in_sig = False
+                continue
+            if stripped:
+                cur_sig_lines.append(stripped)
+            continue
+
+    # Final flush
+    if cur_name:
+        _flush()
+
+    if not blocks:
+        return ("Active Outpatient Medications (including Supplies):\n"
+                + rxop_body.strip() + "\n")
+
+    return (
+        "Active Outpatient Medications (including Supplies):\n"
+        + "\n".join(blocks)
+        + "\n"
+        + "=" * 79
+        + "\n"
+    )
 
 
 def _render_imaging_from_ii(ii_body: str) -> str:
@@ -382,6 +512,62 @@ def _render_imaging_from_ii(ii_body: str) -> str:
     )
 
 
+# Per provider direction (2026-06-20): pathology section should ONLY
+# include specimens from urologic organs. Other specimens (colon polyp,
+# skin biopsy, lung biopsy, etc.) are filtered out.
+_UROLOGIC_PATHOLOGY_ORGAN_RE = re.compile(
+    r"\b("
+    r"adrenal(?:\s+gland)?|"
+    r"kidney|renal|nephr(?:ectomy|olithotomy)?|"
+    r"ureter(?:al)?|"
+    r"bladder|urothelial|urothelium|"
+    r"urethra(?:l)?|"
+    r"prostate|prostatic|prost(?:\s+bx|\s+core|\s+biopsy)?|"
+    r"penis|penile|"
+    r"foreskin|preputial|"
+    r"test(?:is|es|icular)|"
+    r"vas(?:\s+deferens)?|"
+    r"spermatic\s+cord|"
+    r"epididym(?:is|al)|"
+    r"scrotum|scrotal|"
+    r"seminal\s+vesicle"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_urologic_pathology_block(block_text: str) -> bool:
+    """True if a pathology block describes a specimen from a urologic
+    organ.
+
+    A SP block has the urologic anatomy either at the very top (in the
+    Specimen: manifest, before that's stripped) or further down in the
+    DIAGNOSIS list as "A. PROSTATE, RIGHT MED APEX, BIOPSY:". We scan
+    the FIRST 1500 chars so a stripped manifest doesn't hide the
+    diagnosis labels, and also explicitly look at the DIAGNOSIS block
+    if present.
+
+    A passing narrative mention of "kidney" (e.g. inside "Brief Clinical
+    Hx: ... history of kidney stones") would still pass — but pathology
+    blocks are organ-specific by construction, so this is unlikely to
+    cause real false positives in practice.
+    """
+    if not block_text:
+        return False
+    head = block_text[:1500]
+    if _UROLOGIC_PATHOLOGY_ORGAN_RE.search(head):
+        return True
+    # Fallback: look in the DIAGNOSIS block (the structured part) for
+    # urologic anatomy labels even when the head is truncated.
+    diag_match = re.search(
+        r"(?:\*\*\s*MICROSCOPIC\s+EXAM/DIAGNOSIS|DIAGNOSIS:)\s*\n(.{0,1200})",
+        block_text, re.IGNORECASE | re.DOTALL,
+    )
+    if diag_match and _UROLOGIC_PATHOLOGY_ORGAN_RE.search(diag_match.group(1)):
+        return True
+    return False
+
+
 def _render_pathology_from_sp(sp_body: str) -> str:
     """Render the CPRS PATHOLOGY RESULTS section from VistA SP body.
 
@@ -407,6 +593,22 @@ def _render_pathology_from_sp(sp_body: str) -> str:
         body, flags=re.IGNORECASE | re.MULTILINE,
     )
 
+    # Strip the long pre-diagnosis "Specimen: A. R MED. APEX PROSTATE BX
+    # CORES / B. R MED. MID..." manifest. The same labels reappear under
+    # the DIAGNOSIS block where the cores actually have findings. Leaving
+    # the manifest in place lets the downstream pathology extractor
+    # accidentally pair the bare "Specimen: A. R MED. ..." line with
+    # whatever narrative appears after the SP body, producing phantom
+    # "A. R MED. APEX PROSTATE BX CORES: , new medications ordered..."
+    # entries scraped from unrelated ED-discharge text.
+    body = re.sub(
+        r"^\s*Specimen:\s*A\.\s+.*?(?=^\s*(?:Brief\s+Clinical|Gross\s+Description|"
+        r"Microscopic\s+Exam|\*\*\s*MICROSCOPIC|Date\s+obtained|----|$))",
+        "",
+        body,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+
     # Convert "Collected: MM/DD/YYYY HH:MM" -> "Date obtained: MMM DD, YYYY"
     # (the existing extractor's high-priority strategy 1b key).
     def _collected_to_date_obtained(m: re.Match) -> str:
@@ -424,7 +626,35 @@ def _render_pathology_from_sp(sp_body: str) -> str:
         body,
     )
 
-    return "---- SURGICAL PATHOLOGY ----\n" + body.strip() + "\n"
+    # Urologic-organ filter (provider direction). Split the SP body on
+    # per-report boundaries (allow leading whitespace because the
+    # Collected: rewrite preserves the original indentation) and keep
+    # only blocks describing one of the allowed urologic organs.
+    blocks = re.split(
+        r"(?=^\s*---- SURGICAL PATHOLOGY ----)",
+        body, flags=re.MULTILINE,
+    )
+    kept_blocks: List[str] = []
+    leading = ""
+    for blk in blocks:
+        if not blk.strip():
+            continue
+        if not re.match(r"^\s*----\s*SURGICAL\s+PATHOLOGY\s*----", blk, re.IGNORECASE):
+            leading = blk
+            continue
+        if _is_urologic_pathology_block(blk):
+            # Strip leading whitespace from the divider line so the
+            # downstream pathology extractor's section regex matches.
+            kept_blocks.append(re.sub(r"^\s+", "", blk.lstrip("\n")).rstrip())
+
+    if not kept_blocks:
+        return ""
+
+    parts: List[str] = []
+    if leading.strip() and _is_urologic_pathology_block(leading):
+        parts.append("---- SURGICAL PATHOLOGY ----\n" + leading.strip())
+    parts.extend(kept_blocks)
+    return "\n\n".join(parts) + "\n"
 
 
 _VISTA_LAB_ROW_RE = re.compile(
@@ -438,120 +668,297 @@ _VISTA_LAB_ROW_RE = re.compile(
     re.MULTILINE,
 )
 
+# VistA "ditto" continuation rows under a date+specimen header — the
+# date/specimen literally repeat as quotation marks: '   "        "   '
+_VISTA_LAB_DITTO_RE = re.compile(
+    r'^\s*"\s+"\s+"?\s*'
+    r"(.+?)\s{2,}"
+    r"([<>]?\d+\.?\d*)\s*([HL]?)\s*"
+    r"([A-Za-z%/0-9.]*)\s*(.*)$",
+    re.MULTILINE,
+)
 
-def _extract_psa_rows_from_lab_table(body: str) -> List[Tuple[str, str, str]]:
-    """Find PSA TOTAL rows in a VistA lab table and return
-    [(date_disp, time, value), ...] in source order.
+
+def _normalize_vista_lab_dittos(body: str) -> str:
+    """VistA labs use ditto-mark continuation rows under a single
+    date+specimen header:
+        05/02/2026 23:34  BLOOD      POC SODIUM       139    mmol/L  138 - 146
+           "        "       "        POC POTASSIUM    3.3 L  mmol/L  3.5 - 4.9
+           "        "       "        POC CHLORIDE     106    mmol/L  98 - 109
+
+    Replace the dittos with the inherited date / specimen so each row
+    is independently parseable. Performs a single forward pass.
     """
-    out: List[Tuple[str, str, str]] = []
-    seen = set()
+    if not body:
+        return body
+    out_lines: List[str] = []
+    cur_date = ""
+    cur_spec = ""
+    for line in body.split("\n"):
+        m = re.match(
+            r"^(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2})\s+(\S+)\s+(.*)$",
+            line,
+        )
+        if m:
+            cur_date = m.group(1)
+            cur_spec = m.group(2)
+            out_lines.append(line)
+            continue
+        # Ditto-row: replace with the inherited prefix
+        m2 = re.match(
+            r'^\s*"\s+"\s+"?\s*(.*)$',
+            line,
+        )
+        if m2 and cur_date and cur_spec:
+            out_lines.append(f"{cur_date}  {cur_spec}      {m2.group(1)}")
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+# Test-name classifier. Each entry is (regex, bucket).
+# Buckets:
+#   "psa"       -> PSA CURVE block (already handled)
+#   "endocrine" -> ENDOCRINE LABS section
+#   "stone"     -> STONE LABS section
+#   "skip"      -> drop (e.g. stool pathogens, irrelevant POC tests)
+#   "general"   -> regular LABS section
+_LAB_BUCKET_RULES: Tuple[Tuple[re.Pattern, str], ...] = (
+    # PSA family — pulled into PSA CURVE
+    (re.compile(r"\bPSA\s+TOTAL\b", re.IGNORECASE), "psa"),
+    (re.compile(r"\bPSA-?F\b|FREE\s+PSA|\bPSA\s*%|%\s*FREE\s+PSA", re.IGNORECASE), "psa_free"),
+
+    # Endocrine
+    (re.compile(r"TESTOSTERONE.*FREE|FREE\s+TESTOSTERONE", re.IGNORECASE), "endocrine"),
+    (re.compile(r"%\s*FREE\s+TESTOSTERONE", re.IGNORECASE), "endocrine"),
+    (re.compile(r"TESTOSTERONE", re.IGNORECASE), "endocrine"),
+    (re.compile(r"ESTROGEN|ESTRADIOL|TOTAL\s+ESTROGENS?", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bLH\b|LUTEINIZING\s+HORMONE", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bFSH\b|FOLLICLE\s+STIM", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bHCG\b|HUMAN\s+CHORIONIC", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bAFP\b|ALPHA[- ]?FETOPROTEIN", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bLDH\b|LACTATE\s+DEHYDROGENASE", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bHB?A1C\b|HEMOGLOBIN\s+A1C|GLYCATED\s+HEMOGLOBIN", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bTSH\b|THYROID\s+STIM", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bPRL\b|PROLACTIN", re.IGNORECASE), "endocrine"),
+    (re.compile(r"\bSHBG\b|SEX\s+HORMONE\s+BIND", re.IGNORECASE), "endocrine"),
+
+    # Stone-panel (24-hour urine + stone composition)
+    (re.compile(r"\bSTONERISK\b|STONE\s+(?:RISK|COMPOSITION|ANALYSIS)|CALCULUS\s+ANALYSIS",
+                re.IGNORECASE), "stone"),
+    (re.compile(r"CALCIUM\s+OXALATE|CALCIUM\s+PHOSPHATE|BRUSHITE|"
+                r"STRUVITE|URIC\s+ACID\s+(?:CRYST|SS)|URIC\s+ACID,\s*URINE|"
+                r"SODIUM\s+URATE|TOTAL\s+URINE\s+VOLUME",
+                re.IGNORECASE), "stone"),
+    (re.compile(r"\b(?:OXALATE|CITRATE|MAGNESIUM|SODIUM|POTASSIUM|"
+                r"PHOSPHORUS|PHOSPHATE|SULFATE|AMMONIUM|CREATININE|"
+                r"CALCIUM|URIC\s+ACID),?\s+URINE\b",
+                re.IGNORECASE), "stone"),
+    (re.compile(r"\bURINE\s+(?:OXALATE|CITRATE|MAGNESIUM|SODIUM|POTASSIUM|"
+                r"PHOSPHORUS|PHOSPHATE|SULFATE|AMMONIUM|CALCIUM|CREATININE|"
+                r"URIC\s+ACID)\b",
+                re.IGNORECASE), "stone"),
+    (re.compile(r"\bURINE\s+PH\b|\bpH\s+URINE\b", re.IGNORECASE), "stone"),
+    (re.compile(r"\bCYSTINE\b", re.IGNORECASE), "stone"),
+
+    # Stool pathogen panel — drop, not clinically relevant in urology note
+    (re.compile(r"CAMPYLO|VIBRIO|SHIGELLA|SALMONELLA|YERSINIA|"
+                r"ROTAVIRUS|NOROVIRUS|ASTROVIRUS|SAPOVIRUS|ADENOV|"
+                r"CRYPTOSPORIDIUM|CYCLOSPORA|G LAMBLIA|E HISTOLYTICA|"
+                r"PLESIOMONAS|SHIGA-TOX|ENTERO E COLI|ENTEROPATH E COLI|"
+                r"ENTERTOX E COLI|A/B TOXIN", re.IGNORECASE), "skip"),
+)
+
+
+def _classify_lab_test(test_name: str) -> str:
+    """Return the bucket for a VistA lab test name."""
+    for pat, bucket in _LAB_BUCKET_RULES:
+        if pat.search(test_name):
+            return bucket
+    return "general"
+
+
+def _parse_lab_rows(body: str) -> List[Tuple[str, str, str, str, str, str, str, str]]:
+    """Parse VistA lab rows into (date_disp, hhmm, specimen, test_name,
+    value, flag, units, ref) tuples. Dittos are expanded first."""
+    body = _normalize_vista_lab_dittos(body or "")
+    out: List[Tuple[str, str, str, str, str, str, str, str]] = []
     for m in _VISTA_LAB_ROW_RE.finditer(body):
         mm, dd, yyyy, hhmm = m.group(1), m.group(2), m.group(3), m.group(4)
+        specimen = m.group(5).strip().upper()
         test_name = m.group(6).strip().upper()
         value = m.group(7)
-        if "PSA" not in test_name:
-            continue
-        if any(skip in test_name for skip in ("FREE PSA", "%PSA", "PSA%", "PSA-F", "DENSITY")):
-            # Only TOTAL PSA enters the curve
-            if "TOTAL" not in test_name:
-                continue
+        flag = m.group(8) or ""
+        units = m.group(9) or ""
+        ref = (m.group(10) or "").strip()
         try:
             from datetime import date as _date
             d = _date(int(yyyy), int(mm), int(dd))
             date_disp = d.strftime("%b %d, %Y")
         except Exception:
             date_disp = f"{mm}/{dd}/{yyyy}"
-        key = (date_disp, hhmm, value)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((date_disp, hhmm.replace(":", ""), value))
+        out.append((date_disp, hhmm.replace(":", ""), specimen, test_name,
+                    value, flag, units, ref))
     return out
 
 
-def _extract_non_psa_lab_lines(body: str) -> List[str]:
-    """Pass non-PSA lab rows through in the CPRS '... [671] (date)' shape
-    the labs extractor already handles."""
-    out: List[str] = []
-    seen = set()
-    for m in _VISTA_LAB_ROW_RE.finditer(body):
-        mm, dd, yyyy = m.group(1), m.group(2), m.group(3)
-        test_name = m.group(6).strip()
-        value = m.group(7)
-        flag = m.group(8)
-        units = m.group(9)
-        ref = m.group(10).strip()
-        if "PSA" in test_name.upper():
-            continue
-        try:
-            from datetime import date as _date
-            d = _date(int(yyyy), int(mm), int(dd))
-            date_disp = d.strftime("%b %d, %Y")
-        except Exception:
-            date_disp = f"{mm}/{dd}/{yyyy}"
-        # Build CPRS-style line: "NAME  VALUE [H/L]  UNITS  REF  ({date})"
-        parts = [test_name.upper(), value]
-        if flag:
-            parts.append(flag)
-        if units:
-            parts.append(units)
-        if ref:
-            parts.append(ref)
-        parts.append(f"({date_disp})")
-        rendered = "  ".join(parts)
-        key = (test_name.upper(), date_disp, value)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(rendered)
-    return out
+def _format_cprs_lab_line(test_name: str, value: str, flag: str, units: str,
+                          ref: str, date_disp: str) -> str:
+    """Render a single CPRS-canonical lab line.
+
+    Shape: "NAME  VALUE [H/L]  UNITS  REF  (MMM DD, YYYY)"
+    Downstream lab + endocrine extractors already parse this shape.
+    """
+    parts: List[str] = [test_name, value]
+    if flag:
+        parts.append(flag)
+    if units:
+        parts.append(units)
+    if ref:
+        parts.append(ref)
+    parts.append(f"({date_disp})")
+    return "  ".join(parts)
 
 
 def _render_labs_from_ch_slt_mic(ch_body: str, slt_body: str, mic_body: str) -> str:
-    """Render the CPRS LABS section + PSA CURVE block.
+    """Bucket VistA lab rows by clinical category and emit each bucket
+    under the matching CPRS section header.
 
-    VistA SLT / CH rows look like:
+    Buckets:
+      psa       -> PSA CURVE: ... (rows shaped "[r] MMM DD, YYYY HHMM   VAL")
+      endocrine -> "===== ENDOCRINE LABS =====" CPRS block
+      stone     -> "===== STONE LABS =====" CPRS block
+      general   -> "===== LABS =====" CPRS block
+      skip      -> dropped (stool pathogens, irrelevant POC)
+      psa_free  -> dropped from PSA CURVE (free PSA / %PSA noise) but
+                   surfaced as a general lab line for completeness
 
-        MM/DD/YYYY HH:MM  SERUM      TEST NAME            VALUE H  UNITS  REF
-        10/20/2025 11:25  SERUM      PSA TOTAL            5.52 H   ng/mL  0.2 - 4.0
-
-    The existing CPRS PSA extractor wants a 'PSA CURVE:' header block
-    with rows shaped 'MMM DD, YYYY HHMM  VALUE'. The labs extractor
-    wants 'NAME  VALUE  UNITS  REF  (MMM DD, YYYY)'. We synthesize
-    both shapes from the parsed VistA rows.
-
-    Source order:
-      - PSA TOTAL rows -> consolidated PSA CURVE block (sorted newest
-        first as the extractor expects).
-      - All other rows from SLT + CH -> CPRS-style LABS lines.
-      - MIC rows -> appended verbatim under a MICROBIOLOGY: header
-        (the labs extractor passes microbiology through).
+    Dittos are expanded first so each row carries its own date/specimen.
     """
-    combined_lab_body = "\n".join(b for b in (slt_body, ch_body) if b and b.strip())
+    combined = "\n".join(b for b in (slt_body, ch_body) if b and b.strip())
+    rows = _parse_lab_rows(combined)
+    if not rows and not (mic_body and mic_body.strip()):
+        return ""
+
+    # Bucket the rows. Deduplicate per (test_name, date_disp, value).
+    psa_rows: List[Tuple[str, str, str]] = []          # (date_disp, hhmm, value)
+    endocrine_rows: List[str] = []
+    stone_rows: List[str] = []
+    general_rows: List[str] = []
+    seen_psa = set()
+    seen_other = set()
+
+    for date_disp, hhmm, specimen, test_name, value, flag, units, ref in rows:
+        bucket = _classify_lab_test(test_name)
+        if bucket == "skip":
+            continue
+        if bucket == "psa":
+            key = (date_disp, hhmm, value)
+            if key in seen_psa:
+                continue
+            seen_psa.add(key)
+            psa_rows.append((date_disp, hhmm, value))
+            continue
+
+        line = _format_cprs_lab_line(test_name, value, flag, units, ref, date_disp)
+        key = (test_name, date_disp, value)
+        if key in seen_other:
+            continue
+        seen_other.add(key)
+
+        if bucket == "endocrine":
+            endocrine_rows.append(line)
+        elif bucket == "stone":
+            stone_rows.append(line)
+        elif bucket == "psa_free":
+            # Free-PSA / %PSA values are not part of PSA CURVE but the
+            # provider may still want them visible — surface as general.
+            general_rows.append(line)
+        else:
+            general_rows.append(line)
 
     out_parts: List[str] = []
 
-    # PSA CURVE block
-    psa_rows = _extract_psa_rows_from_lab_table(combined_lab_body)
+    # PSA CURVE (newest first)
     if psa_rows:
-        # Newest first
+        from datetime import datetime as _dt
         def _date_key(row):
-            from datetime import datetime
             try:
-                return datetime.strptime(row[0], "%b %d, %Y")
+                return _dt.strptime(row[0], "%b %d, %Y")
             except Exception:
-                return datetime.min
+                return _dt.min
         psa_rows.sort(key=_date_key, reverse=True)
         psa_lines = ["PSA CURVE:"]
         for date_disp, hhmm, value in psa_rows:
             psa_lines.append(f"[r] {date_disp} {hhmm or '0000'}    {value}")
         out_parts.append("\n".join(psa_lines))
 
-    # Non-PSA labs
-    other_lab_lines = _extract_non_psa_lab_lines(combined_lab_body)
-    if other_lab_lines:
-        out_parts.append("==================== LABS ====================\n" + "\n".join(other_lab_lines))
+    # Endocrine block (matches "===== ENDOCRINE LABS =====" section anchor)
+    if endocrine_rows:
+        out_parts.append(
+            "=" * 31 + "ENDOCRINE LABS " + "=" * 28 + "\n"
+            + "\n".join(endocrine_rows)
+        )
 
+    # Stone block. The existing CPRS stone extractor's most reliable
+    # parser is extract_plain_label_stone_panel(), which keys on a
+    # "24-HOUR URINE METABOLIC STONE PANEL (date):" header followed by
+    # "LABEL: value" lines. Emit that shape instead of the generic
+    # CPRS lab-line shape so the values are actually parsed.
+    #
+    # Threshold gate: only emit a STONE LABS panel when at least 3
+    # distinct stone-panel analytes co-occur on the same date. A
+    # single isolated row (e.g. routine 'URINE PH 5.0' from a UA) is
+    # not a 24-hr urine panel and should not promote a STONE LABS
+    # section that the LLM then references as if a metabolic workup
+    # had been done.
+    if stone_rows:
+        stone_per_date: Dict[str, List[Tuple[str, str]]] = {}
+        for date_disp, hhmm, specimen, test_name, value, flag, units, ref in rows:
+            if _classify_lab_test(test_name) != "stone":
+                continue
+            label = re.sub(r"\s+", " ", test_name.title()).strip()
+            value_str = value
+            if flag:
+                value_str += f" {flag}"
+            if units:
+                value_str += f" {units}"
+            stone_per_date.setdefault(date_disp, []).append((label, value_str))
+        # Drop dates that don't meet the cluster threshold
+        stone_per_date = {
+            d: rows_ for d, rows_ in stone_per_date.items()
+            if len(rows_) >= 3
+        }
+
+        if stone_per_date:
+            # Newest panel first
+            from datetime import datetime as _dt
+            def _date_key(d):
+                try:
+                    return _dt.strptime(d, "%b %d, %Y")
+                except Exception:
+                    return _dt.min
+            panel_blocks: List[str] = []
+            for date_disp in sorted(stone_per_date.keys(), key=_date_key, reverse=True):
+                lines = [f"24-HOUR URINE METABOLIC STONE PANEL ({date_disp}):"]
+                for label, val in stone_per_date[date_disp]:
+                    lines.append(f"{label}: {val}")
+                panel_blocks.append("\n".join(lines))
+
+            out_parts.append(
+                "=" * 30 + "STONE RELATED LABS " + "=" * 26 + "\n"
+                + "\n\n".join(panel_blocks)
+            )
+
+    # General LABS block
+    if general_rows:
+        out_parts.append(
+            "=" * 36 + " LABS " + "=" * 36 + "\n"
+            + "\n".join(general_rows)
+        )
+
+    # Microbiology pass-through under its own header so the labs
+    # extractor's existing UA-culture parsing can find it.
     if mic_body and mic_body.strip():
         out_parts.append("MICROBIOLOGY:\n" + mic_body.strip())
 
