@@ -127,12 +127,13 @@ def split_vista_sections(raw_text: str) -> Dict[str, str]:
 #   - Bone Scan
 #   - PET/CT, specifically PSMA PET/CT
 # ---------------------------------------------------------------------------
+# Modalities the provider asked us to preserve.
 _UROLOGIC_IMAGING_MODALITY_RE = re.compile(
-    r"\b("
-    r"CT[\s\-]?\w*|"           # CT, CT-Abd, CT/PEL, etc.
-    r"MRI|"                    # any MRI study
-    r"MR[\s\-]?(?:[A-Za-z]+)?|"  # MR PROSTATE, MR PELVIS
-    r"US|U/?S|Ultrasound|"     # US, U/S, ultrasound
+    r"\b(?:"
+    r"CT(?:A|U)?\b|"             # CT / CTA / CTU
+    r"MRI|"                      # any MRI study
+    r"MR\b|"                     # bare MR (e.g. "MR PROSTATE")
+    r"US|U/S|Ultrasound|"        # ultrasound
     r"bone\s+scan|"
     r"nuclear\s+med(?:icine)?\s+bone|"
     r"PSMA(?:[\s\-]?PET(?:/CT)?)?|"
@@ -141,18 +142,70 @@ _UROLOGIC_IMAGING_MODALITY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Urologic anatomy / region keywords. A CT or MRI or US is only
+# urologically-relevant when one of these anatomy markers appears in the
+# study name. The list is conservative and explicit so non-GU CT/MRI
+# (CT MAXILLOFACIAL, CT CHEST, MRI BRAIN, MRI SHOULDER, etc.) drop out.
+_UROLOGIC_ANATOMY_RE = re.compile(
+    r"\b(?:"
+    r"abd(?:omen|ominal)?|"        # CT abd, ABDOMEN, abdominal
+    r"pelvis|pelvic|pel\b|"
+    r"abd[/&]?\s*pel(?:vis)?|"
+    r"urogram|"
+    r"renal|kidney|"
+    r"retroperitoneal|"
+    r"bladder|cystogram|"
+    r"prostate|prostatic|"
+    r"adrenal|"
+    r"scrotum|scrotal|testic|epididym|"
+    r"penis|penile|"
+    r"ureter|"
+    r"renal\s+stone|"
+    r"KUB"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Studies that are urologic by modality alone (no anatomy gate needed).
+_UROLOGIC_BY_MODALITY_ALONE_RE = re.compile(
+    r"\b(?:"
+    r"bone\s+scan|"
+    r"nuclear\s+med(?:icine)?\s+bone|"
+    r"PSMA(?:[\s\-]?PET(?:/CT)?)?|"
+    r"MR\s*UROGRAM"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _is_urologic_imaging_study(study_block: str) -> bool:
     """True if the imaging-study block represents one of the urologic
-    modalities the provider wants preserved (CT, MRI, US, Bone Scan,
-    PSMA PET/CT)."""
+    modalities the provider wants preserved.
+
+    Rule: study is urologic if EITHER
+      - the modality alone is inherently urologic (bone scan, PSMA PET,
+        MR urogram), OR
+      - the modality matches CT / CTA / CTU / MRI / MR / US / Ultrasound
+        AND the title contains a urologic anatomy keyword (abd / pelvis /
+        renal / kidney / bladder / prostate / adrenal / scrotum / testis /
+        ureter / urogram / retroperitoneal / KUB).
+
+    Non-urologic CT / MRI titles (CT MAXILLOFACIAL, CT CHEST, MRI BRAIN,
+    MRI SHOULDER, KNEE X-ray, etc.) lack a urologic anatomy match and
+    correctly drop.
+    """
     if not study_block:
         return False
-    # Limit search to the first ~3 lines — that is where the study
-    # name lives in II output. Avoids matching mentions of imaging
-    # inside the IMPRESSION prose ("compared to prior CT...").
+    # Limit search to the first ~3 lines so a passing mention of CT in
+    # the IMPRESSION prose ("compared to prior CT") does not promote a
+    # non-urologic study into the urologic set.
     head = "\n".join(study_block.split("\n")[:4])
-    return bool(_UROLOGIC_IMAGING_MODALITY_RE.search(head))
+    if _UROLOGIC_BY_MODALITY_ALONE_RE.search(head):
+        return True
+    if (_UROLOGIC_IMAGING_MODALITY_RE.search(head)
+            and _UROLOGIC_ANATOMY_RE.search(head)):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -476,26 +529,42 @@ def _render_imaging_from_ii(ii_body: str) -> str:
         else:
             mm, dd, yyyy, title = m.group(1), m.group(2), m.group(3), m.group(4).strip()
 
-        # Apply urologic filter on the title
-        if not _UROLOGIC_IMAGING_MODALITY_RE.search(title) and not _is_urologic_imaging_study(chunk):
+        # Apply urologic filter on the TITLE. Both checks are required:
+        #   1. _is_urologic_imaging_study() — modality + anatomy or
+        #      inherently-urologic modality (bone scan / PSMA PET).
+        #   2. An explicit drop list for studies whose title still
+        #      matches an anatomy keyword but is really non-urologic
+        #      (chest CTA, maxillofacial CT, etc.).
+        if not _is_urologic_imaging_study(title):
             continue
-        # Additional drop list: knee, shoulder, spine plain films, IACS MRI,
-        # etc. that match "CT" / "MRI" generically but are clearly not GU.
+        # Explicit non-urologic anatomy drop list. A small number of
+        # study titles can sneak past (1) when they contain BOTH a
+        # non-GU anatomy word and a GU-ish word — e.g. "CTA ABDOMINAL
+        # AORTA" satisfies the abdominal anatomy gate but the study is
+        # really vascular, not urologic. Drop when title contains a
+        # non-urologic anatomy word UNLESS it also contains a urologic-
+        # primary keyword (urogram / renal / kidney / bladder / prostate
+        # / adrenal / scrotum / testis / etc.).
         if re.search(
             r"\b(?:knee|shoulder|spine|cervical|thoracic\s+spine|lumbar\s+spine|"
             r"foot|ankle|hand|wrist|chest|cardiac|brain|head|sinus|"
-            r"IACS|internal\s+auditory)\b",
+            r"maxillofacial|mandib|sialo|parotid|salivary|dental|"
+            r"IACS|internal\s+auditory|"
+            r"aortic|aorta|iliac|vascular|EVAR|carotid|peripheral)\b",
             title, re.IGNORECASE,
         ):
-            # ... unless it's GU-specific (CT abd/pel, CT urogram, MR prostate)
             if not re.search(
-                r"\b(?:abd|pelvis|pel|urogram|renal|kidney|prostate|"
-                r"retroperitoneal|bladder|adrenal)\b",
+                r"\b(?:urogram|renal|kidney|prostate|adrenal|scrotum|"
+                r"scrotal|testic|epididym|penis|penile|ureter|bladder|"
+                r"cystogram|KUB|retroperitoneal)\b",
                 title, re.IGNORECASE,
             ):
                 continue
 
-        # Parse the impression text from the indented body
+        # Parse the impression text from the indented body. VistA II
+        # report bodies are indented continuation lines under the
+        # study header; sometimes the impression is labeled with an
+        # explicit "Impression:" line, sometimes it's just free-text.
         impression_lines: List[str] = []
         for line in rest.split("\n"):
             ln = line.strip()
@@ -509,10 +578,34 @@ def _render_imaging_from_ii(ii_body: str) -> str:
                 continue
             if "Attention Patients" in ln or "ordering provider" in ln.lower():
                 continue
+            # Drop telephone / fax footer lines that some sites paste
+            # below the impression — "877-780-5559", "phone:", etc.
+            if re.match(r"^[\s\-]*(?:\(?\d{3}\)?[\s\-]?){2}\d{4}[\s\-]*$", ln):
+                continue
+            if re.match(r"^(?:phone|fax|tel)\s*[:\-]", ln, re.IGNORECASE):
+                continue
+            # If we see an explicit "Impression:" / "IMPRESSION:" header
+            # WITH text on the same line OR following lines, prefer that
+            # specifically — it's the radiologist's bottom-line summary
+            # and is more useful than concatenated body text.
+            m_imp = re.match(r"^impression\s*:?\s*(.*)$", ln, re.IGNORECASE)
+            if m_imp:
+                tail_text = m_imp.group(1).strip()
+                if tail_text:
+                    impression_lines = [tail_text]
+                else:
+                    impression_lines = []
+                continue
             impression_lines.append(ln)
         impression = " ".join(impression_lines).strip()
         if not impression:
-            impression = "(no impression text)"
+            # No usable body content for this study. Per provider
+            # direction, do NOT emit a "(no impression text)" placeholder
+            # — the LLM has been observed to treat that string as a
+            # real finding ("imaging was inconclusive"). Drop the study
+            # entirely; the IMAGING section is better off without a row
+            # than with a fabrication-prone placeholder.
+            continue
 
         # Build CPRS-format header. The downstream extract_human_readable_imaging
         # expects the date in MM/DD/YYYY form and the section header to use
