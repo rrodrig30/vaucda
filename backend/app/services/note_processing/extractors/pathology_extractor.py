@@ -1038,6 +1038,36 @@ def extract_pathology(clinical_document: str) -> str:
             diagnosis = re.sub(r' +', ' ', diagnosis)
             diagnosis = re.sub(r'\n{3,}', '\n', diagnosis)
 
+            # Reject empty / punctuation-only diagnoses. A diagnosis that
+            # is just ", new medications ordered..." (the classic phantom
+            # shape) starts with a comma because the DIAGNOSIS regex
+            # capture latched onto a bare "Specimen: X" label and the
+            # text immediately after happened to be unrelated narrative.
+            diagnosis_test = diagnosis.lstrip(", ;:.\n\t")
+            if not diagnosis_test or len(diagnosis_test) < 8:
+                continue
+            # Reject pathology entries whose SPECIMEN is non-urologic.
+            # Per provider direction (2026-06-20) pathology must be limited
+            # to urologic organs (adrenal / kidney / ureter / bladder /
+            # urethra / prostate / penis / foreskin / testis / vas /
+            # spermatic cord / epididymis / scrotum / seminal vesicle).
+            # Microbiology / cytology samples like THROAT CULTURE,
+            # PHARYNX, NASAL, SPUTUM, etc. should never appear here.
+            if specimen:
+                _UROLOGIC_PATH_ORGANS_RE = re.compile(
+                    r"\b(?:adrenal|kidney|renal|nephr|ureter|bladder|"
+                    r"urothelial|urothelium|urethra|prostate|prostatic|"
+                    r"penis|penile|foreskin|preputial|testis|testes|"
+                    r"testicular|vas|spermatic|epididym|scrotum|scrotal|"
+                    r"seminal\s+vesicle)\b",
+                    re.IGNORECASE,
+                )
+                if not _UROLOGIC_PATH_ORGANS_RE.search(specimen):
+                    # Specimen names that are explicitly NOT urologic.
+                    # Drop the entry entirely rather than emit a phantom
+                    # "<DATE> - PHARYNX: <ED-discharge narrative>" line.
+                    continue
+
             # Format: Date | Specimen | Diagnosis
             if date and diagnosis:
                 report = f"{date} - {specimen}: {diagnosis}" if specimen else f"{date}: {diagnosis}"

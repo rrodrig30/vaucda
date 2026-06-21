@@ -443,6 +443,73 @@ class ConsultRequestExtractor:
                 if structured_race:
                     result['race'] = structured_race.group(1).strip().upper()
 
+        # ======================================================================
+        # PRIORITY 5 (FALLBACK): VistA "GU CLINIC PREP EXTRACT" banner
+        # Common shapes:
+        #   "PATIENT: DOE,JOHN"
+        #   "DOE,JOHN    XXX-XX-XXXX   DOB: 03/08/1969"
+        #   "DOE,JOHN, XXX-XX-XXXX, MAR 8,1969"
+        # Only fills fields that prior priorities did not populate.
+        # ======================================================================
+        if not result.get('patient_name'):
+            m = re.search(
+                r"^\s*PATIENT\s*:\s*([A-Z][A-Z'\- ]+,[A-Z][A-Z'\- ]+(?:\s+[A-Z][A-Z'\- ]+)?)\s*$",
+                text, re.MULTILINE,
+            )
+            if m:
+                va_name = m.group(1).strip()
+                result['patient_name'] = va_name
+                result['patient_name_formatted'] = self._format_name(va_name)
+
+        # Combined name + SSN + DOB on one line
+        if not result.get('patient_name') or not result.get('ssn'):
+            m = re.search(
+                r"^([A-Z][A-Z'\- ]+,[A-Z][A-Z'\- ]+(?:\s+[A-Z][A-Z'\- ]+)?)"
+                r"[\s,]+(\d{3}-\d{2}-\d{4})",
+                text, re.MULTILINE,
+            )
+            if m:
+                if not result.get('patient_name'):
+                    va_name = m.group(1).strip()
+                    result['patient_name'] = va_name
+                    result['patient_name_formatted'] = self._format_name(va_name)
+                if not result.get('ssn'):
+                    ssn = m.group(2)
+                    result['ssn'] = ssn
+                    result['ssn_last4'] = ssn.split('-')[-1]
+
+        # Standalone DOB line ("DOB: 03/08/1969") for age computation by
+        # downstream caller. We don't write age here — note_builder
+        # recomputes it from DOB + visit_date authoritatively.
+
+        # DEM-section sex line ("Sex: MALE" but with VistA whitespace)
+        if not result.get('sex'):
+            m = re.search(r"Sex\s*:\s*(MALE|FEMALE)\b", text, re.IGNORECASE)
+            if m:
+                result['sex'] = m.group(1).strip().upper()
+
+        # DEM-section race line. VistA puts it after "Race:" with leading
+        # whitespace; existing pattern's stop list misses VistA so add a
+        # second permissive matcher gated on first miss.
+        if not result.get('race'):
+            m = re.search(
+                r"Race\s*:\s*([A-Z][A-Z ]+?)(?:\s{2,}|\n|$)",
+                text,
+            )
+            if m:
+                result['race'] = m.group(1).strip()
+
+        # DEM-section age line
+        if not result.get('age'):
+            m = re.search(
+                r"\bAge\s*:\s*(\d{1,3})\b",
+                text,
+            )
+            if m:
+                age_val = int(m.group(1))
+                if 18 <= age_val <= 110:
+                    result['age'] = str(age_val)
+
         return result
 
     def _format_name(self, va_name: str) -> str:
