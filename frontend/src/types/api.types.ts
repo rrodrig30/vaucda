@@ -229,6 +229,8 @@ export interface UserSettings {
   ocr_llm?: TaskLLMConfig
   stage1_llm?: TaskLLMConfig
   stage2_llm?: Stage2LLMConfig
+  // Source EHR format of pasted/uploaded charts: 'cprs' (default) or 'vista'.
+  source_format?: 'cprs' | 'vista'
 }
 
 export interface ModuleDefaults {
@@ -283,6 +285,7 @@ export interface UpdateSettingsRequest {
   stage2_use_rag?: boolean
   stage2_use_graphrag?: boolean
   stage2_rag_top_k?: number
+  source_format?: 'cprs' | 'vista'
 }
 
 // Task-Specific LLM Configuration

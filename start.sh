@@ -215,6 +215,9 @@ fi
 if [ -f "database/migrations/add_num_ctx_columns.py" ]; then
     python database/migrations/add_num_ctx_columns.py 2>/dev/null || echo -e "${YELLOW}  num_ctx migration script completed (or database not yet created)${NC}"
 fi
+if [ -f "database/migrations/add_source_format_column.py" ]; then
+    python database/migrations/add_source_format_column.py 2>/dev/null || echo -e "${YELLOW}  source_format migration script completed (or database not yet created)${NC}"
+fi
 echo -e "${GREEN}✓ Database migrations complete${NC}"
 
 # Check Neo4j (optional) - test actual connectivity

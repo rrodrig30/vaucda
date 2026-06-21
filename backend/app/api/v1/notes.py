@@ -14,6 +14,7 @@ import os
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Request, File, Form, UploadFile, Header
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_active_user
@@ -56,6 +57,22 @@ def get_llm_manager() -> LLMManager:
     if _global_llm_manager is None:
         _global_llm_manager = LLMManager()
     return _global_llm_manager
+
+
+async def _get_user_source_format(user_id: str, db) -> str:
+    """Look up the user's preferred source EHR format ('cprs' | 'vista').
+
+    Returns 'cprs' on any error / missing pref so existing single-tenant
+    deployments behave exactly as before.
+    """
+    try:
+        stmt = select(UserPreferences).where(UserPreferences.user_id == user_id)
+        result = await db.execute(stmt)
+        prefs = result.scalars().first()
+        sf = (prefs.source_format if prefs and prefs.source_format else "cprs").lower()
+        return "vista" if sf == "vista" else "cprs"
+    except Exception:
+        return "cprs"
 
 
 # Dependency injection - get note generator using app.state resources
@@ -444,10 +461,12 @@ async def generate_initial_note(
         if request.visit_date:
             clinical_input_with_date = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
 
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
             clinical_text=clinical_input_with_date,
-            task_config=stage1_config
+            task_config=stage1_config,
+            source_format=_src_fmt,
         )
 
         logger.info(f"Agent-based note builder complete: {len(preliminary_note)} chars generated")
@@ -817,10 +836,12 @@ async def generate_express_note(
             )
 
         logger.info("Express Step 1: Building Stage 1 preliminary note...")
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
             clinical_text=clinical_input_with_date,
             task_config=stage1_config,
+            source_format=_src_fmt,
         )
         logger.info(
             f"Express: preliminary note ready ({len(preliminary_note)} chars)"
@@ -1042,10 +1063,12 @@ async def generate_express_note_stream(
                     f"VISIT DATE: {visit_date_v}\n\n{clinical_input}"
                 )
 
+            _src_fmt = await _get_user_source_format(current_user.user_id, db)
             preliminary_note = await asyncio.to_thread(
                 build_urology_note,
                 clinical_text=clinical_input_with_date,
                 task_config=stage1_config,
+                source_format=_src_fmt,
             )
             t_stage1 = _time.time() - t0
 
@@ -1727,12 +1750,14 @@ async def batch_upload_and_process(
         start_time = time.time()
         completed_notes = []  # (filename, content) for total.vaucda
         results = []
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
 
         async def stage1_func(clinical_input, note_type):
             return await asyncio.to_thread(
                 build_urology_note,
                 clinical_text=clinical_input,
                 task_config=stage1_config,
+                source_format=_src_fmt,
             )
 
         async def stage2_func(preliminary_note, clinical_input, note_type):
@@ -1980,11 +2005,13 @@ async def batch_process_folder(
         )
 
         # Define Stage 1 processing function
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
         async def stage1_func(clinical_input: str, note_type: str) -> str:
             return await asyncio.to_thread(
                 build_urology_note,
                 clinical_text=clinical_input,
                 task_config=stage1_config,
+                source_format=_src_fmt,
             )
 
         # Define Stage 2 processing function
@@ -2218,12 +2245,14 @@ async def batch_process_folder_stream(
 
     # Queue for SSE events from the batch processor
     progress_queue: asyncio.Queue = asyncio.Queue()
+    _src_fmt = await _get_user_source_format(current_user.user_id, db)
 
     async def stage1_func(clinical_input: str, note_type: str) -> str:
         return await asyncio.to_thread(
             build_urology_note,
             clinical_text=clinical_input,
             task_config=stage1_config,
+            source_format=_src_fmt,
         )
 
     async def stage2_func(

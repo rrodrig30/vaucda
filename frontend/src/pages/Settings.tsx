@@ -33,6 +33,7 @@ export const Settings: React.FC = () => {
     default_llm: 'ollama' as 'ollama' | 'anthropic' | 'openai',
     default_model: '',
     default_template: 'clinic_note',
+    source_format: 'cprs' as 'cprs' | 'vista',
     temperature: 0.3,
     max_tokens: 4000,
     rag_enabled: true,
@@ -209,6 +210,7 @@ export const Settings: React.FC = () => {
         default_llm: settingsData.default_llm,
         default_model: settingsData.default_model,
         default_template: settingsData.default_template,
+        source_format: (settingsData.source_format ?? 'cprs') as 'cprs' | 'vista',
         temperature: settingsData.llm_temperature ?? 0.3,
         max_tokens: settingsData.llm_max_tokens ?? 4000,
         rag_enabled: true,
@@ -439,6 +441,7 @@ export const Settings: React.FC = () => {
         default_llm: formData.default_llm,
         default_model: formData.default_model,
         default_template: formData.default_template,
+        source_format: formData.source_format,
         llm_temperature: formData.temperature,
         llm_max_tokens: formData.max_tokens,
         llm_top_p: 0.9,  // Add top_p if needed in form
@@ -1209,6 +1212,41 @@ export const Settings: React.FC = () => {
                 onChange={(e) => setFormData({ ...formData, default_template: e.target.value })}
                 options={NOTE_TYPES}
               />
+
+              <div className="space-y-2">
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                  Source EHR Format
+                </label>
+                <div className="inline-flex rounded-md shadow-sm" role="group" aria-label="Source EHR format toggle">
+                  <button
+                    type="button"
+                    onClick={() => setFormData({ ...formData, source_format: 'cprs' })}
+                    className={`px-4 py-2 text-sm font-medium border border-gray-300 dark:border-gray-600 rounded-l-md ${
+                      formData.source_format === 'cprs'
+                        ? 'bg-blue-600 text-white border-blue-600'
+                        : 'bg-white text-gray-700 dark:bg-gray-800 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+                    }`}
+                  >
+                    CPRS
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFormData({ ...formData, source_format: 'vista' })}
+                    className={`px-4 py-2 text-sm font-medium border-t border-b border-r border-gray-300 dark:border-gray-600 rounded-r-md ${
+                      formData.source_format === 'vista'
+                        ? 'bg-blue-600 text-white border-blue-600'
+                        : 'bg-white text-gray-700 dark:bg-gray-800 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+                    }`}
+                  >
+                    VistA
+                  </button>
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  {formData.source_format === 'cprs'
+                    ? 'CPRS pass-through (default). The pipeline parses the document as-is.'
+                    : 'VistA mode runs a preprocessing step that rewrites VistA section headers into the CPRS layout the extractors expect.'}
+                </p>
+              </div>
 
               <div className="flex items-center gap-2">
                 <input

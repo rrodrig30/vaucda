@@ -61,6 +61,14 @@ class UserSettingsResponse(BaseModel):
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
     openevidence_configured: bool = Field(False, description="Whether OpenEvidence is configured")
 
+    source_format: str = Field(
+        "cprs",
+        description="Source EHR format of pasted/uploaded charts. "
+                    "'cprs' (default) leaves input unchanged; 'vista' "
+                    "runs a preprocessing step that rewrites VistA "
+                    "section headers into the CPRS layout the extractors expect.",
+    )
+
     class Config:
         from_attributes = True
 
@@ -107,6 +115,9 @@ class UserSettingsUpdate(BaseModel):
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
     openevidence_username: Optional[str] = Field(None, description="OpenEvidence username")
     openevidence_password: Optional[str] = Field(None, description="OpenEvidence password")
+    source_format: Optional[str] = Field(
+        None, description="Source EHR format: 'cprs' or 'vista'",
+    )
 
 
 def _build_default_task_configs():
@@ -175,7 +186,8 @@ async def get_settings(
                 stage2_llm=default_configs["stage2_llm"],
                 module_defaults={},
                 display_preferences={},
-                openevidence_configured=False
+                openevidence_configured=False,
+                source_format="cprs",
             )
 
         # Query user preferences
@@ -244,7 +256,8 @@ async def get_settings(
             stage2_llm=stage2_llm,
             module_defaults=prefs.module_defaults,
             display_preferences=prefs.display_preferences,
-            openevidence_configured=bool(current_user.openevidence_username)
+            openevidence_configured=bool(current_user.openevidence_username),
+            source_format=(prefs.source_format or "cprs"),
         )
 
     except Exception as e:
@@ -367,6 +380,15 @@ async def update_settings(
             prefs.module_defaults = settings_update.module_defaults
         if settings_update.display_preferences is not None:
             prefs.display_preferences = settings_update.display_preferences
+        if settings_update.source_format is not None:
+            sf = settings_update.source_format.strip().lower()
+            if sf in ("cprs", "vista"):
+                prefs.source_format = sf
+            else:
+                logger.warning(
+                    "Ignoring source_format=%r (must be 'cprs' or 'vista')",
+                    settings_update.source_format,
+                )
 
         # Update OpenEvidence credentials if provided
         if settings_update.openevidence_username is not None:
@@ -429,7 +451,8 @@ async def update_settings(
             stage2_llm=stage2_llm,
             module_defaults=prefs.module_defaults,
             display_preferences=prefs.display_preferences,
-            openevidence_configured=bool(current_user.openevidence_username)
+            openevidence_configured=bool(current_user.openevidence_username),
+            source_format=(prefs.source_format or "cprs"),
         )
 
     except Exception as e:

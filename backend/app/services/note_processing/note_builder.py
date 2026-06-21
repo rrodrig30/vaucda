@@ -158,7 +158,8 @@ documenting the encounter.
 
 def build_urology_note(
     clinical_text: str,
-    task_config: Optional["LLMTaskConfig"] = None
+    task_config: Optional["LLMTaskConfig"] = None,
+    source_format: str = "cprs",
 ) -> str:
     """
     Build a comprehensive urology clinic note from a clinical document.
@@ -168,6 +169,10 @@ def build_urology_note(
     Args:
         clinical_text: Full clinical document text (aliased from clinical_document)
         task_config: Optional LLMTaskConfig for Stage 1 LLM settings
+        source_format: "cprs" (default) or "vista". When "vista", the
+            clinical_text is run through the VistA -> CPRS normalizer
+            BEFORE extractors / agents see it. The downstream pipeline
+            is identical regardless of source.
 
     Returns:
         Formatted urology clinic note
@@ -180,6 +185,24 @@ def build_urology_note(
     # Set the task config for all agents to use via thread-local storage
     # This ensures all synthesize_with_llm calls use the user's configured model
     set_current_task_config(task_config)
+
+    # Source-format normalization. Applied at the very top so every
+    # extractor / agent downstream sees CPRS-canonical section layout.
+    # Pass-through for "cprs"; rewrites VistA section headers / tables
+    # for "vista". Failures fall back to the original text so the
+    # pipeline never blocks on a normalizer bug.
+    try:
+        from .source_normalizers import normalize_to_cprs
+        normalized = normalize_to_cprs(clinical_text, source_format)
+        if normalized and normalized != clinical_text:
+            print(
+                f"  Source-format normalization applied: "
+                f"{source_format} -> cprs ({len(clinical_text)} -> "
+                f"{len(normalized)} chars)"
+            )
+            clinical_text = normalized
+    except Exception as _e:
+        logger.warning(f"Source normalization skipped: {_e}")
 
     clinical_document = clinical_text  # Alias for backward compatibility
 

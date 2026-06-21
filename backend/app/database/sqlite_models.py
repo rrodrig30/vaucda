@@ -181,6 +181,12 @@ class UserPreferences(Base):
     # Template preferences
     default_template = Column(String(100), nullable=False, default="urology_clinic")
 
+    # Source-EHR format the user pastes / uploads. Drives a preprocessing
+    # step that converts VistA-formatted exports into the CPRS section
+    # layout the existing extractors are tuned for. Values: "cprs" | "vista".
+    # Defaults to "cprs" so existing users see no change.
+    source_format = Column(String(16), nullable=False, default="cprs")
+
     # Module defaults (JSON)
     module_defaults = Column(JSON, nullable=True)
 
