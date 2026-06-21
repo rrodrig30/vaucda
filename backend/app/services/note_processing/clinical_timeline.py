@@ -337,6 +337,36 @@ class ProcedureFinding:
     source_quote: str       # provenance
 
 
+def _preceding_note_date(raw_text: str, anchor: int, window: int = 6000) -> Optional[Tuple[str, str]]:
+    """Walk the preceding `window` chars looking for the most recent
+    note-header date stamp at the start of a line. VistA notes carry a
+    "MM/DD/YYYY HH:MM  Local Title: ..." line at the top of each note;
+    when a procedure word (e.g. 'Cystoscopy') sits a few hundred chars
+    below that header, the procedure should be dated to the note's
+    header — not to whatever ±80-char date happens to be near the
+    procedure word.
+    """
+    preceding = raw_text[max(0, anchor - window):anchor]
+    # Last (closest to anchor) "MM/DD/YYYY HH:MM Local Title:" header line
+    best = None
+    for m in re.finditer(
+        r"(?m)^(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}\s+(?:Local\s+Title|Standard\s+Title|"
+        r"LOCAL\s+TITLE)\s*:",
+        preceding,
+    ):
+        best = m
+    if best is None:
+        # Also accept a bare leading "MM/DD/YYYY HH:MM" at line start.
+        for m in re.finditer(
+            r"(?m)^(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}\b",
+            preceding,
+        ):
+            best = m
+    if best is None:
+        return None
+    return _parse_date_from_text(best.group(1))
+
+
 def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
     """Surface key findings from urologic procedures.
 
@@ -359,17 +389,59 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
         for m in re.finditer(proc_pat, raw_text, re.IGNORECASE):
             if _preceded_by_negation(raw_text, m.start()):
                 continue
+            # Date lookup, in order of preference:
+            #   1. Tight ±80 char window around the procedure word.
+            #   2. Most recent VistA-style note-header date stamp in
+            #      the preceding ~2500 chars (catches "UROLOGY PROCEDURE
+            #      NOTE" headers that sit hundreds of chars above the
+            #      procedure-specific keyword).
             d = (_date_in_window(raw_text, m.start(), window=80)
-                 or _date_in_window(raw_text, m.end(), window=80))
+                 or _date_in_window(raw_text, m.end(), window=80)
+                 or _preceding_note_date(raw_text, m.start()))
             date_key = d[0] if d else ""
             date_display = d[1] if d else "(undated)"
-            # Skip purely planning-context mentions ("consider cystoscopy")
+            # Skip purely planning-context mentions ("consider cystoscopy"),
+            # but anchor on a strict word boundary so "schedule" inside a
+            # different sentence doesn't suppress a confirmed procedure.
             preceding = raw_text[max(0, m.start() - 30):m.start()].lower()
-            if any(w in preceding for w in ("consider ", "discuss ", "may ", "if ", "schedule ")):
+            if re.search(
+                r"\b(?:consider|discuss|may|if|schedule|recommend|plan(?:ned)?\s+for|"
+                r"will\s+order|will\s+arrange|will\s+set\s+up)\b",
+                preceding,
+            ):
                 continue
-            # Look for finding text in the 0..400 char window AFTER the
-            # procedure word. Different shapes for different procedures.
-            tail = raw_text[m.end():m.end() + 400]
+            # For procedure-note style matches (cystoscopy / urodynamics /
+            # biopsy / TURBT etc.), require evidence that this match is
+            # an actual report header, not a narrative reference to a
+            # past or hypothetical procedure. The strongest signal:
+            #   - immediately followed by ":" (the report's section
+            #     marker, e.g. "Cystoscopy:")
+            #   - immediately preceded/followed by a CPT code in parens
+            #     (e.g. "Cystoscopy (52000)")
+            #   - sits inside a "Urology Procedure Note: <proc>" header
+            #     within ~80 preceding chars
+            local = raw_text[max(0, m.start() - 80):m.end() + 30]
+            is_report_header = bool(
+                re.search(
+                    rf"\b{proc_pat.replace(chr(92) + 'b', '')}\s*(?::|\(\d{{4,5}}\))",
+                    local, re.IGNORECASE,
+                )
+                or re.search(
+                    r"(?:Urology\s+Procedure\s+Note|Local\s+Title)[^\n]{0,80}",
+                    raw_text[max(0, m.start() - 600):m.start()],
+                    re.IGNORECASE,
+                )
+            )
+            if not is_report_header:
+                continue
+            # Look for finding text. Cystoscopy and other structured
+            # procedure notes can span >1000 chars between the procedure
+            # word and the trailing findings (Bladder mucosa /
+            # Trabeculation grade / etc. lines sit ~800 chars below).
+            # Use a 1500-char tail for these structured notes; the
+            # per-procedure summarizer is conservative about what it
+            # actually keeps.
+            tail = raw_text[m.end():m.end() + 1500]
             finding = _summarize_procedure_finding(proc_label, tail, raw_text, m.start())
             if not finding:
                 continue
@@ -397,7 +469,51 @@ def _summarize_procedure_finding(
     tail_clean = re.sub(r"\s+", " ", tail).strip()
 
     if proc in ("cystoscopy", "cystourethroscopy"):
-        # Common cystoscopy finding markers
+        # Structured VistA Urology Procedure Note format. Cysto reports
+        # have labeled fields like:
+        #   Obstructive assessment: bilobar hypertrophy with intravesical protrusion
+        #   Bladder Neck: Open, high
+        #   Bladder mucosa: Normal
+        #   Bladder calculus: Not seen
+        #   Trabeculation grade: 0 (none)
+        #   Median lobe component: present
+        # Walk a known label list and concatenate the non-empty values
+        # into a clinically useful summary. This is the highest-priority
+        # path because it captures structured findings the prose-style
+        # regex misses.
+        structured_fields = (
+            "Obstructive assessment",
+            "Bladder Neck",
+            "Median lobe component",
+            "Bladder mucosa",
+            "Bladder Wall",
+            "Bladder calculus",
+            "Trabeculation grade",
+            "Diverticulum",
+            "Tumor",
+            "Trigone",
+            "Ureteral orifices",
+            "Anterior Urethra",
+            "Prostatic Urethra",
+            "Stricture",
+            "Hutchison Diverticulum",
+        )
+        structured_bits: List[str] = []
+        for label in structured_fields:
+            mm = re.search(
+                rf"^\s*{re.escape(label)}\s*:\s*([^\n]{{2,120}})$",
+                tail_clean if "\n" in tail_clean else tail,  # keep newlines for line-anchored match
+                re.IGNORECASE | re.MULTILINE,
+            )
+            if mm:
+                val = mm.group(1).strip().rstrip(".;,")
+                # Skip values that are clearly empty or boilerplate
+                if val and val.lower() not in ("not assessed", "n/a", "see above"):
+                    structured_bits.append(f"{label}: {val}")
+        if structured_bits:
+            return _clean_finding_text("; ".join(structured_bits[:8]))
+
+        # Common cystoscopy finding markers — prose-style fallback
         m = re.search(
             r"(?:(?:revealed|showed|demonstrated|notable\s+for|notable\s+findings?(?:\s+include)?[:\s]|"
             r"impression[:\s]|findings?[:\s])[^.]{4,250})",
@@ -408,7 +524,8 @@ def _summarize_procedure_finding(
         # Quick keyword grab if no explicit "showed" verb
         for kw in ("tumor", "papillary", "lesion", "stricture", "bladder neck contracture",
                    "BNC", "normal urethra", "normal bladder", "trabeculation",
-                   "stone", "mass", "mucosa", "diverticulum", "no recurrence"):
+                   "stone", "mass", "mucosa", "diverticulum", "no recurrence",
+                   "hypertrophy", "intravesical"):
             if re.search(rf"\b{re.escape(kw)}\b", tail_clean, re.IGNORECASE):
                 m2 = re.search(
                     rf"[^.]{{0,80}}\b{re.escape(kw)}\b[^.]{{0,80}}",
