@@ -566,6 +566,19 @@ def _render_imaging_from_ii(ii_body: str) -> str:
         # study header; sometimes the impression is labeled with an
         # explicit "Impression:" line, sometimes it's just free-text.
         impression_lines: List[str] = []
+        # Outside-study marker. When a study was performed at an
+        # outside facility and VA radiology has not read it, VistA
+        # emits a "Report:" block followed by "Electronically generated
+        # report for outside study." The impression therefore reflects
+        # the outside facility's read (or is absent). Per provider
+        # direction (2026-06-21), the rendered IMAGING section must
+        # explicitly flag these so the clinician knows the study has
+        # not been re-read by VA.
+        outside_study_marker_re = re.compile(
+            r"electronically\s+generated\s+report\s+for\s+outside\s+study",
+            re.IGNORECASE,
+        )
+        is_outside_study = bool(outside_study_marker_re.search(rest))
         for line in rest.split("\n"):
             ln = line.strip()
             if not ln:
@@ -577,6 +590,14 @@ def _render_imaging_from_ii(ii_body: str) -> str:
             if "VHA National Teleradiology" in ln:
                 continue
             if "Attention Patients" in ln or "ordering provider" in ln.lower():
+                continue
+            # Drop the outside-study sentinel line — its presence is
+            # captured in is_outside_study and surfaced as a prefix
+            # below; leaving the raw VistA boilerplate in the impression
+            # adds clutter without clinical value.
+            if outside_study_marker_re.search(ln):
+                continue
+            if re.match(r"^report\s*:\s*$", ln, re.IGNORECASE):
                 continue
             # Drop telephone / fax footer lines that some sites paste
             # below the impression — "877-780-5559", "phone:", etc.
@@ -598,14 +619,26 @@ def _render_imaging_from_ii(ii_body: str) -> str:
                 continue
             impression_lines.append(ln)
         impression = " ".join(impression_lines).strip()
-        if not impression:
-            # No usable body content for this study. Per provider
-            # direction, do NOT emit a "(no impression text)" placeholder
-            # — the LLM has been observed to treat that string as a
-            # real finding ("imaging was inconclusive"). Drop the study
-            # entirely; the IMAGING section is better off without a row
-            # than with a fabrication-prone placeholder.
+        if not impression and not is_outside_study:
+            # No usable body content for this study AND not flagged as
+            # an outside study. Per provider direction, do NOT emit a
+            # "(no impression text)" placeholder — the LLM has been
+            # observed to treat that string as a real finding ("imaging
+            # was inconclusive"). Drop the study entirely.
             continue
+        # Prefix outside-study impressions with the provider-mandated
+        # disclaimer so the clinician (and downstream LLM) cannot
+        # mistake the outside read for a VA-validated interpretation.
+        # When there is no impression text at all, the disclaimer
+        # stands alone as the impression — better to surface the
+        # existence of an unread outside study than to drop the row.
+        if is_outside_study:
+            disclaimer = ("This study originated from outside the VA and "
+                          "has not been read by VA radiology.")
+            impression = (
+                f"{disclaimer} {impression}".strip()
+                if impression else disclaimer
+            )
 
         # Build CPRS-format header. The downstream extract_human_readable_imaging
         # expects the date in MM/DD/YYYY form and the section header to use
