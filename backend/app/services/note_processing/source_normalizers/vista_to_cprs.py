@@ -679,13 +679,19 @@ def _render_pathology_from_sp(sp_body: str) -> str:
 
 
 _VISTA_LAB_ROW_RE = re.compile(
-    r"^(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}:\d{2})\s+"
-    r"(\S+)\s+"           # specimen (SERUM / URINE / FECES / BLOOD / etc.)
-    r"(.+?)\s{2,}"        # test name (variable spaces; ends at >=2-space gap)
-    r"([<>]?\d+\.?\d*)"   # numeric result
-    r"\s*([HL]?)\s*"      # H / L flag
-    r"([A-Za-z%/0-9.]*)"  # units
-    r"\s*(.*)$",          # ref range
+    # CRITICAL: every inter-field separator uses [ \t]+ rather than \s+
+    # so a missing trailing field (e.g. "STRUVITE (442)  0.04" with no
+    # units/ref) does NOT let the regex engine slide past the newline
+    # into the next row's text. Previously this caused alternating rows
+    # to be dropped (e.g. SR-CREA, TOTAL U.VOLUME) when the preceding
+    # row had empty units/ref.
+    r"^(\d{1,2})/(\d{1,2})/(\d{4})[ \t]+(\d{1,2}:\d{2})[ \t]+"
+    r"(\S+)[ \t]+"             # specimen (SERUM / URINE / FECES / BLOOD)
+    r"(.+?)[ \t]{2,}"          # test name (ends at >=2-space gap)
+    r"([<>]?\d+\.?\d*)"        # numeric result
+    r"[ \t]*([HL]?)[ \t]*"     # H / L flag
+    r"([A-Za-z%/0-9.]*)"       # units
+    r"[ \t]*([^\n]*)$",        # ref range — explicit non-newline
     re.MULTILINE,
 )
 
@@ -764,12 +770,22 @@ _LAB_BUCKET_RULES: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"\bPRL\b|PROLACTIN", re.IGNORECASE), "endocrine"),
     (re.compile(r"\bSHBG\b|SEX\s+HORMONE\s+BIND", re.IGNORECASE), "endocrine"),
 
-    # Stone-panel (24-hour urine + stone composition)
+    # Stone-panel (24-hour urine + stone composition). VistA SLT/CH
+    # rows for the urorisk panel use a urine specimen and one of these
+    # test-name shapes:
+    #   - Supersaturations:  CALCIUM OXALATE, BRUSHITE, SODIUM URATE,
+    #                        STRUVITE, URIC ACID (no "URINE" suffix —
+    #                        but specimen = URINE, distinguishing from
+    #                        SERUM uric acid)
+    #   - Metabolic urine excretions:  <ANALYTE> URINE  or  URINE <ANALYTE>
+    #   - VistA-specific abbreviations: SR-CREA (24-hr creatinine),
+    #                                   PO4-SR (24-hr phosphorus),
+    #                                   TOTAL U.VOLUME (24-hr volume)
     (re.compile(r"\bSTONERISK\b|STONE\s+(?:RISK|COMPOSITION|ANALYSIS)|CALCULUS\s+ANALYSIS",
                 re.IGNORECASE), "stone"),
     (re.compile(r"CALCIUM\s+OXALATE|CALCIUM\s+PHOSPHATE|BRUSHITE|"
                 r"STRUVITE|URIC\s+ACID\s+(?:CRYST|SS)|URIC\s+ACID,\s*URINE|"
-                r"SODIUM\s+URATE|TOTAL\s+URINE\s+VOLUME",
+                r"SODIUM\s+URATE|TOTAL\s+URINE\s+VOLUME|TOTAL\s+U\.?\s*VOLUME",
                 re.IGNORECASE), "stone"),
     (re.compile(r"\b(?:OXALATE|CITRATE|MAGNESIUM|SODIUM|POTASSIUM|"
                 r"PHOSPHORUS|PHOSPHATE|SULFATE|AMMONIUM|CREATININE|"
@@ -781,6 +797,8 @@ _LAB_BUCKET_RULES: Tuple[Tuple[re.Pattern, str], ...] = (
                 re.IGNORECASE), "stone"),
     (re.compile(r"\bURINE\s+PH\b|\bpH\s+URINE\b", re.IGNORECASE), "stone"),
     (re.compile(r"\bCYSTINE\b", re.IGNORECASE), "stone"),
+    # VistA-specific 24-hr abbreviations
+    (re.compile(r"\bSR-CREA\b|\bPO4-SR\b", re.IGNORECASE), "stone"),
 
     # Stool pathogen panel — drop, not clinically relevant in urology note
     (re.compile(r"CAMPYLO|VIBRIO|SHIGELLA|SALMONELLA|YERSINIA|"
@@ -791,12 +809,52 @@ _LAB_BUCKET_RULES: Tuple[Tuple[re.Pattern, str], ...] = (
 )
 
 
-def _classify_lab_test(test_name: str) -> str:
-    """Return the bucket for a VistA lab test name."""
+def _classify_lab_test(test_name: str, specimen: str = "") -> str:
+    """Return the bucket for a VistA lab test name.
+
+    When the specimen is URINE and the test is one of the bare-name
+    stone-panel components ("URIC ACID", "CITRATE", "OXALATE", etc.
+    without a URINE suffix that the keyword rules require), promote to
+    the stone bucket. This catches VistA's 24-hr urorisk panel rows
+    where the test name was truncated to a single word.
+    """
     for pat, bucket in _LAB_BUCKET_RULES:
         if pat.search(test_name):
             return bucket
+    # Specimen-aware fallback: urine + bare stone-component name -> stone
+    if specimen.upper() == "URINE":
+        if re.search(
+            r"\b(?:URIC\s+ACID|CITRATE|OXALATE|MAGNESIUM|CALCIUM|"
+            r"SULFATE|AMMONIUM|PHOSPHORUS|PHOSPHATE|POTASSIUM|SODIUM)\b",
+            test_name, re.IGNORECASE,
+        ):
+            return "stone"
     return "general"
+
+
+def _clean_truncated_test_name(name: str) -> str:
+    """VistA's fixed-column SLT/CH layout truncates long test names at
+    the column edge, often mid-site-code:
+
+        CALCIUM OXALATE(4         -> CALCIUM OXALATE
+        MAGNESIUM URINE(4         -> MAGNESIUM URINE
+        SODIUM URINE (442         -> SODIUM URINE
+        TOTAL U.VOLUME(55         -> TOTAL U.VOLUME
+        AMMONIUM URINE (4         -> AMMONIUM URINE
+
+    Strip both complete "(NNN)" / "(NNN" suffixes and open-paren-only
+    truncated suffixes so the downstream stone-extractor label lookup
+    can match.
+    """
+    if not name:
+        return name
+    # Strip a trailing "(<digits>" with or without a closing ")"
+    cleaned = re.sub(r"\s*\(\d+\)?\s*$", "", name)
+    # Strip a trailing bare "(" left over after truncation
+    cleaned = re.sub(r"\s*\(\s*$", "", cleaned)
+    # Squeeze whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 def _parse_lab_rows(body: str) -> List[Tuple[str, str, str, str, str, str, str, str]]:
@@ -807,7 +865,10 @@ def _parse_lab_rows(body: str) -> List[Tuple[str, str, str, str, str, str, str, 
     for m in _VISTA_LAB_ROW_RE.finditer(body):
         mm, dd, yyyy, hhmm = m.group(1), m.group(2), m.group(3), m.group(4)
         specimen = m.group(5).strip().upper()
-        test_name = m.group(6).strip().upper()
+        # Test name often carries a truncated VistA site-code suffix
+        # ("CALCIUM OXALATE(4", "MAGNESIUM URINE (442"). Strip it so
+        # downstream classifiers and the stone-panel label lookup match.
+        test_name = _clean_truncated_test_name(m.group(6).strip().upper())
         value = m.group(7)
         flag = m.group(8) or ""
         units = m.group(9) or ""
@@ -870,7 +931,7 @@ def _render_labs_from_ch_slt_mic(ch_body: str, slt_body: str, mic_body: str) -> 
     seen_other = set()
 
     for date_disp, hhmm, specimen, test_name, value, flag, units, ref in rows:
-        bucket = _classify_lab_test(test_name)
+        bucket = _classify_lab_test(test_name, specimen)
         if bucket == "skip":
             continue
         if bucket == "psa":
@@ -936,7 +997,7 @@ def _render_labs_from_ch_slt_mic(ch_body: str, slt_body: str, mic_body: str) -> 
     if stone_rows:
         stone_per_date: Dict[str, List[Tuple[str, str]]] = {}
         for date_disp, hhmm, specimen, test_name, value, flag, units, ref in rows:
-            if _classify_lab_test(test_name) != "stone":
+            if _classify_lab_test(test_name, specimen) != "stone":
                 continue
             label = re.sub(r"\s+", " ", test_name.title()).strip()
             value_str = value

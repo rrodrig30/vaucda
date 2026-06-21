@@ -61,6 +61,17 @@ STONERISK_LABEL_MAP = {
     'TOTAL URINE VOLUME': ('Volume (L/day)', 'env'),
     'URINE VOLUME': ('Volume (L/day)', 'env'),
     'VOLUME': ('Volume (L/day)', 'env'),
+
+    # VistA SLT/CH 24-hr urorisk panel uses abbreviated labels:
+    'TOTAL U.VOLUME': ('Volume (L/day)', 'env'),
+    'TOTAL U VOLUME': ('Volume (L/day)', 'env'),
+    'SR-CREA': ('Creatinine (mg/day)', 'met'),
+    'SR CREA': ('Creatinine (mg/day)', 'met'),
+    'PO4-SR': ('Phosphate (mg/day)', 'met'),
+    'PO4 SR': ('Phosphate (mg/day)', 'met'),
+    # Bare "URIC ACID" in a URINE specimen row is the supersaturation
+    # value (no /day units). Map both shapes.
+    'URIC ACID': ('Uric Acid SS', 'ss'),
 }
 
 
@@ -619,8 +630,12 @@ def extract_plain_label_stone_panel(clinical_document: str) -> str:
         key_values = {}
         for line in body_lines:
             # "LABEL: value units (ref)"  — split on first colon
+            # Label character class includes hyphen and period so VistA
+            # urorisk-panel labels like "Sr-Crea", "Po4-Sr", and
+            # "Total U.Volume" match. Previously these were rejected
+            # because the original class was [A-Za-z0-9\s/] only.
             m = re.match(
-                r'^\s*([A-Za-z][A-Za-z0-9\s/]+?)\s*:\s*'
+                r'^\s*([A-Za-z][A-Za-z0-9\s/\-.]+?)\s*:\s*'
                 r'([\-\d\.]+)\s*([HL])?\s*(.*)$',
                 line
             )
