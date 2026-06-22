@@ -15,6 +15,7 @@ import re
 from typing import List, Optional, TYPE_CHECKING
 from ..llm_helper import synthesize_with_llm
 from .history_cleaners import clean_llm_commentary
+from .age_guardrail import build_age_guardrail_block
 
 if TYPE_CHECKING:
     from app.services.llm_config_manager import LLMTaskConfig
@@ -73,6 +74,18 @@ def synthesize_plan(
     # explicit ABSOLUTE RULES the LLM must follow.
     if authoritative_facts and authoritative_facts.strip():
         context_parts.append(authoritative_facts + "\n")
+
+    # Age & life-expectancy guardrail. Deterministically classifies the
+    # patient from age + PMH-flagged comorbidities + frailty markers, and
+    # names the AUA Early-Detection language that actually applies to
+    # this patient. Without this the Plan LLM pattern-matches to a
+    # generic AUA workup template (PSA q6-12 mo, mpMRI, biopsy) and
+    # cites "AUA guidelines" in 87-year-olds with CHF / dementia /
+    # advanced cancer — when AUA's actual language says screening
+    # should be discontinued.
+    age_guardrail = build_age_guardrail_block(stage1_note)
+    if age_guardrail:
+        context_parts.append(age_guardrail)
 
     # The Assessment was just generated immediately before this Plan call.
     # It contains the clinical reasoning AND the recommendation set the
@@ -442,6 +455,27 @@ CONTEXT AWARENESS:
 - This is a UROLOGY CLINIC NOTE - do NOT recommend "referral to urology" (patient is already here)
 - Do NOT recommend tests/imaging that have already been completed (check IMAGING section)
 - Do NOT recommend procedures when contraindicated by current labs (e.g., cystoscopy with active UTI)
+
+AGE / LIFE-EXPECTANCY GUARDRAIL (MANDATORY — read the AGE / LIFE-EXPECTANCY
+GUARDRAIL block in AVAILABLE INFORMATION above before writing this plan):
+- The guardrail block tells you the patient's life-expectancy bucket
+  (VERY_LIMITED / LIMITED / STANDARD). Your plan MUST honor the rules
+  for that bucket.
+- For VERY_LIMITED: do NOT recommend routine PSA surveillance, mpMRI
+  prostate, or prostate biopsy. The plan should focus on symptom
+  management and (if currently being done) explicitly recommend
+  STOPPING the cancer-detection workup with the AUA rationale.
+- For LIMITED: do NOT default to "continue annual PSA" / "obtain mpMRI"
+  / "schedule biopsy" without an explicit shared-decision-making
+  statement that names life expectancy and patient preference. Generic
+  "per AUA guidelines" is NOT sufficient justification.
+- Do NOT cite AUA Early Detection language as supporting active cancer-
+  detection workup in a VERY_LIMITED patient. AUA's actual language
+  says the opposite. The guardrail block above contains the exact AUA
+  quotations; use them.
+- These rules do NOT restrict workup of an ALREADY-KNOWN urologic cancer
+  (staging, treatment response, surveillance imaging for known disease).
+  They restrict workup for DETECTION of new prostate cancer.
 
 OUTPUT REQUIREMENTS:
 - Provide ONLY the treatment plan text

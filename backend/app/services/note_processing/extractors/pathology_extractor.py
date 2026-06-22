@@ -146,7 +146,13 @@ def extract_prostate_biopsy(clinical_document: str) -> str:
                 for bm in re.finditer(
                     r'(?:SURGICAL\s+PATHOLOGY\s+REPORT|STANDARD\s+FORM\s+515|'
                     r'Performing\s+Lab(?:oratory)?[:\s]|'
-                    r'Reporting\s+Lab(?:oratory)?[:\s])',
+                    r'Reporting\s+Lab(?:oratory)?[:\s]|'
+                    # VistA-to-CPRS normalizer divider — without this,
+                    # SP reports whose gross-description body exceeds
+                    # 1500 chars push the "Date obtained:" header out
+                    # of the fallback window and the report renders
+                    # with no date.
+                    r'----\s*SURGICAL\s+PATHOLOGY\s*----)',
                     preceding,
                     re.IGNORECASE,
                 ):
@@ -920,6 +926,20 @@ def extract_pathology(clinical_document: str) -> str:
             new_sections.extend(parts)
         sections = new_sections
 
+    # Trim each section at the next note-header boundary. Without this,
+    # the tail section after the LAST SURGICAL PATHOLOGY marker extends
+    # to end-of-document and pulls a `DIAGNOSIS:` header out of a
+    # downstream radiation-onc / urology consult note, generating a
+    # phantom pathology entry that pairs the biopsy date with consult-
+    # narrative prose.
+    _note_header_re = re.compile(
+        r'\n(?=\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s+(?:Local|Standard)\s+Title\s*:)',
+        re.IGNORECASE,
+    )
+    sections = [
+        _note_header_re.split(s, maxsplit=1)[0] for s in sections
+    ]
+
     for i, section in enumerate(sections):
         if i == 0:
             # First section is before any SURGICAL PATHOLOGY marker
@@ -945,8 +965,13 @@ def extract_pathology(clinical_document: str) -> str:
         # Extract diagnosis
         # Look for common diagnosis headers: "DIAGNOSIS:", "FLOW CYTOMETRY DIAGNOSIS:", "FINAL DIAGNOSIS:", etc.
         # CRITICAL: Exclude "PREOPERATIVE DIAGNOSIS", "OPERATIVE DIAGNOSIS", "POSTOPERATIVE DIAGNOSIS"
+        # CRITICAL: Reject DIAGNOSIS that sits inside square brackets
+        # ("anticipated benefits [diagnosis of the prostate condition] were
+        # discussed in layman's terms") — that's procedure-note consent
+        # prose, not a pathology heading. The (?<!\[) negative lookbehind
+        # and required colon after the word both block the false match.
         diagnosis_match = re.search(
-            r'(?:FINAL\s+|FLOW\s+CYTOMETRY\s+|FISH\s+)?DIAGNOSIS(?!\s*:\s*$)[:\s;]*([^\n]+(?:\n(?!\s*(?:Comment|Note|Clinical|Reporting))[^\n]+)*)',
+            r'(?<![\[\w])(?:FINAL\s+|FLOW\s+CYTOMETRY\s+|FISH\s+)?DIAGNOSIS(?!\s*:\s*$)\s*[:;]\s*([^\n]+(?:\n(?!\s*(?:Comment|Note|Clinical|Reporting))[^\n]+)*)',
             section,
             re.IGNORECASE | re.MULTILINE
         )

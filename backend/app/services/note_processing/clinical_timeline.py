@@ -337,7 +337,7 @@ class ProcedureFinding:
     source_quote: str       # provenance
 
 
-def _preceding_note_date(raw_text: str, anchor: int, window: int = 6000) -> Optional[Tuple[str, str]]:
+def _preceding_note_date(raw_text: str, anchor: int, window: int = 20000) -> Optional[Tuple[str, str]]:
     """Walk the preceding `window` chars looking for the most recent
     note-header date stamp at the start of a line. VistA notes carry a
     "MM/DD/YYYY HH:MM  Local Title: ..." line at the top of each note;
@@ -403,9 +403,17 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
             # Skip purely planning-context mentions ("consider cystoscopy"),
             # but anchor on a strict word boundary so "schedule" inside a
             # different sentence doesn't suppress a confirmed procedure.
-            preceding = raw_text[max(0, m.start() - 30):m.start()].lower()
+            preceding = raw_text[max(0, m.start() - 50):m.start()].lower()
             if re.search(
-                r"\b(?:consider|discuss|may|if|schedule|recommend|plan(?:ned)?\s+for|"
+                # Catch BOTH "schedule" and "scheduled"/"scheduled for",
+                # BOTH "plan/planned/planned for", and the additional
+                # intent markers "due for", "to undergo", "needs", and
+                # "interested in" that mark a procedure the patient has
+                # NOT yet had.
+                r"\b(?:consider(?:ing|ed)?|discuss(?:ed|ing)?|may|if\b|"
+                r"scheduled?(?:\s+for)?|recommend(?:ed|ing)?|"
+                r"plan(?:ned|ning)?(?:\s+for|\s+to)?|due\s+for|"
+                r"to\s+undergo|needs?(?:\s+to)?|interested\s+in|"
                 r"will\s+order|will\s+arrange|will\s+set\s+up)\b",
                 preceding,
             ):
@@ -426,8 +434,17 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
                     rf"\b{proc_pat.replace(chr(92) + 'b', '')}\s*(?::|\(\d{{4,5}}\))",
                     local, re.IGNORECASE,
                 )
+                # Local Title must explicitly mention "procedure" or
+                # one of the structured procedure-note types — a generic
+                # CHART CHECK NOTE / TECH NOTE / TELEPHONE NOTE with
+                # `Local Title:` does NOT count. Without this tightening
+                # a CHART CHECK NOTE that says "He is scheduled for
+                # cystoscopy" passes the report-header gate.
                 or re.search(
-                    r"(?:Urology\s+Procedure\s+Note|Local\s+Title)[^\n]{0,80}",
+                    r"(?:Urology\s+Procedure\s+Note|"
+                    r"Local\s+Title\s*:\s*[^\n]*"
+                    r"(?:PROCEDURE|CYSTOSCOPY|CYSTOURETHROSCOPY|"
+                    r"URODYNAMICS|BIOPSY|TURBT|TURP|DEXA))",
                     raw_text[max(0, m.start() - 600):m.start()],
                     re.IGNORECASE,
                 )

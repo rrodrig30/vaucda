@@ -271,6 +271,22 @@ def synthesize_psh(gu_notes: List[Dict[str, str]], non_gu_notes: List[Dict[str, 
             if not surgery_name:
                 continue
 
+            # Drop "None" / "N/A" / "Denies" sentinels — these are
+            # placeholder values that mean the patient has no PSH per
+            # this note. They must not appear alongside real surgical
+            # entries; the renderer was producing
+            #   1. Prostate biopsy
+            #   2. None
+            # which is clinically meaningless.
+            _sentinel_re = re.compile(
+                r'^\s*(?:none|n/?a|denies(?:\s+any)?|no\s+(?:prior\s+|past\s+)?'
+                r'(?:surgical\s+history|surgeries|surgery))\.?\s*$',
+                re.IGNORECASE,
+            )
+            stripped_name = re.sub(r'^\d+\.\s*', '', surgery_name).strip()
+            if _sentinel_re.match(stripped_name):
+                continue
+
             canon_key = _surgery_canonical_key(surgery_name)
             if not canon_key:
                 continue

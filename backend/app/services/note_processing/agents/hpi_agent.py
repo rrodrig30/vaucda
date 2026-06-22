@@ -128,6 +128,160 @@ def _build_treatment_status_block(
     return '\n'.join(lines)
 
 
+_NONUROLOGIC_MED_TERMS = {
+    # Cardiovascular / antihypertensive / antilipid / antiplatelet /
+    # anticoagulant agents — never urologic.
+    "amlodipine", "lisinopril", "metoprolol", "atenolol", "carvedilol",
+    "losartan", "valsartan", "olmesartan", "hydrochlorothiazide", "hctz",
+    "chlorthalidone", "furosemide", "spironolactone", "diltiazem",
+    "verapamil", "warfarin", "apixaban", "rivaroxaban", "dabigatran",
+    "clopidogrel", "aspirin", "atorvastatin", "rosuvastatin", "simvastatin",
+    "pravastatin", "ezetimibe", "fenofibrate", "gemfibrozil",
+    # Allergy / respiratory / ENT
+    "cetirizine", "loratadine", "fexofenadine", "diphenhydramine",
+    "fluticasone", "mometasone", "budesonide", "albuterol", "montelukast",
+    # GI
+    "omeprazole", "pantoprazole", "esomeprazole", "ranitidine", "famotidine",
+    "polyethylene glycol", "miralax", "docusate", "senna",
+    # Psych / neuro
+    "sertraline", "fluoxetine", "paroxetine", "citalopram", "escitalopram",
+    "bupropion", "venlafaxine", "duloxetine", "trazodone", "mirtazapine",
+    "gabapentin", "pregabalin", "lamotrigine", "levetiracetam",
+    "glatiramer", "interferon",
+    # Diabetes / endocrine non-androgen
+    "metformin", "glipizide", "insulin", "levothyroxine",
+    # Misc
+    "naloxone", "lactobacillus",
+}
+
+_NONUROLOGIC_LAB_TERMS = {
+    "glucose", "bun", "sodium", "potassium", "chloride", "co2",
+    "anion gap", "specific gravity", "egfr", "hgb a1c",
+    "hemoglobin a1c", "ldl", "hdl", "triglyceride", "cholesterol",
+    "tsh", "vitamin d", "vitamin b12", "ferritin", "alkaline phosphatase",
+    "ast", "alt",
+}
+
+# Non-urologic anatomy / findings — if a sentence mentions these AND has
+# no urologic anchor, the sentence is irrelevant to the urology HPI and
+# gets stripped. Catches cases where the LLM lifted text from prior CT
+# or ED-discharge narrative ("interval increased extent of dilated small
+# bowel loops...", "mildly dilated bile ducts and soft tissue attenuation
+# filling defects in the common bile duct", "gallbladder pathology").
+_NONUROLOGIC_FINDING_TERMS = {
+    "small bowel", "bowel obstruction", "bowel ischemia",
+    "bile duct", "biliary", "gallbladder", "cholelith",
+    "hepatic", "hepatomeg", "liver lesion",
+    "pancreas", "pancreatitis",
+    "splenomeg",
+    "pulmonary embolism", "pleural effusion", "atelectasis",
+    "abdominal aortic aneurysm",
+    "myocardial infarction", "coronary artery",
+    "stroke", "cerebrovascular",
+    "nasopharyngeal", "oropharyngeal", "parotid",
+    "lymphadenopathy of neck",
+    "diabetic retinopathy", "macular",
+    "thyroid nodule",
+}
+
+# Urologic anchors — if a sentence contains one of these tokens, the
+# stripper keeps it even if it also names a non-urologic med/lab
+# (because the urologic relevance is established).
+_UROLOGIC_ANCHORS = {
+    "psa", "prostate", "prostatic", "urolog", "urinary", "urine",
+    "urination", "lut", "bph", "ipss", "void", "voiding", "stream",
+    "frequency", "nocturia", "hesitancy", "hematuria", "dysuria",
+    "incontinence", "retention",
+    "kidney", "renal", "nephro", "stone", "calculus",
+    "bladder", "ureter", "urethra", "scrotum", "scrotal",
+    "testis", "testicle", "testicular", "epididym", "spermato",
+    "varicocele", "hydrocele",
+    "erectile", "ed", "libido", "sexual dysfunction", "pde5", "sildenafil",
+    "tadalafil", "vardenafil",
+    "tamsulosin", "alfuzosin", "silodosin", "doxazosin", "terazosin",
+    "finasteride", "dutasteride",
+    "oxybutynin", "solifenacin", "mirabegron", "vibegron", "tolterodine",
+    "leuprolide", "goserelin", "degarelix", "relugolix",
+    "bicalutamide", "enzalutamide", "apalutamide", "darolutamide",
+    "abiraterone", "lupron", "eligard",
+    "creatinine",  # creatinine IS urologically relevant (renal function)
+}
+
+
+def _strip_nonurologic_sentences(hpi: str) -> str:
+    """Drop HPI sentences that name only non-urologic meds / labs.
+
+    The HPI prompt forbids enumerating non-urologic medications and
+    non-urologic labs, but the LLM still emits sentences like:
+      "He also takes Cetirizine for allergies and Fluticasone Prop
+       for nasal allergies."
+      "Recent laboratory results include a specific gravity of 1.011,
+       an EGFR CKD EPI of 82, a glucose level of 102 mg/dL, and a
+       creatinine level of 1.0 mg/dL."
+    These rot the signal-to-noise of the HPI. Drop them deterministically.
+
+    A sentence is dropped iff it names ≥1 non-urologic term AND contains
+    NO urologic anchor. Sentences that mention a non-urologic agent in a
+    urologic context (e.g., "held apixaban for cystoscopy") are kept.
+    """
+    if not hpi or not hpi.strip():
+        return hpi
+
+    # Sentence split that survives "ng/mL", "Mr.", etc. — same heuristic
+    # as the dedupe helper.
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', hpi.strip())
+
+    kept = []
+    for s in sentences:
+        s_low = s.lower()
+        # Med-list-dump detector: any sentence that names ≥2 distinct
+        # medication agents is a list dump and belongs in the
+        # MEDICATIONS section, not the HPI prose — even when one of the
+        # meds happens to be urologic (e.g., "His meds include
+        # amlodipine, lisinopril, sildenafil, rosuvastatin"). The HPI
+        # should mention a urologic med in clinical context (e.g.,
+        # "started tamsulosin for LUTS"), not as an enumeration.
+        non_uro_hits = sum(1 for term in _NONUROLOGIC_MED_TERMS if term in s_low)
+        uro_med_terms = (
+            "tamsulosin", "alfuzosin", "silodosin", "doxazosin",
+            "terazosin", "finasteride", "dutasteride",
+            "oxybutynin", "solifenacin", "mirabegron", "vibegron",
+            "tolterodine", "leuprolide", "goserelin", "degarelix",
+            "relugolix", "bicalutamide", "enzalutamide", "apalutamide",
+            "darolutamide", "abiraterone", "lupron", "eligard",
+            "sildenafil", "tadalafil", "vardenafil", "avanafil",
+            "trimix", "alprostadil",
+        )
+        uro_med_hits = sum(1 for term in uro_med_terms if term in s_low)
+        total_med_hits = non_uro_hits + uro_med_hits
+        if total_med_hits >= 2:
+            # Med-list dump — drop entire sentence.
+            continue
+
+        has_non_uro = (non_uro_hits > 0) or any(
+            term in s_low for term in _NONUROLOGIC_LAB_TERMS
+        ) or any(term in s_low for term in _NONUROLOGIC_FINDING_TERMS)
+        if not has_non_uro:
+            kept.append(s)
+            continue
+        # Word-boundary match for urologic anchors. Substring match was
+        # producing false positives — e.g., "ed" matched inside
+        # "showed"/"obtained"/"examined", causing every CT-finding
+        # sentence to be falsely flagged as urologic and kept.
+        has_uro = any(
+            re.search(rf"\b{re.escape(anchor)}\b", s_low)
+            for anchor in _UROLOGIC_ANCHORS
+        )
+        if has_uro:
+            kept.append(s)
+            continue
+        # Sentence names non-urologic content with no urologic anchor —
+        # drop it.
+
+    result = ' '.join(kept).strip()
+    return result if result else hpi
+
+
 def _dedupe_hpi_sentences(hpi: str) -> str:
     """Remove sentence-level redundancy that survives the LLM prompt.
 
@@ -254,6 +408,521 @@ def _dedupe_hpi_sentences(hpi: str) -> str:
             out_paragraphs.append(' '.join(kept_sentences))
 
     return '\n\n'.join(out_paragraphs).strip()
+
+
+_DATE_PATTERNS = (
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+    "%m/%d/%y",
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%b %d %Y",
+)
+
+
+def _parse_any_date(s: str):
+    """Best-effort parse for the date formats this codebase emits."""
+    from datetime import datetime
+    if not s:
+        return None
+    s = s.strip().rstrip(",")
+    for fmt in _DATE_PATTERNS:
+        try:
+            return datetime.strptime(s, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _months_ago(dt) -> Optional[int]:
+    from datetime import datetime
+    if dt is None:
+        return None
+    now = datetime.now()
+    return (now.year - dt.year) * 12 + (now.month - dt.month)
+
+
+def _recency_label(dt) -> str:
+    """Classify an event date as CURRENT (≤6 mo), RECENT (6-12 mo),
+    or HISTORICAL (>12 mo). Used to tag imaging / labs / visits in the
+    HPI prompt so the LLM cannot call a 3-year-old MRI "recent"."""
+    m = _months_ago(dt)
+    if m is None:
+        return "[UNDATED]"
+    if m <= 6:
+        return f"[CURRENT — {m} mo ago]"
+    if m <= 12:
+        return f"[RECENT — {m} mo ago]"
+    years = m / 12
+    if years < 2:
+        return f"[HISTORICAL — {m} mo ago]"
+    return f"[HISTORICAL — ~{years:.1f} yr ago]"
+
+
+def _relabel_imaging_for_recency(imaging_data: Optional[str]) -> str:
+    """Re-emit the imaging block with explicit recency tags per study,
+    sorted newest-first. The LLM otherwise anchors on whichever study
+    appears first in source order — frequently a 3-year-old MRI from a
+    resolved hospitalization — and writes "recent imaging shows...".
+
+    Parses each study by its leading "(MM/DD/YYYY)" tag (the format
+    the imaging extractor emits). Studies without a parseable date are
+    placed last and tagged [UNDATED]."""
+    if not imaging_data or not imaging_data.strip():
+        return imaging_data or ""
+    # Split on blank lines so each study (header + body) stays together.
+    chunks = [c.strip() for c in re.split(r'\n\s*\n', imaging_data) if c.strip()]
+    entries = []
+    date_re = re.compile(r'\((\d{1,2})/(\d{1,2})/(\d{4})\)')
+    from datetime import datetime
+    for c in chunks:
+        m = date_re.search(c)
+        if m:
+            try:
+                dt = datetime(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+            except ValueError:
+                dt = None
+        else:
+            dt = None
+        entries.append((dt, c))
+    # Sort: dated first by descending date, undated last.
+    entries.sort(key=lambda e: (e[0] is None, -(e[0].toordinal() if e[0] else 0)))
+    lines = []
+    for dt, chunk in entries:
+        tag = _recency_label(dt)
+        lines.append(f"{tag} {chunk}")
+    return "\n\n".join(lines)
+
+
+def _build_temporal_anchor_block(
+    psa_data: Optional[str],
+    imaging_data: Optional[str],
+    gu_notes: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Deterministic 'when is now' block. Lists today's date, the 6-month
+    cutoff, and the most-recent dated event per modality so the LLM has
+    no excuse to call an old event 'recent'.
+
+    Without this the LLM applies 'recent' / 'recently' / 'persistent' to
+    multi-year-old findings (2023 MRI for resolved pyelonephritis becomes
+    'recent imaging shows persistent UTI/cystitis' in a 2026 note)."""
+    from datetime import datetime, timedelta
+    today = datetime.now()
+    cutoff_6mo = today - timedelta(days=183)
+    cutoff_12mo = today - timedelta(days=365)
+
+    lines = [
+        "TEMPORAL ANCHOR (READ FIRST — non-negotiable):",
+        f"- TODAY = {today.strftime('%Y-%m-%d')} "
+        f"({today.strftime('%B %d, %Y')}).",
+        f"- The word 'recent' / 'recently' / 'lately' applies ONLY to "
+        f"events on or after {cutoff_6mo.strftime('%Y-%m-%d')} "
+        f"(within the last 6 months).",
+        f"- For any event older than that, USE THE EXPLICIT DATE "
+        f"(e.g., 'CT in March 2025', 'MRI in July 2023'). Never call "
+        f"it 'recent'.",
+    ]
+
+    # Most-recent PSA date
+    if psa_data:
+        psa_date_re = re.compile(
+            r'(?:\[[a-z]+\]\s+)?'
+            r'([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})'
+        )
+        psa_dates = []
+        for line in psa_data.split('\n'):
+            m = psa_date_re.search(line.strip())
+            if m:
+                dt = _parse_any_date(m.group(1))
+                if dt:
+                    psa_dates.append(dt)
+        if psa_dates:
+            most_recent = max(psa_dates)
+            lines.append(
+                f"- Most-recent PSA date: "
+                f"{most_recent.strftime('%Y-%m-%d')} "
+                f"{_recency_label(most_recent)}"
+            )
+
+    # Most-recent imaging date (uses imaging-block "(MM/DD/YYYY)" tags)
+    if imaging_data:
+        date_re = re.compile(r'\((\d{1,2})/(\d{1,2})/(\d{4})\)')
+        img_dates = []
+        for m in date_re.finditer(imaging_data):
+            try:
+                img_dates.append(datetime(int(m.group(3)),
+                                          int(m.group(1)),
+                                          int(m.group(2))))
+            except ValueError:
+                continue
+        if img_dates:
+            most_recent = max(img_dates)
+            lines.append(
+                f"- Most-recent imaging date: "
+                f"{most_recent.strftime('%Y-%m-%d')} "
+                f"{_recency_label(most_recent)}"
+            )
+            stale_imgs = [d for d in img_dates if d < cutoff_12mo]
+            if stale_imgs:
+                stale_years = sorted({d.year for d in stale_imgs})
+                year_str = ", ".join(str(y) for y in stale_years)
+                lines.append(
+                    f"- Imaging from {year_str} is HISTORICAL. If those "
+                    f"findings have been re-evaluated by newer studies, "
+                    f"describe the historical findings with their year "
+                    f"AND the current status (e.g., 'July 2023 MRI "
+                    f"showed X during the pyelonephritis episode; "
+                    f"follow-up CT in March 2025 demonstrated "
+                    f"resolution')."
+                )
+
+    # Most-recent GU-visit date (helps LLM frame as 'since last visit on
+    # <date>' rather than fabricating a today-symptom complaint)
+    if gu_notes:
+        visit_dates = []
+        for n in gu_notes:
+            d = _parse_any_date(n.get("_source_date", "") or n.get("date", ""))
+            if d:
+                visit_dates.append(d)
+        if visit_dates:
+            most_recent = max(visit_dates)
+            lines.append(
+                f"- Most-recent urology visit: "
+                f"{most_recent.strftime('%Y-%m-%d')} "
+                f"{_recency_label(most_recent)}. The patient has NOT "
+                f"been interviewed since that date — do not fabricate "
+                f"new same-day subjective complaints."
+            )
+
+    return "\n".join(lines)
+
+
+def _strip_stale_recent_qualifier(hpi: str) -> str:
+    """Strip / rewrite 'recent' qualifiers that point at >6-month-old
+    events. Catches the common LLM failure where it writes 'recent
+    imaging studies have shown X' about an MRI from 3 years ago.
+
+    Conservative — only rewrites when (a) the same sentence contains a
+    year that is >1 calendar year before TODAY, OR (b) the sentence
+    references 'imaging' / 'MRI' / 'CT' but no date at all (in which
+    case 'recent' is ambiguous and is dropped). Otherwise pass through."""
+    if not hpi or not hpi.strip():
+        return hpi
+    from datetime import datetime
+    this_year = datetime.now().year
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', hpi.strip())
+    out = []
+    year_re = re.compile(r'\b(20\d{2})\b')
+    qualifier_re = re.compile(
+        r'\b(recent(?:ly)?|lately|just)\b',
+        re.IGNORECASE,
+    )
+    # Pattern that flags an "undated recent imaging" claim — almost
+    # always stale (the LLM is paraphrasing a 2023 study as 'recent'
+    # because no temporal anchor told it not to).
+    undated_recent_img_re = re.compile(
+        r'\brecent(?:ly)?\s+(?:imaging|MRI|CT|ultrasound|study|studies)\b',
+        re.IGNORECASE,
+    )
+    month_re = re.compile(
+        r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+        r'(?:[a-z]+)?\s+\d{1,2},?\s+\d{4}\b'
+        r'|\b\d{1,2}/\d{1,2}/\d{2,4}\b',
+        re.IGNORECASE,
+    )
+    for s in sentences:
+        years = [int(y) for y in year_re.findall(s)]
+        has_date = bool(month_re.search(s))
+        # Case A: explicit old year + recent qualifier in same sentence.
+        old_year_present = any(y <= this_year - 2 for y in years)
+        if old_year_present and qualifier_re.search(s):
+            s = qualifier_re.sub("", s)
+            s = re.sub(r'\s{2,}', ' ', s).strip()
+            s = re.sub(r'^(imaging|MRI|CT|ultrasound|study)', r'The \1', s)
+            out.append(s)
+            continue
+        # Case B: "recent imaging/MRI/CT/study" with NO date in the
+        # sentence — drop entirely. The TEMPORAL ANCHOR block has
+        # provided authoritative dates for the truly recent studies;
+        # any free-floating "recent imaging" sentence without a date
+        # is the LLM paraphrasing a stale finding. The truly-recent
+        # study will be cited explicitly in another sentence.
+        if undated_recent_img_re.search(s) and not has_date:
+            continue
+        out.append(s)
+    return " ".join(out).strip()
+
+
+def _reconcile_psa_direction(hpi: str, psa_data: Optional[str]) -> str:
+    """When the deterministic PSA direction is 'decreased' but the HPI
+    still says 'rising' / 'elevated PSA levels' framing, rewrite the
+    framing. Catches the Chavez-style self-contradiction
+    ('rising PSA levels, which have decreased from 1.84 to 0.79')."""
+    if not hpi or not psa_data:
+        return hpi
+    # Reuse the delta block's parsing.
+    values = []
+    for raw_line in psa_data.split('\n'):
+        line = raw_line.strip()
+        nums = re.findall(r'\d+\.\d+', line)
+        if nums:
+            try:
+                values.append(float(nums[-1]))
+            except ValueError:
+                pass
+    if len(values) < 2:
+        return hpi
+    cur, prev = values[0], values[1]
+    if cur >= prev - 0.05:
+        return hpi  # not clearly decreasing → don't touch
+
+    # Rewrite "rising PSA" / "rising PSA levels" / "elevated PSA levels"
+    # framings to "previously elevated PSA, now declining" when applied
+    # to the current trajectory. Don't touch historical-tense uses
+    # ("PSA rose to 4.28 in 2023" is a valid statement of past history).
+    patterns = [
+        (re.compile(r'\brising\s+PSA(?:\s+levels)?\b', re.IGNORECASE),
+         "previously elevated PSA, now declining"),
+        (re.compile(r'\belevated\s+PSA(?:\s+levels)?\b(?!\s+in\s+\d{4})',
+                    re.IGNORECASE),
+         "previously elevated PSA, now declining"),
+        (re.compile(r'\bcurrently\s+undergoing\s+evaluation\s+for\s+new\s+disease\b',
+                    re.IGNORECASE),
+         "now on PSA surveillance following normalization"),
+    ]
+    out = hpi
+    for pat, repl in patterns:
+        out = pat.sub(repl, out)
+    return out
+
+
+def _scrub_unsupported_biopsy_claims(
+    hpi: str,
+    pathology_data: Optional[str],
+    psh_data: Optional[str],
+) -> str:
+    """Drop HPI sentences that claim a prostate biopsy was performed when
+    PATHOLOGY RESULTS shows no biopsy and PSH lists none.
+
+    Root cause this fixes: the LLM completes the narrative "PSA spike →
+    biopsy" pattern even when no biopsy is in the source. It also
+    inverts "No prostate pathology on file" → "(pathology on file)" by
+    dropping the negation. Both produce a fabricated biopsy claim in
+    an otherwise factual HPI.
+
+    Detection: any sentence containing "underwent a prostate biopsy",
+    "biopsy revealed/showed/demonstrated", "prostate biopsy (pathology
+    on file)", or similar — AND the rendered PATHOLOGY data is empty
+    / "None documented" / contains no prostate-biopsy entry — AND PSH
+    contains no prostate biopsy entry.
+
+    Action: strip the offending CLAUSE within the sentence (preferred)
+    or the whole sentence if the claim is sentence-spanning. Surgical
+    precision avoids wiping out the legitimate facts in the same
+    sentence (e.g., the real PSA spike + UTI context).
+    """
+    if not hpi:
+        return hpi
+
+    pathology_blob = (pathology_data or "").lower()
+    psh_blob = (psh_data or "").lower()
+
+    # Does the rendered pathology / PSH have a real prostate-biopsy entry?
+    has_real_prostate_biopsy = bool(
+        re.search(r"prostate\s+biops|prostatic\s+biops|trus\s*[/-]?\s*bx|"
+                  r"transrectal\s+(?:ultrasound[\s\-]?)?biops|"
+                  r"prostate\s+cores|gleason\s+(?:score|grade)",
+                  pathology_blob + "\n" + psh_blob)
+    )
+    if has_real_prostate_biopsy:
+        return hpi  # Real biopsy exists — claim is legitimate
+
+    # Pattern that matches the hallucinated biopsy claim and the
+    # parenthetical "(pathology on file)" tail. The clause-strip
+    # captures the verb + biopsy noun + optional parenthetical.
+    biopsy_claim_re = re.compile(
+        r"(?:\s+and\s+|\s*;\s*|\s*,\s*|\s+)?"
+        r"(?:has\s+(?:had|undergone)|"
+        r"(?:he|she|the\s+patient)\s+(?:has\s+)?(?:had|undergone)|"
+        r"underwent|completed|received|"
+        r"is\s+s/?p|status\s+post|s/?p)\s+"
+        r"(?:a\s+|an\s+|the\s+)?"
+        r"(?:prior\s+|previous\s+|recent\s+)?"
+        r"(?:transrectal\s+|TRUS\s*[/\-]?\s*)?"
+        r"prostate\s+biops(?:y|ies)"
+        r"(?:\s*\((?:pathology\s+on\s+file|results?\s+(?:pending|on\s+file)|"
+        r"see\s+pathology|cores\s+sampled)[^)]*\))?",
+        re.IGNORECASE,
+    )
+
+    # Also catch "biopsy revealed/showed/demonstrated/confirmed X" when X
+    # references prostate pathology (Gleason, adenocarcinoma, etc.) — these
+    # claims similarly imply a biopsy occurred.
+    biopsy_finding_claim_re = re.compile(
+        r"(?:prostate\s+|TRUS\s+|transrectal\s+)biops(?:y|ies)\s+"
+        r"(?:revealed|showed|demonstrated|confirmed|noted|found)\s+"
+        r"[^.]*?(?:gleason|adenocarcinoma|grade\s+group|GG\s*\d|"
+        r"cores?\s+positive|benign|negative\s+for\s+malignancy)[^.]*?\.",
+        re.IGNORECASE,
+    )
+
+    # "pathology on file" parenthetical alone (when the LLM dropped the
+    # "no" negation from "No prostate pathology on file"). This is rare
+    # but extremely high-confidence as a hallucination.
+    pathology_on_file_re = re.compile(
+        r"\(\s*(?:prostate\s+)?pathology\s+on\s+file\s*\)",
+        re.IGNORECASE,
+    )
+
+    out = hpi
+
+    # Drop full biopsy-finding sentences (rare, but cleanest when caught)
+    out = biopsy_finding_claim_re.sub("", out)
+
+    # Strip the biopsy-claim clause WITHIN sentences. This preserves the
+    # surrounding facts (PSA values, UTI context, dates) that are real.
+    out = biopsy_claim_re.sub("", out)
+
+    # Strip orphan "(pathology on file)" parenthetical
+    out = pathology_on_file_re.sub("", out)
+
+    # Cleanup: normalize whitespace, drop orphan connectives left after
+    # clause removal, collapse double-punctuation.
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([.,;:])", r"\1", out)
+    # "he and experienced" / "the patient and reports" → "he experienced"
+    # — the conjunction is left dangling because the first conjunct was
+    # the biopsy clause we just removed.
+    out = re.sub(
+        r"\b(he|she|the\s+patient|patient)\s+and\s+(?=[a-z])",
+        r"\1 ",
+        out, flags=re.IGNORECASE,
+    )
+    # "; and experienced" / ", and experienced" with nothing between
+    # the punctuation and "and" — drop the leading "and".
+    out = re.sub(r"([.;,])\s*and\s+(?=[a-z])", r"\1 ", out)
+    out = re.sub(r"\.\s*\.", ".", out)
+    out = re.sub(r",\s*\.", ".", out)
+    out = re.sub(r";\s*\.", ".", out)
+    # Tidy any stray ";  " or ",  " from removed clauses
+    out = re.sub(r"\s{2,}", " ", out)
+    # Strip leading punctuation/whitespace left by a sentence-initial
+    # biopsy clause being stripped.
+    out = re.sub(r"^\s*[.,;:]+\s*", "", out)
+    return out.strip()
+
+
+def _scrub_psa_hallucinations(hpi: str, psa_data: Optional[str]) -> str:
+    """Replace fabricated PSA values in the HPI with the true current value.
+
+    The LLM occasionally substitutes a PSA-context number with a non-PSA
+    numeric that appears nearby in the source — most commonly a value
+    from a TUMOR SCREENS reference-range row that shares the same table
+    as the PSA column ("Ref range high  4  ...  34  38.6" → "PSA ...
+    risen to 38.6 ng/mL"). The existing HPIFactVerifier only matches
+    "PSA <number>" but the LLM phrases it as "PSA has risen to ... ng/mL"
+    with prose between PSA and the number, so the verifier misses it.
+
+    This scrubber:
+      1. Parses the deterministic PSA list from psa_data (truth set).
+      2. Finds every "<value> ng/mL" mention in the HPI.
+      3. For mentions that sit within ~150 chars of a "PSA" / "PSA-
+         value" token AND whose value is NOT a known PSA value (±0.05),
+         rewrites that value to the most-recent true PSA, with date.
+
+    Conservative — only rewrites when (a) PSA context is established
+    in the same vicinity, AND (b) the cited value is not within 0.05
+    ng/mL of ANY known PSA value. ng/mL values for other analytes
+    (testosterone, vitamin D, etc.) are not affected because they are
+    rarely PSA-adjacent in the prose.
+    """
+    if not hpi or not psa_data:
+        return hpi
+    # Parse known PSA values + the current (most-recent) one with date.
+    psa_entries = []  # list of (value_float, date_str)
+    for raw_line in psa_data.split('\n'):
+        line = raw_line.strip()
+        if not line:
+            continue
+        date_match = re.match(
+            r'(?:\[[a-z]+\]\s+)?'
+            r'([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})',
+            line,
+        )
+        nums = re.findall(r'\d+\.\d+', line)
+        if not nums:
+            continue
+        try:
+            val = float(nums[-1])
+        except ValueError:
+            continue
+        date_str = date_match.group(1) if date_match else ""
+        psa_entries.append((val, date_str))
+    if not psa_entries:
+        return hpi
+    known_values = {round(v, 2) for v, _ in psa_entries}
+    cur_val, cur_date = psa_entries[0]  # reverse-chronological → most-recent first
+
+    def _is_known(v: float) -> bool:
+        return any(abs(v - k) < 0.05 for k in known_values)
+
+    # Scan every "<value> ng/mL" mention. For each, look 200 chars
+    # BEFORE for the nearest analyte name (PSA / testosterone / etc.).
+    # If the nearest analyte is PSA — AND the value isn't a known PSA
+    # value — it's a hallucination. Non-greedy regex advancing past
+    # the first PSA-ng/mL pair was missing the second ng/mL in
+    # sentences like "PSA was 4.47 ng/mL ... risen to 38.6 ng/mL".
+    ngml_re = re.compile(r'(\d+\.?\d*)\s*ng/mL', re.IGNORECASE)
+    # Other analyte tokens whose presence between PSA and the value
+    # means the value belongs to the OTHER analyte, not PSA. Keep this
+    # list small and high-precision.
+    other_analyte_re = re.compile(
+        r'\b(?:testosterone|testos|free\s+T|estradiol|estrogens?|'
+        r'vitamin\s+[A-Z]|B12|cobalamin|prolactin|cortisol|TSH|'
+        r'T4|T3|LH|FSH|HCG|AFP|LDH|alkaline|hemoglobin|HgB|'
+        r'creatinine|BUN|glucose|A1C|calcium|albumin|protein|'
+        r'CEA|CA[\-\s]?(?:125|15[\-\s]?3|19[\-\s]?9|27[\-\s]?29)|'
+        r'PSA[\-\s]?F|free\s+PSA|%\s*free\s+PSA)\b',
+        re.IGNORECASE,
+    )
+    psa_token_re = re.compile(r'(?<![A-Za-z\-])PSA(?!\s*[-/])\b', re.IGNORECASE)
+
+    out_parts = []
+    pos = 0
+    for m in ngml_re.finditer(hpi):
+        cited_str = m.group(1)
+        try:
+            cited = float(cited_str)
+        except ValueError:
+            continue
+        # Look 200 chars BEFORE the value for the nearest analyte token.
+        lookback_start = max(0, m.start() - 200)
+        before = hpi[lookback_start:m.start()]
+        # Find last PSA position
+        last_psa = None
+        for pm in psa_token_re.finditer(before):
+            last_psa = pm.end()
+        if last_psa is None:
+            continue
+        # Find last OTHER analyte position
+        last_other = None
+        for om in other_analyte_re.finditer(before):
+            last_other = om.end()
+        # If a non-PSA analyte sits AT or AFTER the PSA mention (closer
+        # to the value), the value belongs to that analyte — leave
+        # alone. Use >= so "Free PSA" (which contains the PSA token but
+        # is also a distinct analyte) wins on tie.
+        if last_other is not None and last_other >= last_psa:
+            continue
+        if _is_known(cited):
+            continue
+        # Hallucinated. Replace just this ng/mL value with the current PSA + date.
+        out_parts.append(hpi[pos:m.start()])
+        date_suffix = f" on {cur_date}" if cur_date else ""
+        out_parts.append(f"{cur_val} ng/mL{date_suffix}")
+        pos = m.end()
+    out_parts.append(hpi[pos:])
+    return ''.join(out_parts)
 
 
 def _build_psa_delta_block(psa_data: Optional[str]) -> str:
@@ -397,8 +1066,34 @@ def synthesize_hpi(
             cleaned, _ = _scaf(text, patient_facts)
             return cleaned
 
+    # Recency filter for prior HPIs: when a recent urology note exists,
+    # drop HPIs from notes older than 18 months. Otherwise an ancient
+    # consult's ER narrative ("received morphine with pain relief,
+    # discharged with urology consult") is presented to the LLM as a
+    # peer of recent visits and gets woven into today's HPI.
+    from datetime import datetime as _dt, timedelta as _td
+    _now = _dt.now()
+    _recent_cutoff = _now - _td(days=548)
+    def _note_dt2(n):
+        d = (n.get("_source_date") or "").strip()
+        if not d:
+            return None
+        for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return _dt.strptime(d, fmt)
+            except (ValueError, TypeError):
+                continue
+        return None
+    _gu_notes_for_hpi = gu_notes
+    if any(_note_dt2(n) and _note_dt2(n) >= _recent_cutoff and n.get("HPI")
+           for n in gu_notes):
+        _gu_notes_for_hpi = [
+            n for n in gu_notes
+            if (_note_dt2(n) is None) or (_note_dt2(n) >= _recent_cutoff)
+        ]
+
     hpi_instances = []
-    for note in gu_notes:
+    for note in _gu_notes_for_hpi:
         hpi_text = note.get("HPI")
         if not hpi_text:
             continue
@@ -468,12 +1163,21 @@ def synthesize_hpi(
     if len(hpi_instances) == 1 and not (authoritative_facts and authoritative_facts.strip()):
         # Remove our internal labels
         result = hpi_instances[0]
+        # Strip our internal "[Prior visit dated ... — TITLE]" header
+        # the snapshot loop prepended. Without this strip, the line
+        # would render verbatim in the HPI section.
+        result = re.sub(r'^\s*\[Prior\s+visit[^\]]*\]\s*\n+', '', result)
         result = result.replace("Non-GU HPI: ", "")
         # Replace "consult" with "followup" terminology
-        import re
         result = re.sub(r'\burology\s+consult\b', 'urology followup', result, flags=re.IGNORECASE)
         result = re.sub(r'\bconsult\s+for\b', 'followup for', result, flags=re.IGNORECASE)
         result = re.sub(r'\bfor\s+a\s+urology\s+consult\b', 'for a urology followup', result, flags=re.IGNORECASE)
+        # Run the LLM-commentary cleaner — prior HPIs are themselves
+        # LLM-generated by prior runs and frequently carry
+        # "Mr., a 65-year-old", "Patient Name:", "Based on the provided
+        # data..." scaffolding that bypassed the cleaner because this
+        # short-circuit path didn't call it.
+        result = clean_llm_commentary(result)
         return result
 
     # Build clinical context section from available data.
@@ -495,6 +1199,20 @@ def synthesize_hpi(
     # matching against rising-PSA templates.
     if authoritative_facts and authoritative_facts.strip():
         context_parts.append(authoritative_facts)
+
+    # TEMPORAL ANCHOR — answers "when is now?" deterministically so the
+    # LLM cannot call a 3-year-old MRI "recent". Placed near the top so
+    # every downstream context block (PSA list, imaging list, prior-
+    # visit HPIs) is read through the recency rules. Uses today's date,
+    # most-recent PSA date, most-recent imaging date, and most-recent
+    # urology-visit date.
+    temporal_anchor = _build_temporal_anchor_block(
+        psa_data=psa_data,
+        imaging_data=imaging_data,
+        gu_notes=_gu_notes_for_hpi,
+    )
+    if temporal_anchor:
+        context_parts.append(temporal_anchor)
 
     # PHASE 2: deterministic HPI story skeleton — placed AFTER the ground-
     # truth block so the LLM sees both. The skeleton is the structured
@@ -546,9 +1264,19 @@ def synthesize_hpi(
         labs_summary = labs_data[:1500] if len(labs_data) > 1500 else labs_data
         context_parts.append(f"RELEVANT LAB RESULTS:\n{labs_summary}")
     if imaging_data and imaging_data.strip():
-        # Limit imaging to reasonable length for HPI context
-        imaging_summary = imaging_data[:1500] if len(imaging_data) > 1500 else imaging_data
-        context_parts.append(f"IMAGING FINDINGS:\n{imaging_summary}")
+        # Re-label imaging block with recency tags ([CURRENT 0-6 mo],
+        # [RECENT 6-12 mo], [HISTORICAL >12 mo]) and sort newest first.
+        # Otherwise the LLM picks whichever study appears first in the
+        # source and calls it "recent" — frequently a 3-year-old MRI
+        # from a resolved hospitalization.
+        relabeled = _relabel_imaging_for_recency(imaging_data)
+        imaging_summary = relabeled[:2000] if len(relabeled) > 2000 else relabeled
+        context_parts.append(
+            "IMAGING FINDINGS (each study is tagged with its recency — "
+            "use only [CURRENT] studies as 'recent'; cite [HISTORICAL] "
+            "studies by their explicit date and frame as historical):\n"
+            f"{imaging_summary}"
+        )
 
     # Add cross-specialty urologic context (from non-GU notes)
     if cross_specialty_context and cross_specialty_context.strip():
@@ -636,6 +1364,30 @@ Create a current, comprehensive UROLOGY HPI that synthesizes all available urolo
 {clinical_context}
 {authoritative_directive}
 {skeleton_directive}
+
+PRE-VISIT / CHART-PREP FRAMING (READ FIRST — non-negotiable):
+- This HPI is generated from a chart extract assembled BEFORE the patient
+  is seen today. The patient has NOT yet been interviewed. NO new symptom
+  history, ROS positive, or "today the patient reports..." statement can
+  be invented.
+- "Today" in this HPI means: the reason listed on the visit roster
+  (annual followup, PSA followup, ED followup, etc.) — NOT a fresh
+  symptom complaint.
+- All subjective symptom statements MUST be anchored to their source
+  date. Correct: "At the last urology visit on 06/30/2025, he reported
+  stable urinary function..." Incorrect: "He reports stable urinary
+  function" (this implies a same-day interview that has not happened).
+- If a prior visit documented a symptom, frame it as "as of the
+  [DATE] visit" or "since the prior visit, no interval documentation
+  of [symptom]". Do NOT lift the prior-visit subjective narrative and
+  re-present it as today's complaint.
+- The opening sentence pattern for a followup is:
+  "<Name> is a <age>-year-old <sex> who returns for <visit-reason-from-
+  source>." NOT "<Name> presents with [symptoms]" unless the source
+  contains a same-day chief-complaint statement.
+- A follow-up visit's job is to assess interval change and confirm the
+  prior plan. Frame it that way. Do not turn it into a re-presentation
+  of original disease.
 
 CRITICAL TEMPORAL INVARIANTS (read before doing anything else):
 - The HPI entries below are PRIOR-VISIT SNAPSHOTS, each labeled with
@@ -759,18 +1511,50 @@ NON-REDUNDANCY (MANDATORY — output is rejected if violated):
   reference ("the previously noted decline", "this elevation") rather
   than restating the value.
 
-ANTI-REDUNDANCY EXAMPLE (do NOT produce output like this):
-   BAD: "His PSA rose to 30.25 ng/mL. He has metastatic disease and
-        is on monthly Degarelix. Most recent PSA is 30.25 ng/mL.
-        Patient is currently on monthly Degarelix injections.
-        Mild anemia, leukopenia, and elevated alkaline phosphatase
-        noted. The patient's current chief complaint is rising PSA,
-        with a value of 30.25 ng/mL. Mild anemia, leukopenia, and
-        elevated alkaline phosphatase noted."
-   GOOD: "His PSA has risen from 0.26 ng/mL (Sep 2025) to 30.25 ng/mL
-        (Jun 2026) despite ongoing monthly Degarelix injections, with
-        accompanying mild anemia, leukopenia, and elevated alkaline
-        phosphatase on recent labs."
+MEDICATION MENTIONS (MANDATORY — HPI is NOT the medication list):
+- The MEDICATIONS section of the note enumerates the full active
+  outpatient list. Do NOT duplicate it in the HPI prose.
+- Only reference a medication in the HPI when it is UROLOGICALLY
+  ACTIVE (currently being taken for a urologic reason) or directly
+  relevant to a urologic decision being made today. Allowed urologic
+  classes: alpha-blockers (tamsulosin, alfuzosin, silodosin,
+  doxazosin, terazosin), 5-alpha-reductase inhibitors (finasteride,
+  dutasteride), antimuscarinics / anticholinergics (oxybutynin,
+  solifenacin, mirabegron, vibegron, tolterodine, trospium,
+  fesoterodine, darifenacin), PDE5 inhibitors (sildenafil, tadalafil,
+  vardenafil, avanafil), intracavernosal therapy (Trimix, alprostadil),
+  GnRH analogues / antagonists (leuprolide, goserelin, degarelix,
+  relugolix), anti-androgens (bicalutamide, enzalutamide, apalutamide,
+  darolutamide, abiraterone), chemotherapy used for GU cancers
+  (docetaxel, cabazitaxel, mitomycin C, BCG), urinary analgesics
+  (phenazopyridine), urologic abx where infection is the urologic
+  focus, testosterone replacement, and urologic supplements being
+  managed by the clinic.
+- All other medications (statins, antihypertensives, anticoagulants,
+  reflux meds, antidepressants, neurology agents, allergy meds, etc.)
+  belong in the MEDICATIONS section ONLY and must not be listed in
+  the HPI prose. Mention them only when they directly bear on a
+  urologic decision (e.g., apixaban relevant to peri-procedural
+  hold).
+
+ANTI-REDUNDANCY EXAMPLE — illustrative ONLY. The patient name, PSA
+values, medication names, and findings below are PLACEHOLDERS. They are
+NOT this patient's data. Do NOT copy them into your output:
+   BAD: "His PSA rose to PLACEHOLDER_VALUE. He has PLACEHOLDER_FINDING
+        and is on PLACEHOLDER_MED. Most recent PSA is PLACEHOLDER_VALUE.
+        Patient is currently on PLACEHOLDER_MED injections.
+        PLACEHOLDER_LABS noted. The patient's current chief complaint
+        is PLACEHOLDER_CC, with a value of PLACEHOLDER_VALUE.
+        PLACEHOLDER_LABS noted."
+   GOOD: "His PSA has risen from PLACEHOLDER_VALUE_A (Sep 2025) to
+        PLACEHOLDER_VALUE_B (Jun 2026) despite ongoing PLACEHOLDER_MED,
+        with accompanying PLACEHOLDER_LABS on recent labs."
+
+CRITICAL: every patient-specific value (PSA numbers, dates, medication
+names, treatment events, lab findings, imaging findings) in your output
+MUST be sourced from THIS PATIENT'S CLINICAL DATA CONTEXT above. Never
+copy a value from an example, illustration, or template — those are
+not patient data.
 
 CONTENT REQUIREMENTS:
 - USE all urologically relevant information provided in the source notes
@@ -888,6 +1672,65 @@ Provide ONLY the clinical narrative HPI. NO meta-commentary, NO explanations lik
     # sentence AND no new value introduced. See _dedupe_hpi_sentences
     # for the exact criteria.
     cleaned_hpi = _dedupe_hpi_sentences(cleaned_hpi)
+
+    # Deterministic non-urologic-content stripper. Prompt-only rules
+    # against listing non-urologic medications and labs leak — the LLM
+    # still emits "He also takes Cetirizine for allergies and
+    # Fluticasone Prop for nasal allergies" and "Recent laboratory
+    # results include a specific gravity of 1.011, an EGFR CKD EPI of
+    # 82, a glucose level of 102 mg/dL". Strip those sentences here.
+    cleaned_hpi = _strip_nonurologic_sentences(cleaned_hpi)
+
+    # Temporal-anchor post-processors. Catch the LLM failures that
+    # survive the deterministic temporal-anchor and imaging-recency
+    # context blocks: 'recent imaging shows X' for 2023 studies, and
+    # 'rising PSA' framing applied to a clearly-declining trajectory.
+    cleaned_hpi = _strip_stale_recent_qualifier(cleaned_hpi)
+    cleaned_hpi = _reconcile_psa_direction(cleaned_hpi, psa_data)
+    # PSA-hallucination scrubber — replaces fabricated PSA-context ng/mL
+    # values (e.g., "PSA risen to 38.6 ng/mL" pulled from a TUMOR
+    # SCREENS reference-range row) with the deterministic current PSA
+    # and date from psa_data.
+    cleaned_hpi = _scrub_psa_hallucinations(cleaned_hpi, psa_data)
+    # Biopsy-claim scrubber — drop fabricated "underwent prostate biopsy"
+    # clauses when PATHOLOGY RESULTS contains no biopsy and PSH lists
+    # none. This was the Watley failure mode: the LLM completed the
+    # "PSA spike → biopsy" narrative pattern and inverted "No prostate
+    # pathology on file" → "(pathology on file)" by dropping the
+    # negation. Both anchors (PATHOLOGY + PSH) are deterministic
+    # extractors, so we can trust the negative evidence.
+    cleaned_hpi = _scrub_unsupported_biopsy_claims(
+        cleaned_hpi, pathology_data, psh_data,
+    )
+    # Final dedup pass — _reconcile_psa_direction can substitute
+    # "elevated PSA" → "previously elevated PSA, now declining" and
+    # produce duplicates when both "rising PSA" and "elevated PSA"
+    # appear in the same sentence ("previously elevated PSA, now
+    # declining, previously elevated PSA, now declining"). Run the
+    # word-doubling collapse again to catch them.
+    from .history_cleaners import _collapse_word_doubling as _cwd
+    cleaned_hpi = _cwd(cleaned_hpi)
+
+    # Age-corrector — the LLM occasionally writes a wrong age in the
+    # opening sentence (carrying it over from a prior-visit HPI when
+    # the patient was younger). Replace any "<wrong N>-year-old"
+    # mention with the authoritative current age.
+    if patient_age and str(patient_age).isdigit():
+        true_age = int(patient_age)
+        def _fix_age(m):
+            cited = int(m.group(1))
+            if cited == true_age:
+                return m.group(0)
+            # Plausible-age guard: only rewrite ages within ±15 years of
+            # the truth (so a "5-year-old MS history" timing reference
+            # is NOT rewritten).
+            if abs(cited - true_age) > 15:
+                return m.group(0)
+            return f"{true_age}{m.group(0)[len(m.group(1)):]}"
+        cleaned_hpi = re.sub(
+            r'\b(\d{1,3})[-\s]year[-\s]old\b',
+            _fix_age, cleaned_hpi,
+        )
 
     # STEP: Verify HPI against ground truth facts
     verification_result = None

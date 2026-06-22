@@ -200,9 +200,13 @@ def _strip_diagnostic_codes(diagnosis: str) -> str:
     # "Conjunctivitis, Allergic * (ICD-9-CM" or
     # "Allergic rhinitis (SNOMED CT 61582004)".
     cleaned = re.sub(r'\s*\(SCT[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s*\(SNOMED\s+CT[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s*\(ICD-10-CM[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s*\(ICD-9-CM[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
+    # SNOMED variants: VistA PLL tables column-truncate the SNOMED tail,
+    # producing rows like "Allergic rhinitis (SNOMED" (no CT, no
+    # closing paren). Strip on the bare "(SNOMED" anchor instead of
+    # requiring "(SNOMED CT" so column-truncated rows don't leak.
+    cleaned = re.sub(r'\s*\(SNOMED\b[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*\(ICD-?10(?:-CM)?[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*\(ICD-?9(?:-CM)?[^)]*\)?', '', cleaned, flags=re.IGNORECASE)
     # Remove trailing asterisks and stray punctuation
     cleaned = cleaned.rstrip('*').strip().rstrip(',').strip()
     return cleaned

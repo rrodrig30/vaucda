@@ -4,22 +4,76 @@ Imaging Agent
 Combines and summarizes imaging results.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from ..llm_helper import combine_sections_with_llm
 from .history_cleaners import clean_llm_commentary
 
 
-def synthesize_imaging(document_imaging: str, gu_notes: List[Dict[str, str]]) -> str:
+def _render_procedure_imaging_entries(procedure_findings) -> str:
+    """Render cystoscopy / urodynamics / DEXA findings as IMAGING-style
+    entries (STUDY (DATE):\n<finding>). These are diagnostic procedures
+    with imaging-like findings but live outside the radiology pipeline
+    in `clinical_timeline.extract_procedure_findings`. Surfacing them in
+    the IMAGING section keeps them visible at a glance and ensures the
+    date travels with the finding (the HPI prose was previously dropping
+    the date because the skeleton's free-text formatter could lose it)."""
+    if not procedure_findings:
+        return ""
+    # Categories worth promoting to IMAGING. Pure pathology/biopsy stays
+    # in the PATHOLOGY section; surgical procedures (TURP, TURBT) belong
+    # in PSH.
+    promote = {
+        "cystoscopy": "CYSTOSCOPY",
+        "cystourethroscopy": "CYSTOURETHROSCOPY",
+        "urodynamics": "URODYNAMICS",
+        "dexa": "DEXA",
+    }
+    seen = set()
+    lines: List[str] = []
+    # Sort newest first (date_key is the sortable form populated by the
+    # extractor; falls back to "0" for undated).
+    sorted_pf = sorted(
+        procedure_findings,
+        key=lambda f: (f.date_key or "0"),
+        reverse=True,
+    )
+    for pf in sorted_pf:
+        proc_label = promote.get(pf.procedure.lower())
+        if not proc_label:
+            continue
+        if not pf.finding:
+            continue
+        date_disp = pf.date_display or "(undated)"
+        key = (proc_label, date_disp, pf.finding[:60].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"{proc_label} ({date_disp}):\n{pf.finding}\n")
+    return "\n".join(lines)
+
+
+def synthesize_imaging(
+    document_imaging: str,
+    gu_notes: List[Dict[str, str]],
+    procedure_findings: Optional[List] = None,
+) -> str:
     """
     Synthesize imaging results from document-level extraction and notes.
 
     Args:
         document_imaging: Imaging from document RADIOLOGY sections
         gu_notes: List of GU note dictionaries
+        procedure_findings: Optional list of ProcedureFinding from the
+            clinical_timeline. Cystoscopy / urodynamics / DEXA entries
+            are appended to the imaging output so providers see them
+            alongside radiology and the date always travels with the
+            finding.
 
     Returns:
         Summarized imaging results in reverse chronological order
     """
+    procedure_block = _render_procedure_imaging_entries(procedure_findings)
+
     # Document-level extraction wins when available. extract_imaging()
     # already produces the canonical "STUDY (DATE):\nIMPRESSION: ..."
     # format with cross-note dedup and reverse-chronological sort. Feeding
@@ -30,6 +84,8 @@ def synthesize_imaging(document_imaging: str, gu_notes: List[Dict[str, str]]) ->
     # document-level extractor already aggregates across all source notes,
     # so the per-note path is redundant when it succeeds.
     if document_imaging and document_imaging.strip():
+        if procedure_block:
+            return f"{procedure_block}\n{document_imaging}"
         return document_imaging
 
     all_imaging = []
@@ -38,11 +94,12 @@ def synthesize_imaging(document_imaging: str, gu_notes: List[Dict[str, str]]) ->
             all_imaging.append(note["Imaging"])
 
     if not all_imaging:
-        return ""
+        return procedure_block
 
     if len(all_imaging) == 1:
         # Return as-is - extractor already formats correctly
-        return all_imaging[0]
+        body = all_imaging[0]
+        return f"{procedure_block}\n{body}" if procedure_block else body
 
     instructions = """Combine and summarize these imaging results.
 - Include: Study name, Date, Impression
@@ -59,7 +116,7 @@ CRITICAL: Provide ONLY the imaging results. NO meta-commentary, NO explanations,
     cleaned = clean_llm_commentary(synthesized_imaging)
 
     # Return as-is - don't reformat since extractor already formatted correctly
-    return cleaned
+    return f"{procedure_block}\n{cleaned}" if procedure_block else cleaned
 
 
 def _format_imaging_report(imaging_text: str) -> str:

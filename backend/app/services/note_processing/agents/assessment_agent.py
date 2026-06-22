@@ -15,6 +15,7 @@ import re
 from typing import List, Optional, Set, TYPE_CHECKING
 from ..llm_helper import synthesize_with_llm
 from .history_cleaners import clean_llm_commentary
+from .age_guardrail import build_age_guardrail_block
 
 if TYPE_CHECKING:
     from app.services.llm_config_manager import LLMTaskConfig
@@ -221,6 +222,16 @@ def synthesize_assessment(
     # explicit ABSOLUTE RULES the LLM must follow.
     if authoritative_facts and authoritative_facts.strip():
         context_parts.append(authoritative_facts + "\n")
+
+    # Age & life-expectancy guardrail. Same deterministic block the
+    # Plan agent receives — the Assessment must agree with the bucket
+    # so its recommendations are congruent with what the Plan will
+    # write. Otherwise the Assessment says "continue PSA surveillance,
+    # consider mpMRI" in an 87-year-old and the Plan dutifully repeats
+    # it.
+    age_guardrail = build_age_guardrail_block(stage1_note or "")
+    if age_guardrail:
+        context_parts.append(age_guardrail)
 
     # PHASE 2.1: The HPI was just rendered from this same skeleton.
     # Surface it here so the Assessment uses the same chronological view
@@ -488,7 +499,15 @@ CLINICAL REASONING REQUIREMENTS:
 4. If calculator results are provided, incorporate them appropriately
 5. Follow AUA guidelines and NCCN guidelines when characterizing findings
 6. The assessment must reflect THIS patient's specific situation, not generic descriptions
-7. SURVEILLANCE STATUS (for cancer patients):
+7. AGE / LIFE-EXPECTANCY GUARDRAIL (MANDATORY): read the AGE / LIFE-
+   EXPECTANCY GUARDRAIL block in AVAILABLE INFORMATION above. If the
+   bucket is VERY_LIMITED or LIMITED, the Assessment's recommendations
+   for PSA surveillance / mpMRI / biopsy MUST be conditioned on life
+   expectancy and patient preference per the AUA language quoted in
+   that block. Generic "per AUA, continue annual PSA / consider mpMRI"
+   is FORBIDDEN in those buckets. The Plan agent will receive the same
+   guardrail and will not write a workup the Assessment did not endorse.
+8. SURVEILLANCE STATUS (for cancer patients):
    - Note the current surveillance status (e.g., "no evidence of disease on surveillance cystoscopies")
    - Mention the surveillance schedule if transitioning (e.g., "has now transitioned to q6 month surveillance")
    - Reference the most recent surveillance procedure and its findings

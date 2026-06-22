@@ -304,10 +304,18 @@ _PROSTATE_CONTEXT_RE = re.compile(
 # "has been on", "history of") because in narrative text those reliably
 # mark a real prior treatment.
 _WIDE_COMPLETION_VERB_RE = re.compile(
-    r"(?:s/p|status\s+post|underwent|completed|received|"
-    r"following|after|prior|"
-    r"initiated|started|began|opted\s+for|treated\s+with|"
-    r"is\s+(?:on|s/p)|was\s+(?:on|s/p)|has\s+been\s+on|history\s+of(?!\s+no))",
+    # Each alternation anchored with \b so e.g. "was on" cannot match
+    # within "was only", "is on" within "is only", "s/p" within "s/p-
+    # something". Temporal connectives ('after', 'prior', 'following')
+    # removed because they match harmless prose ('after the appointment',
+    # 'prior to discussion', 'following the procedure note').
+    r"(?:\bs/?p\b|\bstatus\s+post\b|\bunderwent\b|\bcompleted\b|"
+    r"\breceived\b|"
+    r"\binitiated\b|\bstarted\b|\bbegan\b|\bopted\s+for\b|"
+    r"\btreated\s+with\b|"
+    r"\bis\s+on\b|\bis\s+s/p\b|"
+    r"\bwas\s+on\b|\bwas\s+s/p\b|"
+    r"\bhas\s+been\s+on\b|\bhistory\s+of(?!\s+no)\b)",
     re.IGNORECASE,
 )
 
@@ -392,6 +400,27 @@ def find_treatment_in_raw_clinical_text(text: str) -> List[str]:
         r"\b(?:declined|declines|refuses|refused|deferred|not\s+a\s+candidate)\b",
         re.IGNORECASE,
     )
+    # Discussion / counseling / option-list / intent markers. When any
+    # of these sit in the same window as a "completion-verb-like" token,
+    # the prose is COUNSELING about the option, not asserting it was
+    # performed. Without this filter, sentences like
+    #   "He says that he was only offered RALP and AS at USA"
+    # — where 'was on' matches inside 'was only' or where 'history of'
+    # appears nearby — register as completed RALP.
+    discussion_re = re.compile(
+        r"\b(?:discuss(?:ed|ing|ion)?|consider(?:ed|ing|ation)?|"
+        r"offer(?:ed|ing)?|interest(?:ed)?\s+in|may\s+benefit|"
+        r"option(?:s)?\s+(?:of|for|include|are|to)|"
+        r"candidate\s+(?:for|of)|recommend(?:ed|ing|ation)?|"
+        r"plan(?:ned|ning)?\s+(?:for|to)|consult(?:ed|ation)?\s+(?:for|to)|"
+        r"referred\s+(?:for|to)|scheduled\s+(?:for|to)|"
+        r"await(?:ing|s)?|elect(?:ed)?\s+against|"
+        r"under\s+consideration|"
+        r"including|consist(?:ing|s)\s+of|such\s+as|"
+        r"pursu(?:e|ing|ed)|"
+        r"never\s+heard\s+of|never\s+been\s+told\s+about)\b",
+        re.IGNORECASE,
+    )
 
     found: List[str] = []
     for tx_pattern in _RAW_TREATMENT_TOKENS:
@@ -405,6 +434,11 @@ def find_treatment_in_raw_clinical_text(text: str) -> List[str]:
             # Reject "declined / refused / deferred" in the same window
             # (these mean the patient did NOT receive the treatment).
             if declined_re.search(preceding_80):
+                continue
+            # Reject if the broader ±80-char window shows the prose is
+            # an option discussion / counseling / intent statement.
+            window = text[max(0, m.start() - 100):m.end() + 60]
+            if discussion_re.search(window):
                 continue
             # Require prostate-cancer context within ±300 chars.
             if not _in_prostate_context(text, m.start()):

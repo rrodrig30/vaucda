@@ -27,6 +27,86 @@ VAUCDA follows a layered architecture:
 - **RAG Pipeline:** LangChain orchestration with sentence-transformers embeddings
 - **Vector Search:** Neo4j vector indices for semantic similarity
 
+### Note-Processing Pipeline (`backend/app/services/note_processing/`)
+
+The clinical-note generator is an agent-based pipeline. Stage 1 runs
+~20 section agents in parallel; Stage 2 (Assessment + Plan) runs after
+the patient encounter. Each section is built by a regex-based extractor
++ an optional LLM synthesizer wrapped by deterministic post-processors.
+
+**Source-format normalization** (`source_normalizers/vista_to_cprs.py`)
+runs FIRST so every downstream extractor sees CPRS-canonical section
+layout regardless of whether the input is a VistA export or a CPRS dump.
+Toggle via the `source_format` argument to `build_urology_note()`.
+
+**Section synthesis agents** (`agents/`):
+
+| Agent | Role |
+|---|---|
+| `cc_agent` | Chief complaint — picks from gu_notes CCs, applies urologic-keyword filter, falls back to PMH/pathology/PSA-derived rules. Has `_TREATMENT_PATTERNS` for definitive-treatment completion (radiation/prostatectomy/brachy/focal) with discussion-negation filter |
+| `hpi_agent` | HPI — heaviest agent. Builds a deterministic story skeleton, temporal-anchor block, PSA-delta block, treatment-status block, then LLM-renders. Long cleanup chain (see below) |
+| `cc_agent`, `assessment_agent`, `plan_agent` | Stage 2 — read the Stage 1 note + ground-truth blocks; produce Assessment and Plan |
+| `pmh_agent`, `psh_agent`, `social_agent`, `family_agent`, `sexual_agent`, `diet_agent`, `allergies_agent`, `medications_agent`, `ros_agent`, `pe_agent`, `ipss_agent` | Per-section combiners |
+| `psa_agent`, `pathology_agent`, `imaging_agent`, `lab_agents`, `gu_agent`, `non_gu_agent`, `prior_ap_agent` | Clinical-data combiners |
+
+**Ground-truth + safety agents (deterministic — no LLM)**:
+
+- `patient_status_facts` — builds `PatientStatusFacts` from PMH + PSH +
+  pathology + raw-text scanner. Provides authoritative cancer_status,
+  treatment_naive flag, phoenix_applicable, treatment_active_status,
+  clinical_timeline, current_active_treatments, procedure_findings.
+  Drives the HPI/CC/Assessment/Plan "absolute rules" block
+- `clinical_timeline` — extracts dated events (treatments, biopsies,
+  cystoscopies, urodynamics, DEXA, imaging) for structured chronological
+  view independent of LLM-generated prose
+- `hpi_skeleton` — assembles a story-template (intro / diagnosis /
+  treatment timeline / PSA trajectory / procedure findings / current
+  regimen / today's symptoms) that the HPI LLM must RENDER rather than
+  invent
+- `agents/age_guardrail` — classifies patient as STANDARD / LIMITED /
+  VERY_LIMITED life-expectancy from age + PMH-flagged comorbidities;
+  emits AUA Early-Detection-Guideline language so Assessment + Plan
+  don't recommend routine PSA screening / mpMRI / biopsy in elderly
+  or frail patients
+
+**HPI post-processor chain** (runs after LLM synthesis, in order):
+1. `clean_llm_commentary` — strips Markdown leakage (`**Patient Name:**`),
+   meta-preamble (`Based on...I will...`), trailing notes
+   (`Note: I have followed...`), bracket placeholders, "Mr. [Name]"
+   honorific cleanup, "Mr. LAST,FIRST" VistA name format
+2. `_dedupe_hpi_sentences` — collapses LLM redundancy
+3. `_strip_nonurologic_sentences` — drops sentences mentioning
+   non-urologic meds/labs/findings (bile duct, gallbladder, small
+   bowel, nasopharyngeal, etc.) when no urologic anchor present
+4. `_strip_stale_recent_qualifier` — strips "recent imaging" claims
+   that reference >2-year-old studies
+5. `_reconcile_psa_direction` — rewrites "rising PSA" → "previously
+   elevated PSA, now declining" when the PSA delta is clearly down
+6. `_scrub_psa_hallucinations` — replaces PSA-context ng/mL values
+   not in the deterministic PSA list with the true current value;
+   skips Free PSA / testosterone / other analyte mentions
+7. `_scrub_unsupported_biopsy_claims` — strips fabricated "underwent
+   prostate biopsy" / "(pathology on file)" / "biopsy revealed
+   Gleason X" clauses when PATHOLOGY RESULTS is empty AND PSH has no
+   biopsy entry. Anchored against deterministic extractors
+8. Final word-doubling collapse (catches duplicates introduced by
+   reconcile_psa_direction)
+9. Age corrector — replaces wrong "<N>-year-old" with banner age
+
+**Second-pass consistency checker** (`agents/consistency_checker.py`):
+- LLM agent that runs AFTER full Stage-1 assembly. Reads the rendered
+  note + authoritative facts, returns a JSON list of issues
+- Strict action vocabulary: `remove_sentence` / `replace_value` /
+  `flag_only`
+- Safety gates: `remove_sentence` auto-applies ONLY for
+  `FRAGMENT_SENTENCE`; higher-stakes issues (`TREATMENT_NOT_IN_PSH`,
+  `CC_HPI_TOPIC_MISMATCH`, `INTERNAL_CONTRADICTION`, etc.) downgrade to
+  `flag_only`; `replace_value` requires both old and new values to
+  match a numeric clinical-value shape (rejects LLM prose substitution)
+- Hard caps: max 2 removals, max 1 replacement per note
+- Disabled by setting `VAUCDA_CONSISTENCY_CHECK=0` env var
+- Audit trail printed per finding for provider review
+
 ### Clinical Module Categories (44 Total)
 
 | Category | Count | Examples |

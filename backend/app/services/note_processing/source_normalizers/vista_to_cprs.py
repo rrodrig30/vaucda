@@ -258,6 +258,13 @@ def _render_pmh_from_pll(pll_body: str) -> str:
     for m in _PLL_ROW_RE.finditer(pll_body):
         status = m.group(1)
         diagnosis = re.sub(r"\s+", " ", m.group(2)).strip().rstrip(",")
+        # Pre-strip column-truncated SNOMED / ICD code fragments. PLL
+        # tables routinely cut "(SNOMED CT 12345)" mid-string at the
+        # column boundary, leaving "(SNOMED" alone. Without this, the
+        # year-suffix append below produces leaks like "Asthma (SNOMED
+        # (2016)" that the downstream extractor's strip regex misses.
+        diagnosis = re.sub(r"\s*\((?:SNOMED|SCT|ICD-?(?:9|10)(?:-CM)?)\b[^)]*\)?",
+                           "", diagnosis, flags=re.IGNORECASE).rstrip(", *")
         date_mod = m.group(3)
         if status != "A":  # Only active problems
             continue

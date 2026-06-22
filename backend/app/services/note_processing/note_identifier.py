@@ -146,26 +146,87 @@ def identify_notes(clinical_document: str) -> Dict[str, List[Dict[str, str]]]:
                   "Reason For Request:" in clinical_document)
 
     if has_provisional and has_reason:
-        # Split by "===== END =====" markers to handle multiple consult requests
-        consult_sections = re.split(r'=+\s*END\s*=+', clinical_document)
+        # Iterate over EVERY "Provisional Diagnosis:" occurrence. Each one
+        # is a candidate consult request. Don't split by "===== END ====="
+        # — that delimiter is unreliable: VistA dumps in particular use
+        # "MM/DD/YYYY HH:MM Local Title:" record boundaries instead of
+        # equal-sign sections, so a single split would treat the whole
+        # document as one giant consult region.
+        from datetime import datetime, timedelta
 
-        for section in consult_sections:
-            section_has_provisional = "Provisional Diagnosis:" in section
-            section_has_reason = ("Reason for Consult Request:" in section or
-                                 "Reason For Request:" in section)
+        # Header that precedes each historical note in a VistA/CPRS dump:
+        # "MM/DD/YYYY HH:MM  Local Title: <TITLE>". The note's true date
+        # comes from this header — NOT from "Clinically Ind. Date" (which
+        # is often absent) and NOT from "Date: ..." (which can be a note-
+        # signed date months later).
+        _note_header_re = re.compile(
+            r'(\d{1,2})/(\d{1,2})/(\d{4})\s+\d{1,2}:\d{2}\s+Local Title:',
+            re.IGNORECASE,
+        )
 
-            if section_has_provisional and section_has_reason:
-                # Extract date from "Clinically Ind. Date:"
+        for prov_match in re.finditer(r'Provisional Diagnosis:', clinical_document):
+            prov_idx = prov_match.start()
+
+            # Find the nearest preceding "MM/DD/YYYY HH:MM Local Title:"
+            # header. Its date is the consult's date.
+            preceding = list(_note_header_re.finditer(
+                clinical_document[:prov_idx]
+            ))
+            if not preceding:
+                # No anchor header — fall back to Clinically Ind. Date if
+                # present, else accept as undated (don't gate).
                 date = ""
-                date_match = re.search(r'Clinically Ind\. Date:\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4})', section)
-                if date_match:
-                    date = date_match.group(1).strip()
+                ci_match = re.search(
+                    r'Clinically Ind\. Date:\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4})',
+                    clinical_document[prov_idx:prov_idx + 2000],
+                )
+                if ci_match:
+                    date = ci_match.group(1).strip()
+                consult_dt = None
+            else:
+                anchor = preceding[-1]
+                mm, dd, yyyy = int(anchor.group(1)), int(anchor.group(2)), int(anchor.group(3))
+                try:
+                    consult_dt = datetime(yyyy, mm, dd)
+                    date = consult_dt.strftime("%b %d, %Y")
+                except ValueError:
+                    consult_dt = None
+                    date = ""
 
-                consult_requests.append({
-                    "title": "CONSULT REQUEST",
-                    "date": date,
-                    "content": section.strip()
-                })
+            # Verify there's a matching "Reason for Consult Request" /
+            # "Reason For Request" within ~3000 chars of this Provisional
+            # Diagnosis (same record).
+            window = clinical_document[prov_idx:prov_idx + 3000]
+            if not (
+                "Reason for Consult Request:" in window
+                or "Reason For Request:" in window
+            ):
+                continue
+
+            # Recency gate: a "consult request" older than 18 months is a
+            # HISTORICAL consult, not the reason for today's visit.
+            # Treating ancient consults as current routes the CC/HPI
+            # pipeline through the consult flow with stale provisional-
+            # diagnosis + multi-year-old ER narrative as the supposed
+            # presenting complaint.
+            if consult_dt is not None:
+                if (datetime.now() - consult_dt) > timedelta(days=548):
+                    continue
+
+            # Build the consult body as content from the anchor header (if
+            # any) forward through ~3000 chars or to the next note header.
+            body_start = preceding[-1].start() if preceding else prov_idx
+            next_header = _note_header_re.search(
+                clinical_document, prov_idx + 1
+            )
+            body_end = next_header.start() if next_header else (prov_idx + 3000)
+            body = clinical_document[body_start:body_end].strip()
+
+            consult_requests.append({
+                "title": "CONSULT REQUEST",
+                "date": date,
+                "content": body,
+            })
 
     # Split by "STANDARD TITLE:" markers (case-insensitive)
     # Use lookahead to keep the marker in each section

@@ -552,7 +552,32 @@ def build_urology_note(
         print("      Extracting prior A&P context for HPI...")
         prior_assessments = []
         prior_plans = []
-        for note in notes_dict["gu_notes"]:
+        # Recency filter: when any GU note from the last 18 months has
+        # an A or P, drop A/P from older notes. Without this, a 2020
+        # consult's A&P (e.g., "scrotal US, urology referral for
+        # testicular pain") is fed to the Stage-2 synthesizer as a
+        # peer of the most-recent followup A&P, biasing today's plan
+        # toward stale concerns.
+        from datetime import datetime as _dt2, timedelta as _td2
+        _cutoff = _dt2.now() - _td2(days=548)
+        def _gnote_dt(n):
+            d = (n.get("_source_date") or n.get("date") or "").strip()
+            if not d:
+                return None
+            for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
+                try:
+                    return _dt2.strptime(d, fmt)
+                except (ValueError, TypeError):
+                    continue
+            return None
+        _notes_for_ap = notes_dict["gu_notes"]
+        if any(_gnote_dt(n) and _gnote_dt(n) >= _cutoff
+               for n in notes_dict["gu_notes"]):
+            _notes_for_ap = [
+                n for n in notes_dict["gu_notes"]
+                if (_gnote_dt(n) is None) or (_gnote_dt(n) >= _cutoff)
+            ]
+        for note in _notes_for_ap:
             note_content = note.get("content", "")
             assessment = extract_assessment(note_content)
             plan = extract_plan(note_content)
@@ -835,7 +860,10 @@ def build_urology_note(
 
     # Capture document_imaging in closure
     _doc_imaging = document_imaging
-    synthesis_tasks['imaging'] = lambda: synthesize_imaging(_doc_imaging, gu_notes)
+    _proc_findings = _hpi_pf.procedure_findings if _hpi_pf else []
+    synthesis_tasks['imaging'] = lambda: synthesize_imaging(
+        _doc_imaging, gu_notes, procedure_findings=_proc_findings,
+    )
 
     synthesis_tasks['ros'] = lambda: synthesize_ros(gu_notes, non_gu_notes)
 
@@ -940,6 +968,35 @@ def build_urology_note(
     )
 
     print(f"      Final note: {len(final_note)} characters")
+
+    # Step 5b: Second-pass consistency check
+    # Reads the assembled note + authoritative facts, returns a JSON
+    # list of inconsistencies, applies them deterministically.
+    # Disabled by setting VAUCDA_CONSISTENCY_CHECK=0 in env.
+    import os as _os
+    if _os.environ.get("VAUCDA_CONSISTENCY_CHECK", "1") != "0":
+        try:
+            from .agents.consistency_checker import run_consistency_check
+            print("\n[5b/5] Running consistency check...")
+            _cc_result = run_consistency_check(
+                stage1_note=final_note,
+                authoritative_facts=_hpi_authoritative_facts,
+                task_config=task_config,
+            )
+            if _cc_result.findings:
+                print(
+                    f"      Findings: {len(_cc_result.findings)} "
+                    f"({_cc_result.applied_actions} applied, "
+                    f"{_cc_result.flag_only_count} flag-only)"
+                )
+                for _f in _cc_result.findings:
+                    print(f"        - [{_f.issue}] {_f.action}: {_f.evidence[:100]}")
+                final_note = _cc_result.applied_note
+            else:
+                print("      No inconsistencies found")
+        except Exception as _e:
+            logger.warning(f"Consistency check skipped: {_e}")
+
     print("\n" + "="*80)
     print("NOTE BUILDING COMPLETE")
     print("="*80)

@@ -40,6 +40,7 @@ UROLOGIC_KEYWORDS = re.compile(
     r'fertilit|infertilit|semen|sperm|'
     r'penil|peyron|priapism|'
     r'ureter|ureteral|stent|pyelo|turp|turbt|prostatect|'
+    r'adrenal|myelolipoma|pheochromocytoma|'
     r'urolog|\bgu\b|genitourinary|micturition|enuresis|urodynamic|uroflow|'
     r'foley|catheter|'
     r'circumcis|phimosis|paraphimosis|epididym|'
@@ -122,6 +123,12 @@ _DERIVED_CC_RULES = [
      "Follow-up for urethral stricture"),
     (re.compile(r'\b(?:male\s+infertility|infertility|low\s+sperm|azoospermia|oligospermia)\b', re.I),
      "Follow-up for male infertility"),
+    (re.compile(r'\badrenal\s+(?:mass|myelolipoma|adenoma|tumor|incidentaloma|nodule)\b', re.I),
+     "Follow-up for adrenal mass"),
+    (re.compile(r'\b(?:UTI|urinary\s+tract\s+infection|recurrent\s+UTI|pyelonephritis)\b', re.I),
+     "Follow-up for urinary tract infection"),
+    (re.compile(r'\bcystocele\b|\b(?:pelvic\s+organ\s+)?prolapse\b', re.I),
+     "Follow-up for pelvic organ prolapse"),
 ]
 
 
@@ -162,18 +169,26 @@ _TREATMENT_PATTERNS = [
         r'\bs/?p\s+(?:radical\s+)?prostatectomy\b'
         r'|\b(?:status\s+post|post)[-\s]+(?:radical\s+)?prostatectomy\b'
         r'|\bunderwent\s+(?:robotic\s+|robotic[-\s]assisted\s+|open\s+|laparoscopic\s+)?(?:radical\s+)?prostatectomy\b'
-        r'|\b(?:robotic|RARP|RALP|RRP)\s+(?:radical\s+)?prostatectomy\b'
         r'|\bprostatectomy\s+(?:on|completed|performed)\b'
-        r'|\bhad\s+(?:a\s+)?(?:radical\s+)?prostatectomy\b',
+        r'|\bhad\s+(?:a\s+)?(?:radical\s+)?prostatectomy\b'
+        # PSH-style "S/P RALP" / "S/P RARP" / "S/P RRP" — completion
+        # context implicit in the "s/p" prefix.
+        r'|\bs/?p\s+(?:RALP|RARP|RRP)\b'
+        r'|\b(?:status\s+post|post)[-\s]+(?:RALP|RARP|RRP)\b',
         re.IGNORECASE,
     )),
     ('radiation', re.compile(
+        # Require an EXPLICIT completion / past-tense verb immediately
+        # adjacent to the radiation term. The earlier
+        # "\bdefinitive\s+(?:radiation|...)" clause matched any
+        # discussion of "definitive radiation therapy" — including
+        # "discussed definitive radiation therapy" — flipping
+        # treatment-naive patients to TREATED.
         r'\bcompleted\s+(?:external\s+beam\s+)?(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
         r'|\b(?:external\s+beam\s+)?(?:radiation|radiotherapy|EBRT|XRT|IMRT)\s+(?:therapy\s+)?(?:completed|finished|ended)\b'
         r'|\bs/?p\s+(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
         r'|\b(?:status\s+post|post)[-\s]+(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
-        r'|\b(?:underwent|received)\s+(?:definitive\s+)?(?:external\s+beam\s+)?(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b'
-        r'|\bdefinitive\s+(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b',
+        r'|\b(?:underwent|received)\s+(?:definitive\s+)?(?:external\s+beam\s+)?(?:radiation|radiotherapy|EBRT|XRT|IMRT)\b',
         re.IGNORECASE,
     )),
     ('brachytherapy', re.compile(
@@ -185,11 +200,39 @@ _TREATMENT_PATTERNS = [
         re.IGNORECASE,
     )),
     ('focal therapy', re.compile(
-        r'\b(?:HIFU|high[-\s]?intensity\s+focused\s+ultrasound)\b'
-        r'|\bcryotherapy\b|\bcryoablation\b|\bfocal\s+therapy\b',
+        # Require completion verb for focal therapy too. Bare "focal
+        # therapy" or "cryotherapy" mentions in option-discussion prose
+        # ("we discussed focal therapy") would otherwise trigger.
+        r'\bunderwent\s+(?:HIFU|high[-\s]?intensity\s+focused\s+ultrasound|'
+        r'cryotherapy|cryoablation|focal\s+therapy)\b'
+        r'|\bcompleted\s+(?:HIFU|high[-\s]?intensity\s+focused\s+ultrasound|'
+        r'cryotherapy|cryoablation|focal\s+therapy)\b'
+        r'|\bs/?p\s+(?:HIFU|cryotherapy|cryoablation|focal\s+therapy)\b'
+        r'|\b(?:status\s+post|post)[-\s]+(?:HIFU|cryotherapy|cryoablation|focal\s+therapy)\b',
         re.IGNORECASE,
     )),
 ]
+
+
+# Discussion / intent / consideration markers that, when they precede a
+# treatment match, mean the patient is being COUNSELED about that option,
+# not that the treatment has been performed. The detector must skip
+# matches whose preceding ~80 characters contain any of these — without
+# this filter, a single sentence like "we discussed definitive radiation
+# therapy as an option" promotes the patient to s/p-radiation status.
+_DISCUSSION_NEGATION_RE = re.compile(
+    r'\b(?:discuss(?:ed|ing|ion)?|consider(?:ed|ing|ation)?|'
+    r'offer(?:ed|ing)?|interest(?:ed)?\s+in|may\s+benefit|'
+    r'option(?:s)?\s+(?:of|for|include|are|to)|'
+    r'candidate\s+(?:for|of)|recommend(?:ed|ing|ation)?|'
+    r'plan(?:ned|ning)?\s+(?:for|to)|consult(?:ed|ation)?\s+(?:for|to)|'
+    r'referred\s+(?:for|to)|scheduled\s+(?:for|to)|'
+    r'await(?:ing|s)?|elect(?:ed)?(?:\s+against)?|declined|'
+    r'refused|deferred|under\s+consideration|'
+    r'including|consist(?:ing|s)\s+of|such\s+as|'
+    r'pursuing|pursue)\b',
+    re.IGNORECASE,
+)
 
 
 def _detect_treatment_history(
@@ -199,14 +242,45 @@ def _detect_treatment_history(
     """Detect whether definitive treatment for prostate cancer was completed.
 
     Returns {"type": <type>} when a completion marker is found, else None.
-    Search order is PSH first (most reliable), then the raw document.
+
+    PSH is the most reliable haystack — completed procedures get logged
+    there. The raw clinical document is a fallback that requires
+    additional negation filtering, because prose like "we discussed
+    definitive radiation therapy as an option" otherwise registers as
+    "s/p radiation". For each match in the raw document, we look back
+    ~80 chars for discussion / intent / option-listing markers and skip
+    matches that have them.
     """
-    for haystack in (psh, clinical_document):
-        if not haystack:
-            continue
+    # PSH first — completion verbs in PSH are reliable.
+    if psh:
         for t_type, pat in _TREATMENT_PATTERNS:
-            if pat.search(haystack):
+            if pat.search(psh):
                 return {"type": t_type}
+    if not clinical_document:
+        return None
+    for t_type, pat in _TREATMENT_PATTERNS:
+        for m in pat.finditer(clinical_document):
+            # Look back ~80 chars for option-discussion language.
+            window_start = max(0, m.start() - 80)
+            preceding = clinical_document[window_start:m.start()]
+            if _DISCUSSION_NEGATION_RE.search(preceding):
+                continue
+            # Also reject when the match itself sits inside a "options
+            # discussed including [X, Y, Z]" list. Look forward ~30
+            # chars for comma-separated options. Skip if a comma-or-and
+            # delimiter is within 30 chars of the match end and another
+            # treatment-keyword (RALP/AS/XRT/EBRT/IMRT/surgery/etc.)
+            # appears nearby — that pattern is an enumeration of
+            # options, not a completion statement.
+            tail = clinical_document[m.end():m.end() + 50]
+            if (re.search(r'^\s*[,]\s*and\s+\w+', tail, re.IGNORECASE)
+                or re.search(r'^\s*,\s+(?:and\s+)?(?:AS|RALP|RP|RARP|'
+                             r'EBRT|XRT|IMRT|surgery|prostatectomy|'
+                             r'observation|active\s+surveillance|'
+                             r'brachytherapy)\b',
+                             tail, re.IGNORECASE)):
+                continue
+            return {"type": t_type}
     return None
 
 
@@ -703,14 +777,47 @@ def synthesize_cc(
     psa_state = _assess_psa_trend(document_psa)
 
     # 1. Collect CC candidates from GU notes only.
-    all_ccs = [note["CC"] for note in gu_notes if note.get("CC")]
+    # Recency filter: when a urologic CC from the last 18 months exists,
+    # drop CCs from older notes. Otherwise an ancient consult ("Left
+    # testicular pain" from a 2020 UROLOGY CONSULT) competes with the
+    # most-recent annual followup CC and the LLM-combine step merges
+    # the stale complaint into today's CC.
+    from datetime import datetime, timedelta
+    _now = datetime.now()
+    _recent_cutoff = _now - timedelta(days=548)
+    def _note_dt(n):
+        d = (n.get("_source_date") or "").strip()
+        if not d:
+            return None
+        for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(d, fmt)
+            except (ValueError, TypeError):
+                continue
+        return None
+    _recent_notes_with_cc = [
+        n for n in gu_notes
+        if n.get("CC") and _note_dt(n) and _note_dt(n) >= _recent_cutoff
+    ]
+    if _recent_notes_with_cc:
+        all_ccs = [n["CC"] for n in _recent_notes_with_cc]
+    else:
+        all_ccs = [note["CC"] for note in gu_notes if note.get("CC")]
 
     # 2. Filter to urologic-containing CCs. Drop empties / pure
     # non-urologic complaints ("annual physical", "back pain").
     urologic_ccs = [cc for cc in all_ccs if _is_urologic_text(cc)]
 
     cc: str
-    if len(urologic_ccs) == 1:
+    # Shortcut: if all urologic candidates are identical (case-insensitive,
+    # whitespace-normalized), skip the LLM call and return that CC. This
+    # prevents the LLM-combine path from drifting to a generic "Urology
+    # follow-up" when 2-3 prior notes all carry the same CC ("Adrenal
+    # myelolipoma" → "Urology follow-up" was the failure mode).
+    _normalized_ccs = {re.sub(r'\s+', ' ', cc.strip().lower()) for cc in urologic_ccs}
+    if len(urologic_ccs) >= 1 and len(_normalized_ccs) == 1:
+        cc = _apply_terminology(urologic_ccs[0])
+    elif len(urologic_ccs) == 1:
         # 3. Single urologic CC: clean.
         cc = _apply_terminology(urologic_ccs[0])
     elif len(urologic_ccs) > 1:
@@ -738,13 +845,36 @@ CRITICAL: Provide ONLY the concise chief complaint. NO meta-commentary, NO expla
             instructions=instructions,
         )
         cleaned = _apply_terminology(clean_llm_commentary(synthesized))
-        if cleaned and _is_urologic_text(cleaned):
+        # Reject LLM CCs that are meta-commentary, refusal messages, or
+        # generic non-CCs that should never appear as a chief complaint.
+        nonsense_ccs = (
+            re.compile(r'no\s+urolog', re.IGNORECASE),
+            re.compile(r'no\s+(?:specific|relevant)\s+', re.IGNORECASE),
+            re.compile(r'^there\s+(?:is|are)\s+', re.IGNORECASE),
+            re.compile(r'\bnot\s+(?:provided|specified|documented|available)\b',
+                       re.IGNORECASE),
+            re.compile(r'^based\s+on\b', re.IGNORECASE),
+            re.compile(r'^the\s+patient\s+(?:does\s+not|has\s+no)\b',
+                       re.IGNORECASE),
+            re.compile(r'^I\s+(?:will|cannot|can\'t|am\s+unable)\b',
+                       re.IGNORECASE),
+        )
+        is_nonsense = any(p.search(cleaned) for p in nonsense_ccs) if cleaned else True
+        if cleaned and _is_urologic_text(cleaned) and not is_nonsense:
             cc = cleaned
         else:
-            # LLM output drifted off-topic — derive from context.
-            cc = _derive_cc_from_context(
+            # LLM output drifted off-topic or was a refusal — derive from
+            # context (PMH / pathology / PSA). If context-derive also
+            # returns the generic "Urology follow-up" sentinel, prefer
+            # the first urologic CC we collected (it's better than
+            # nothing).
+            derived = _derive_cc_from_context(
                 document_pmh, document_pathology, document_psa,
             )
+            if derived == "Urology follow-up" and urologic_ccs:
+                cc = _apply_terminology(urologic_ccs[0])
+            else:
+                cc = derived
     else:
         # 5. Zero urologic CCs — derive from context.
         cc = _derive_cc_from_context(
