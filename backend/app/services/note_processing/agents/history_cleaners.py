@@ -147,6 +147,60 @@ _SENTENCE_DROP_PATTERNS = (
 )
 
 
+# Rubric labels the LLM occasionally echoes back from its instructions
+# as self-evaluation prose at the end of the HPI. These are highly
+# distinctive — no real clinical narrative uses any of them. When one
+# appears, everything from that label onwards is meta-commentary.
+#
+# Seen in production (Woods, 2026-06-23): "...Current vs prior treatment:
+# The patient's current treatment status is accurately reflected...
+# Post-treatment narrative arc: ... Non-redundancy: ... Medication
+# mentions: ..."
+_RUBRIC_LEAK_LABEL_RE = re.compile(
+    r"\s*\b(?:"
+    r"Current\s+vs\.?\s+prior\s+treatment|"
+    r"Post-treatment\s+narrative\s+arc|"
+    r"Narrative\s+arc|"
+    r"Non-redundancy|"
+    r"Non\s+redundancy|"
+    r"Medication\s+mentions|"
+    r"Clinical\s+accuracy|"
+    r"Treatment\s+status\s+accuracy|"
+    r"Temporal\s+anchors?|"
+    r"Specific\s+dates?\s+only|"
+    r"Cleanup\s+notes?"
+    r")\s*:",
+    re.IGNORECASE,
+)
+
+# Trailing "I hope this..." / "Hope this..." closing remarks the LLM
+# emits as a polite sign-off after the rubric leak. Truncation often
+# leaves bare "I hope" with no terminal punctuation.
+_TRAILING_SIGNOFF_RE = re.compile(
+    r"(?:^|\s)(?:I\s+hope|Hope\s+(?:this|that)|Hopefully|Please\s+let\s+me\s+know)"
+    r"[^.!?]*(?:[.!?]|$)",
+    re.IGNORECASE,
+)
+
+
+def _strip_rubric_leak(text: str) -> str:
+    """Truncate at first rubric-label echo (e.g. "Non-redundancy:").
+
+    These labels never appear in real clinical narrative — they're the
+    LLM regurgitating sections from its instruction rubric as a
+    self-evaluation block. Everything from the first label onwards is
+    meta-commentary and must be removed.
+    """
+    if not text:
+        return text
+    m = _RUBRIC_LEAK_LABEL_RE.search(text)
+    if m:
+        text = text[:m.start()].rstrip()
+    # Strip any trailing polite sign-off ("I hope this helps.")
+    text = _TRAILING_SIGNOFF_RE.sub('', text).rstrip()
+    return text
+
+
 # Trailing-fragment cleanup applied AFTER sentence drops. Removes
 # orphan tokens like "Here is," "Mr." (no name), "The patient,"
 # that survive the broader cleanup.
@@ -270,6 +324,11 @@ def clean_llm_commentary(text: str) -> str:
     """
     if not text:
         return text
+
+    # Pass 0: rubric-leak truncation. Runs FIRST so the rest of the
+    # cleaner doesn't waste cycles on the meta-block, and so subsequent
+    # sentence-split logic isn't confused by the label colons.
+    text = _strip_rubric_leak(text)
 
     # Pass 1: line-level drops
     out_lines = []
