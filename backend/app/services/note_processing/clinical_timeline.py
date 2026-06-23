@@ -339,24 +339,48 @@ class ProcedureFinding:
 
 def _preceding_note_date(raw_text: str, anchor: int, window: int = 20000) -> Optional[Tuple[str, str]]:
     """Walk the preceding `window` chars looking for the most recent
-    note-header date stamp at the start of a line. VistA notes carry a
-    "MM/DD/YYYY HH:MM  Local Title: ..." line at the top of each note;
-    when a procedure word (e.g. 'Cystoscopy') sits a few hundred chars
-    below that header, the procedure should be dated to the note's
-    header — not to whatever ±80-char date happens to be near the
-    procedure word.
+    note-header date stamp at the start of a line.
+
+    Recognized header shapes (preference: most-specific to least):
+      1. "MM/DD/YYYY HH:MM  Local Title: ..." (VistA note opener)
+      2. "DATE OF NOTE: MMM DD, YYYY@HH:MM" (CPRS note attribute)
+      3. "MM/DD/YYYY<spaces><Service>  Surgeon:" (operative-report
+         header — Ortega's cysto, Long's cysto)
+      4. "Signed: MM/DD/YYYY HH:MM" (closing stamp)
+      5. Bare "MM/DD/YYYY HH:MM" at line start
     """
     preceding = raw_text[max(0, anchor - window):anchor]
-    # Last (closest to anchor) "MM/DD/YYYY HH:MM Local Title:" header line
     best = None
+    # 1. "MM/DD/YYYY HH:MM Local Title:" (most-specific)
     for m in re.finditer(
         r"(?m)^(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}\s+(?:Local\s+Title|Standard\s+Title|"
         r"LOCAL\s+TITLE)\s*:",
         preceding,
     ):
         best = m
+    # 2. "DATE OF NOTE: MMM DD, YYYY"
     if best is None:
-        # Also accept a bare leading "MM/DD/YYYY HH:MM" at line start.
+        for m in re.finditer(
+            r"(?m)^\s*DATE\s+OF\s+NOTE:\s+([A-Z]{3,9}\s+\d{1,2},?\s+\d{4})",
+            preceding, re.IGNORECASE,
+        ):
+            best = m
+    # 3. "MM/DD/YYYY<spaces><Service>  Surgeon:" — operative report
+    if best is None:
+        for m in re.finditer(
+            r"(?m)^(\d{1,2}/\d{1,2}/\d{4})\s+[A-Za-z][A-Za-z\s&]+\s+Surgeon:",
+            preceding,
+        ):
+            best = m
+    # 4. "Signed: MM/DD/YYYY HH:MM"
+    if best is None:
+        for m in re.finditer(
+            r"(?m)^\s*Signed:\s*(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}",
+            preceding, re.IGNORECASE,
+        ):
+            best = m
+    # 5. Bare "MM/DD/YYYY HH:MM" at line start
+    if best is None:
         for m in re.finditer(
             r"(?m)^(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}\b",
             preceding,
@@ -485,6 +509,34 @@ def _summarize_procedure_finding(
     """Build a short finding string for a specific procedure category."""
     tail_clean = re.sub(r"\s+", " ", tail).strip()
 
+    # Truncate cysto tail at next paragraph break / known-other-procedure
+    # marker BEFORE any matching. Otherwise the prose / keyword fallback
+    # can leak content from co-occurring procedures in the same
+    # operative report (Long failure: cysto block consumed bilateral
+    # retrograde pyelogram findings from the next paragraph).
+    if proc in ("cystoscopy", "cystourethroscopy"):
+        cutoff_re = re.compile(
+            # Inline "with [bilateral] retrograde pyelogram" — when the
+            # cysto word appears in a procedure-list line that also
+            # mentions co-occurring procedures on the same line.
+            r"\bwith\s+(?:bilateral\s+|right\s+|left\s+)?retrograde|"
+            r"\bwith\s+(?:laser\s+)?lithotripsy|"
+            r"\bwith\s+stent\s+placement|"
+            # Paragraph break / new labeled section
+            r"\n\s*\n|"
+            r"\n\s*(?:Bilateral\s+retrograde|retrograde\s+pyelogram|"
+            r"Indications?\s+for\s+Operation|Complications|"
+            r"Description\s+of\s+(?:Operation|Procedure)|"
+            r"Specimen|EBL\b|Anesthesia|Disposition|Stents?\s+placed|"
+            r"Stents?\s+placement|Estimated\s+Blood\s+Loss|"
+            r"POSTOP\s+|Plan:|Signed\s+by)",
+            re.IGNORECASE,
+        )
+        cutoff_m = cutoff_re.search(tail)
+        if cutoff_m:
+            tail = tail[:cutoff_m.start()]
+            tail_clean = re.sub(r"\s+", " ", tail).strip()
+
     if proc in ("cystoscopy", "cystourethroscopy"):
         # Structured VistA Urology Procedure Note format. Cysto reports
         # have labeled fields like:
@@ -530,15 +582,38 @@ def _summarize_procedure_finding(
         if structured_bits:
             return _clean_finding_text("; ".join(structured_bits[:8]))
 
-        # Common cystoscopy finding markers — prose-style fallback
+        # Common cystoscopy finding markers — prose-style fallback.
+        # IMPORTANT: must stop at the next paragraph / section boundary
+        # (blank line OR a new labeled section like "Bilateral
+        # retrograde pyelograms:" / "Indications:" / "Complications:")
+        # so the cysto summary doesn't leak content from co-occurring
+        # procedures in the same operative report (Long failure mode).
+        # Run match on the ORIGINAL tail (with newlines preserved) so
+        # the blank-line / new-label terminators can fire.
         m = re.search(
-            r"(?:(?:revealed|showed|demonstrated|notable\s+for|notable\s+findings?(?:\s+include)?[:\s]|"
-            r"impression[:\s]|findings?[:\s])[^.]{4,250})",
-            tail_clean, re.IGNORECASE,
+            r"(?:revealed|showed|demonstrated|notable\s+for|"
+            r"notable\s+findings?(?:\s+include)?[:\s]|"
+            r"impression[:\s]|findings?[:\s])"
+            # Capture up to 250 non-period chars, but stop at:
+            #   - blank line (\n\n)
+            #   - a new labeled section (line starting with
+            #     "Capitalized Word(s):")
+            #   - explicit known-other-procedure markers
+            r"(?:(?!\n\s*\n|\n\s*[A-Z][A-Za-z\s]+:|"
+            r"Bilateral\s+retrograde|retrograde\s+pyelogram|"
+            r"Indications|Complications|Description\s+of\s+Operation|"
+            r"Specimen|EBL\b|Anesthesia|Disposition|"
+            r"stent\s+placed|stent\s+placement)"
+            r"[^.])"
+            r"{4,250}",
+            tail, re.IGNORECASE,
         )
         if m:
             return _clean_finding_text(m.group(0))
-        # Quick keyword grab if no explicit "showed" verb
+        # Quick keyword grab if no explicit "showed" verb. tail_clean
+        # here is already truncated to the cysto block (we trim above),
+        # so the keyword match cannot leak into pyelogram / stent /
+        # description-of-operation content.
         for kw in ("tumor", "papillary", "lesion", "stricture", "bladder neck contracture",
                    "BNC", "normal urethra", "normal bladder", "trabeculation",
                    "stone", "mass", "mucosa", "diverticulum", "no recurrence",
@@ -550,6 +625,12 @@ def _summarize_procedure_finding(
                 )
                 if m2:
                     return _clean_finding_text(m2.group(0))
+        # Final fallback: return the truncated cysto body verbatim
+        # (capped at 250 chars). Better to surface "no suspicious lower
+        # GU tract findings" than to return empty and lose the cysto
+        # entirely.
+        if tail_clean and len(tail_clean) < 250:
+            return _clean_finding_text(tail_clean)
 
     elif proc == "urodynamics":
         bits: List[str] = []

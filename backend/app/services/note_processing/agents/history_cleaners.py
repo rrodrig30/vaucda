@@ -109,6 +109,20 @@ _SENTENCE_DROP_PATTERNS = (
     re.compile(r"\bNote\s*:\s*I(?:\s+have|'ve)?\s+(?:followed|adhered|"
                r"complied|maintained|incorporated|synthesized|"
                r"rewritten|generated|created)[^.]*\.", re.IGNORECASE),
+    # Bare "I have followed the guidelines/rules/requirements/
+    # instructions provided..." — same meta-commentary leak as the
+    # Note: variant but without the Note: prefix (Holder failure mode).
+    # Match REGARDLESS of trailing period (catches mid-sentence
+    # truncations: "I have followed the guidelines provided to generate"
+    # with no terminal punctuation).
+    re.compile(r"(?:^|[.!?]\s+)I(?:\s+have|'ve)\s+(?:followed|adhered\s+to|"
+               r"complied\s+with|maintained|incorporated|synthesized|"
+               r"rewritten|generated|created)\s+"
+               r"(?:all\s+(?:of\s+)?)?(?:the\s+)?"
+               r"(?:rules|guidelines|requirements|instructions|"
+               r"directives|protocol|specifications)"
+               r"[^.!?]*(?:[.!?]|$)",
+               re.IGNORECASE),
     re.compile(r'\bNote\s*:\s*(?:The|This)\s+(?:rewritten|synthesized|'
                r'combined|generated)\s+(?:HPI|narrative|note|entry)[^.]*\.',
                re.IGNORECASE),

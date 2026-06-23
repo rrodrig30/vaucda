@@ -356,17 +356,39 @@ def extract_human_readable_labs(clinical_document: str) -> list:
     """
     lab_results = []
 
-    # Look for the LABS section marker
-    labs_section_match = re.search(
-        r'={30,}\s*LABS\s*={30,}(.*?)(?:={30,}|$)',
+    # Look for the LABS section marker. Open boundary is permissive
+    # (>=4 equals signs OR a bare 'LABS:' line at start of a line, which
+    # appears in clinical-note bodies). Close boundary uses the FIRST of:
+    #   - a section divider with EQUAL OR FEWER equals signs than the
+    #     opening (closes the section)
+    #   - any explicit section terminator (MICROBIOLOGY:, IMAGING:,
+    #     *** END, TUMOR BOARD, STANDARD TITLE:, ASSESSMENT, PLAN, etc.)
+    # The previous '={30,}|$' close boundary captured all the way to
+    # end-of-document when subsequent section dividers used fewer than
+    # 30 equals signs — pulling HPI prose into LABS (the Everett leak).
+    # Collect ALL labs sections in the document (some patients have
+    # multiple — e.g., a VistA CH section AND a clinical-note LABS:
+    # block carrying a CHAM panel).
+    labs_section_matches = list(re.finditer(
+        r'(?:={4,}\s*LABS\s*={4,}|^\s*LABS\s*:\s*$)'
+        r'(.*?)'
+        r'(?=\n\s*={4,}|'
+        r'\*\*\*\s*END\b|'
+        r'\n\s*(?:MICROBIOLOGY|IMAGING|TUMOR\s+BOARD|RADIOLOGY|'
+        r'CONSULTS?|MEDICATIONS|ASSESSMENT|PLAN|STANDARD\s+TITLE|'
+        r'PATHOLOGY|ENDOCRINE)\s*:|'
+        r'\Z)',
         clinical_document,
-        re.DOTALL | re.IGNORECASE
-    )
+        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    ))
 
-    if not labs_section_match:
+    if not labs_section_matches:
         return lab_results
 
-    labs_content = labs_section_match.group(1).strip()
+    # Concatenate all labs sections so downstream patterns see them all
+    labs_content = '\n\n'.join(
+        m.group(1).strip() for m in labs_section_matches if m.group(1).strip()
+    )
 
     # Define endocrine markers to EXCLUDE from general LABS (they go in ENDOCRINE section)
     endocrine_markers = ['A1C', 'HBA1C', 'HEMOGLOBIN A1C', 'TSH', 'VITAMIN D', 'VITAMIN B12',
@@ -431,6 +453,42 @@ def extract_human_readable_labs(clinical_document: str) -> list:
 
         # Clean up line breaks and excessive whitespace
         values = re.sub(r'\s+', ' ', values)
+
+        # NARRATIVE-LEAK GUARD: reject "DATE: <prose>" captures where
+        # the values text reads like HPI prose, not lab data. Two
+        # signals together flag prose:
+        #   (a) Contains prose markers — "year-old", "patient", "biopsy",
+        #       "reported", "denied", "approximately", quotation marks,
+        #       parenthetical quotes, multiple sentences
+        #   (b) Has NO numeric value paired with a clinical unit
+        #       (ng/mL, mg/dL, mmol/L, %, U/L, mIU, g/dL)
+        # Either alone is allowed (e.g., a one-line "PSA 7.46" lacks
+        # "year-old" but has numeric+unit; a comment line might have
+        # text but also a value). Both together → prose leak.
+        has_prose = bool(re.search(
+            r'\b(?:\d+[\s\-]?year[\s\-]?old|patient|biopsy|biopsies|'
+            r'underwent|placed\s+on|seen\s+by|reported|complained|'
+            r'discussed|approximately|recommended|counseled|'
+            r'symptoms?|denies|denied|prior\s+to)\b'
+            r'|"[^"]{5,}"'
+            r'|[a-z]{3,}\.\s+[A-Z][a-z]+',  # sentence boundary
+            values, re.IGNORECASE,
+        ))
+        has_lab_value = bool(re.search(
+            r'\d+\.?\d*\s*(?:ng/mL|mg/dL|mg/dl|mmol/L|U/L|mIU|g/dL|%|'
+            r'mEq/L|nmol/L|10\.e\d|/uL|/mm|cells)',
+            values, re.IGNORECASE,
+        ))
+        if has_prose and not has_lab_value:
+            continue
+        # Reject PSA history dumps — "X.XX - PSA YYYY-MM-DD: X.XX - PSA"
+        # is a serial PSA list belonging in PSA CURVE, not LABS.
+        if values.count('- PSA') >= 2 or values.upper().count(' PSA ') >= 3:
+            continue
+        # Also reject when the captured values text spans >250 chars
+        # (real lab dumps are concise; long captures are usually prose).
+        if len(values) > 400 and not has_lab_value:
+            continue
 
         # Skip if this is just PSA (already extracted by PSA extractor)
         if re.match(r'^PSA\s+[\d.]+', values, re.IGNORECASE):
@@ -515,6 +573,77 @@ def extract_human_readable_labs(clinical_document: str) -> list:
         values = re.sub(r'\s+', ' ', values)
 
         lab_results.append(f"{test_name} ({date}): {values}")
+
+    # Pattern 4: CHAM N: chemistry-panel block. VistA emits the chemistry
+    # panel as a table:
+    #
+    #   CHAM 20:
+    #   Date        Test              Result    Units   Normal Range  Specimen
+    #   11/03/2025  CREATININE          1.0     mg/dL   .7 - 1.3      SERUM
+    #   11/03/2025  GLUCOSE              91     mg/dL   70 - 105      SERUM
+    #   ...
+    #
+    # Each row has DATE TEST RESULT UNITS RANGE SPECIMEN. Parse rows
+    # until a blank line or non-table line. Preserve the most recent
+    # date when multiple draws are interleaved.
+    cham_match = re.search(
+        r'\bCHAM\s*\d+\s*:\s*\n'
+        r'(?:[^\n]*Date[^\n]*Test[^\n]*\n)?'
+        r'(.*?)'
+        r'(?=\n\s*\n|\n\s*[A-Z]{2,}[^a-z\n]{0,40}:|\n*\Z)',
+        labs_content,
+        re.DOTALL,
+    )
+    if cham_match:
+        cham_body = cham_match.group(1)
+        # Group rows by date; prefer most recent
+        seen_test_to_row = {}
+        for row in cham_body.split('\n'):
+            row = row.strip()
+            if not row:
+                continue
+            # "11/03/2025  CREATININE          1.0     mg/dL   .7 - 1.3      SERUM"
+            row_m = re.match(
+                r'^(\d{1,2}/\d{1,2}/\d{2,4})\s+'
+                r'([A-Z][A-Z0-9 ,./\-]+?)\s{2,}'
+                r'([<>]?\d+\.?\d*)\s+'
+                r'([A-Za-z%/0-9.]*)\s*'
+                r'([\d.\s\-]*)\s*'
+                r'(\S+)?\s*$',
+                row,
+            )
+            if not row_m:
+                continue
+            row_date = row_m.group(1)
+            test_name = row_m.group(2).strip()
+            value = row_m.group(3)
+            units = row_m.group(4) or ""
+            ref = (row_m.group(5) or "").strip()
+            # Skip endocrine markers
+            if any(marker in test_name.upper() for marker in endocrine_markers):
+                continue
+            # Skip PSA
+            if 'PSA' in test_name.upper():
+                continue
+            key = test_name.upper()
+            # Prefer most recent date when the same test appears for
+            # multiple draws — parse dates to compare
+            try:
+                from datetime import datetime as _dt
+                _norm = _dt.strptime(
+                    row_date if len(row_date.split('/')[-1]) == 4
+                    else (row_date.rsplit('/', 1)[0] + '/20' + row_date.rsplit('/', 1)[1]),
+                    '%m/%d/%Y',
+                )
+            except (ValueError, IndexError):
+                _norm = None
+            existing = seen_test_to_row.get(key)
+            if existing is None or (_norm and _norm > existing[1]):
+                ref_part = f"  {ref}" if ref else ""
+                line = f"{test_name}  {value}  {units}{ref_part}  ({row_date})"
+                seen_test_to_row[key] = (line, _norm)
+        for line, _ in seen_test_to_row.values():
+            lab_results.append(line)
 
     return lab_results
 

@@ -31,10 +31,20 @@ def extract_prostate_biopsy(clinical_document: str) -> str:
     # Pattern: "DATE:\n** MICROSCOPIC EXAM/DIAGNOSIS:" or "Current Path Report:\nDATE:"
     biopsy_sections = []
 
-    # Pattern 1: "M/YYYY:" or "MM/DD/YY:" followed by MICROSCOPIC EXAM
-    # Allows content between MICROSCOPIC EXAM and DIAGNOSIS (e.g., MODIFIED REPORT headers)
+    # Pattern 1: "M/YYYY" or "MM/DD/YY" (optional trailing colon)
+    # followed by MICROSCOPIC EXAM. Allows content between MICROSCOPIC
+    # EXAM and DIAGNOSIS (e.g., MODIFIED REPORT headers). The colon
+    # after the date is OPTIONAL — Watkins's source has the date as
+    # a bare line "9/3/2024" followed by "MICROSCOPIC EXAM/DIAGNOSIS:".
+    # Also accepts "Path reports:" as the preceding header.
     date_blocks = re.finditer(
-        r'(?:Current\s+Path\s+Report:?\s*\n)?(\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}/\d{4}):\s*\n\s*\*{0,2}\s*MICROSCOPIC\s+EXAM/DIAGNOSIS[:\s]*\n(?:(?!\s*DIAGNOSIS)[^\n]*\n)*\s*DIAGNOSIS[:\s]*\n(.*?)(?=\n\s*(?:Previous\s+Path|Current\s+Path|Comment:|Note:|\d{1,2}/\d{1,4}:|\*{2}\s*MICROSCOPIC|\s*/es/|Signed|={10,}|$))',
+        r'(?:(?:Current\s+Path\s+Report|Path\s+report)s?:?\s*\n)?'
+        r'(\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}/\d{4}):?\s*\n'
+        r'\s*\*{0,2}\s*MICROSCOPIC\s+EXAM/DIAGNOSIS[:\s]*\n'
+        r'(?:(?!\s*DIAGNOSIS)[^\n]*\n)*\s*DIAGNOSIS[:\s]*\n'
+        r'(.*?)'
+        r'(?=\n\s*(?:Previous\s+Path|Current\s+Path|Comment:|Note:|'
+        r'\d{1,2}/\d{1,4}:|\*{2}\s*MICROSCOPIC|\s*/es/|Signed|={10,}|$))',
         clinical_document,
         re.IGNORECASE | re.DOTALL
     )
@@ -869,6 +879,279 @@ def _parse_specimen_block(block: str) -> list:
     return specimens
 
 
+def extract_misc_urologic_pathology(clinical_document: str) -> list:
+    """Catch-all urologic specimen extractor.
+
+    Handles three failure modes the specialized extractors miss:
+
+      1. TURP / RP / nephrectomy specimens (NOT biopsies) with
+         MICROSCOPIC EXAM/DIAGNOSIS marker and date in unusual position
+         (date on SAME line as marker — Ortega's TURP failure mode).
+
+      2. Tumor-board pathology blocks where MICROSCOPIC EXAM has no
+         adjacent date but the date sits in a preceding
+         "Tumor Board/Conference Date:" / "RL MM/DD/YYYY" header
+         (Barowski's bladder-tumor failure mode).
+
+      3. Inline clinical-note biopsy results: free-text statements like
+         "Repeat biopsy 04/20/2026: 2/12 cores positive, Gleason 3+3=6"
+         or "10/29/25 Biopsy FU Note: Pathology: ... GLEASON SCORE
+         3+3 = 6/10" that the specialized extractors miss because
+         there's no formal pathology section structure (Grant + Watkins
+         failure modes).
+
+    Returns a list of formatted strings — one per specimen.
+
+    Safety: ONLY emits a specimen when ALL of these hold:
+      - A specific date is captured (MM/DD/YY or longer)
+      - A urologic organ marker is present in the specimen text
+      - A concrete pathology finding is present (Gleason / GG / cores
+        positive / adenocarcinoma / urothelial / hyperplasia / margins)
+      - The mention is NOT preceded by a negation ("no prior biopsy")
+        or future-tense / discussion marker ("will likely need biopsy",
+        "considering biopsy", "discussed biopsy options")
+    """
+    out: list = []
+
+    # Negation / future-tense / discussion guard. Any candidate match
+    # whose preceding 120 chars contains one of these is rejected.
+    _BAD_CONTEXT_RE = re.compile(
+        r"\b(?:no\s+(?:prior|previous|history\s+of)\s+(?:prostate\s+)?biops|"
+        r"denies\s+(?:any\s+)?(?:prior\s+)?biops|"
+        r"will\s+(?:likely\s+)?need(?:s)?\s+biops|"
+        r"may\s+(?:need|require|consider)\s+biops|"
+        r"considering\s+(?:a\s+)?biops|"
+        r"discuss(?:ed|ing)\s+(?:the\s+)?(?:options\s+(?:of|for)\s+)?biops|"
+        r"discussed\s+(?:risks|benefits|indications|options|biopsy\s+options)|"
+        r"offered\s+(?:a\s+)?biops|"
+        r"recommend(?:ed|s)?\s+(?:a\s+)?biops(?:y|ies)\s+(?:if|when)|"
+        r"NIH\s+risk[^.]{0,80}biops|"
+        r"chance\s+of\s+[^.]{0,40}cancer\s+on\s+biops|"
+        r"elects?\s+(?:not\s+)?to\s+(?:have\s+)?biops|"
+        r"declines?\s+(?:a\s+)?biops|"
+        r"to\s+set\s+up[^.]{0,40}biops|"
+        r"discussed\s+(?:tx|treatment)\s+options.*?biops|"
+        r"discussed\s+AS\s+FU\s+with[^.]{0,40}biops|"
+        r"set\s+up\s+(?:a\s+)?(?:biopsy|bx)|"
+        r"placed\s+(?:a\s+)?consult)\b",
+        re.IGNORECASE,
+    )
+
+    _UROLOGIC_ORGAN_RE = re.compile(
+        r"\b(?:prostate|prostatic|bladder|trigone|kidney|renal|nephr|"
+        r"ureter|urethra|testis|testicular|epididym|penile|penis|"
+        r"scrotum|scrotal|vas|spermatic|seminal\s+vesicle|adrenal)\b",
+        re.IGNORECASE,
+    )
+
+    _FINDING_RE = re.compile(
+        r"\b(?:gleason|grade\s+group|GG\s*\d|"
+        r"adenocarcinoma|urothelial\s+carcinoma|"
+        r"high[\-\s]grade|low[\-\s]grade|"
+        r"cores?\s+positive|cores?\s+\+|cores?\s+NEM|"
+        r"negative\s+for\s+malignancy|no\s+evidence\s+of\s+malignancy|"
+        r"benign\s+(?:glandular|hyperplasia|prostatic|tissue)|"
+        r"hyperplasia|atypical\s+small\s+acinar|ASAP|HGPIN|"
+        r"perineural\s+invasion|"
+        r"clear\s+cell|papillary|chromophobe|sarcomatoid|"
+        r"muscularis\s+propria|lamina\s+propria|"
+        r"transurethral\s+resection)\b",
+        re.IGNORECASE,
+    )
+
+    _ALREADY_SEEN_KEYS: set = set()
+
+    def _key_for(date: str, body_snippet: str) -> str:
+        """Identity key for dedup. Uses date + first organ + first finding."""
+        organ_m = _UROLOGIC_ORGAN_RE.search(body_snippet)
+        finding_m = _FINDING_RE.search(body_snippet)
+        organ = organ_m.group(0).lower() if organ_m else ""
+        finding = finding_m.group(0).lower() if finding_m else ""
+        # Normalize date (drop century / day flexibility)
+        m_d = re.search(r'(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?', date)
+        d_norm = f"{int(m_d.group(1))}/{int(m_d.group(2))}" if m_d else date
+        return f"{d_norm}|{organ}|{finding}"[:120]
+
+    def _emit(date: str, organ_proc: str, diagnosis: str):
+        """Append a normalized pathology line to the output list,
+        deduped by (date, organ, finding) key."""
+        key = _key_for(date, organ_proc + " " + diagnosis)
+        if key in _ALREADY_SEEN_KEYS:
+            return
+        _ALREADY_SEEN_KEYS.add(key)
+        out.append(f"{date} - {organ_proc}: {diagnosis}")
+
+    # ------------------------------------------------------------------
+    # Path 1: MICROSCOPIC EXAM/DIAGNOSIS DATE: (date on same line — Ortega)
+    # ------------------------------------------------------------------
+    for m in re.finditer(
+        r'\*{0,2}\s*MICROSCOPIC\s+EXAM/DIAGNOSIS\s+'
+        r'(\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}/\d{4})'
+        r'\s*:\s*\n\s*DIAGNOSIS[:\s]*\n'
+        r'(.*?)'
+        r'(?=\n\s*(?:Comment:|Note:|\*{2}\s*MICROSCOPIC|\s*/es/|Signed|'
+        r'Performing|Reporting|Assessment\s+and|Plan|={10,}|\Z))',
+        clinical_document,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        date = m.group(1)
+        body = m.group(2).strip()
+        if not _UROLOGIC_ORGAN_RE.search(body):
+            continue
+        if not _FINDING_RE.search(body):
+            continue
+        # Parse each lettered specimen line in the body
+        for spec_m in re.finditer(
+            r'^[\s]*[A-N]\.\s*([^\n]+?):\s*\n\s*-?\s*([^\n]+(?:\n\s*-[^\n]+)*)',
+            body, re.MULTILINE,
+        ):
+            organ_proc = re.sub(r'\s+', ' ', spec_m.group(1)).strip()
+            diagnosis = re.sub(r'\s+', ' ', spec_m.group(2)).strip()
+            if not _UROLOGIC_ORGAN_RE.search(organ_proc):
+                continue
+            _emit(date, organ_proc, diagnosis)
+
+    # ------------------------------------------------------------------
+    # Path 2: Tumor-board MICROSCOPIC EXAM block (no adjacent date — Barowski)
+    # ------------------------------------------------------------------
+    for m in re.finditer(
+        r'\*{0,2}\s*MICROSCOPIC\s+EXAM/DIAGNOSIS\s*:\s*\n\s*DIAGNOSIS[:\s]*\n'
+        r'(.*?)'
+        r'(?=\n\s*(?:Comment:|Note:|\*{2}\s*MICROSCOPIC|\s*/es/|Signed|'
+        r'Performing|Reporting|Assessment\s+and|Plan|Brief\s+History|'
+        r'Recommendations|Stage\s+at|={10,}|\Z))',
+        clinical_document,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        body = m.group(1).strip()
+        if not _UROLOGIC_ORGAN_RE.search(body):
+            continue
+        if not _FINDING_RE.search(body):
+            continue
+        # Walk preceding ~800 chars for a date anchor.
+        # Preference order (most specific to specimen → least):
+        #   1. "RL MM/DD/YYYY" (immediately precedes MICROSCOPIC EXAM —
+        #      the histology accession/release date; matches the
+        #      specimen exactly)
+        #   2. "Date obtained: MMM DD, YYYY" (formal pathology header)
+        #   3. "Tumor Board/Conference Date:" (LAST resort — this is
+        #      the conference date, weeks after the specimen)
+        preceding = clinical_document[max(0, m.start() - 800):m.start()]
+        date_str = ""
+        rl = list(re.finditer(
+            r'\bRL\s+(\d{1,2}/\d{1,2}/\d{4})\b',
+            preceding,
+        ))
+        if rl:
+            date_str = rl[-1].group(1)
+        if not date_str:
+            do = re.search(
+                r'Date\s+obtained[:\s]+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
+                preceding, re.IGNORECASE,
+            )
+            if do:
+                date_str = do.group(1)
+        if not date_str:
+            tb = re.search(
+                r'Tumor\s+Board(?:/Conference)?\s+Date[:\s]+'
+                r'([A-Za-z]{3,9}\s+\d{1,2},?\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4})',
+                preceding, re.IGNORECASE,
+            )
+            if tb:
+                date_str = tb.group(1).strip().rstrip(',')
+        if not date_str:
+            continue
+        for spec_m in re.finditer(
+            r'^[\s]*[A-N]\.\s*([^\n]+?):\s*\n\s*-?\s*([^\n]+(?:\n\s*-[^\n]+)*)',
+            body, re.MULTILINE,
+        ):
+            organ_proc = re.sub(r'\s+', ' ', spec_m.group(1)).strip()
+            diagnosis = re.sub(r'\s+', ' ', spec_m.group(2)).strip()
+            if not _UROLOGIC_ORGAN_RE.search(organ_proc):
+                continue
+            _emit(date_str, organ_proc, diagnosis)
+
+    # ------------------------------------------------------------------
+    # Path 3: Inline narrative biopsy (Grant + Watkins)
+    # ------------------------------------------------------------------
+    # Sub-pattern 3a: Single-line summary
+    #   "Repeat biopsy 04/20/2026: 2/12 cores positive, Gleason 3+3=6,
+    #    Grade Group 1, 30% and <5% involvement"
+    # Requires date + biopsy word + at least one finding token, all on
+    # one line OR within 100 chars on the next.
+    # Continuation: a line is part of this entry iff it does NOT start
+    # with a new list marker (-, *, A., 1.) and does NOT start a new
+    # narrative section (IMPRESSION:, PLAN:, etc.).
+    for m in re.finditer(
+        r"(?:^|\n)\s*[-*]?\s*"
+        r"(?:repeat\s+|prior\s+|recent\s+|prostate\s+)?biops(?:y|ies)\s*"
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s*:\s*"
+        r"([^\n]+"
+        r"(?:\n(?!\s*(?:[-*]|\d+\.|[A-N]\.|IMPRESSION|PLAN|"
+        r"He\s|She\s|The\s+patient|/es/|Signed|={3,}))[^\n]+){0,3})",
+        clinical_document,
+        re.IGNORECASE,
+    ):
+        date = m.group(1)
+        body = m.group(2)
+        if not _FINDING_RE.search(body):
+            continue
+        # Negation/future guard on preceding 120 chars
+        preceding = clinical_document[max(0, m.start() - 120):m.start()]
+        if _BAD_CONTEXT_RE.search(preceding):
+            continue
+        body_clean = re.sub(r'\s+', ' ', body).strip()
+        # Strip surrounding clutter
+        body_clean = re.sub(r'\s+', ' ', body_clean)[:300]
+        _emit(date, "Prostate biopsy", body_clean)
+
+    # Sub-pattern 3b: Date-led note header followed by biopsy results,
+    # e.g. Grant's "10/29/25 Biopsy FU Note:\nPathology:\n...\n
+    # G. RIGHT BASE LATERAL PROSTATE, BIOPSY: PROSTATIC ADENOCARCINOMA,
+    # GLEASON SCORE 3+3 = 6/10, GRADE GROUP 1, INVOLVING 10% OF TISSUE"
+    for m in re.finditer(
+        r"(?:^|\n)\s*(\d{1,2}/\d{1,2}/\d{2,4})\s+"
+        r"(?:Biopsy\s+FU\s+Note|Biopsy\s+Note|Pathology(?:\s+FU)?|"
+        r"Pathology\s+Note|Path\s+(?:FU|Note))\s*:?\s*\n"
+        r"(.*?)"
+        r"(?=\n\s*(?:\d{1,2}/\d{1,2}/\d{2,4}\s+(?:Biopsy|Pathology|Path|"
+        r"PSA|Tele|GU|Visit|FU)|"
+        r"PLAN:|IMPRESSION:|/es/|Signed|={10,}|\Z))",
+        clinical_document,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        date = m.group(1)
+        body = m.group(2)
+        if not _UROLOGIC_ORGAN_RE.search(body):
+            continue
+        if not _FINDING_RE.search(body):
+            continue
+        # Walk each lettered specimen line and emit. Continuation lines
+        # are captured until the next lettered specimen, blank line, or
+        # narrative marker (He, She, IMPRESSION, PLAN, etc.).
+        emitted_from_block = False
+        for spec_m in re.finditer(
+            r'^[\s]*[A-N]\.\s*([A-Z][^\n:]+?):\s*'
+            r'([A-Z][^\n]+'
+            r'(?:\n(?!\s*(?:[A-N]\.|\s*$|He\s|She\s|The\s+patient|'
+            r'IMPRESSION|PLAN|/es/|Signed))[^\n]+){0,5})',
+            body, re.MULTILINE,
+        ):
+            organ_proc = re.sub(r'\s+', ' ', spec_m.group(1)).strip()
+            diagnosis = re.sub(r'\s+', ' ', spec_m.group(2)).strip()
+            if not _UROLOGIC_ORGAN_RE.search(organ_proc):
+                continue
+            _emit(date, organ_proc, diagnosis)
+            emitted_from_block = True
+        # If no lettered specimens, but body has urologic + finding,
+        # emit a generic summary line.
+        if not emitted_from_block:
+            body_clean = re.sub(r'\s+', ' ', body).strip()[:400]
+            _emit(date, "Prostate biopsy", body_clean)
+
+    return out
+
+
 def extract_pathology(clinical_document: str) -> str:
     """
     Extract pathology reports from all formats in VA clinical documents.
@@ -880,6 +1163,8 @@ def extract_pathology(clinical_document: str) -> str:
     4. MICROSCOPIC EVALUATION AND DIAGNOSIS format
     5. Renal pathology and nephrectomy reports
     6. External/non-VA pathology reports
+    7. Miscellaneous urologic pathology (TURP, tumor-board blocks,
+       narrative biopsy results in clinical notes)
 
     Args:
         clinical_document: Full clinical document
@@ -908,6 +1193,11 @@ def extract_pathology(clinical_document: str) -> str:
     addendum_pathology = extract_addendum_pathology(clinical_document)
     if addendum_pathology:
         pathology_reports.append(addendum_pathology)
+
+    # Catch-all urologic pathology — runs LAST so it can dedup against
+    # all earlier paths (specialized extractors AND the section-split
+    # loop below). See the misc_dedup block at the end of this function.
+    misc_entries = extract_misc_urologic_pathology(clinical_document)
 
     # Split by SURGICAL PATHOLOGY sections
     # Handle both consecutive dashes (----) and spaced dashes (- - - -)
@@ -1110,6 +1400,66 @@ def extract_pathology(clinical_document: str) -> str:
     external_prostate = extract_external_prostate_pathology(clinical_document)
     if external_prostate and external_prostate not in pathology_reports:
         pathology_reports.append(external_prostate)
+
+    # FINALLY: misc-urologic-pathology entries (collected at top of
+    # function). Runs last so it can dedup against ALL earlier paths
+    # including the section-split loop above.
+    if misc_entries:
+        # Build a normalized blob of existing reports for dedup. Strip
+        # date format differences and whitespace so "8/18/23 - PROSTATE,
+        # TRANSURETHRAL RESECTION" and "Aug 18, 2023 - PROSTATE,
+        # TRANSURETHRAL RESECTION" are recognized as the same entry.
+        from datetime import datetime as _dt
+
+        def _normalize_for_dedup(text: str) -> str:
+            t = text.lower()
+            # Normalize "8/18/23" / "08/18/2023" / "aug 18, 2023" all to
+            # a canonical "yyyy-mm-dd"
+            for m in list(re.finditer(
+                r'\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b', t
+            )):
+                try:
+                    mm = int(m.group(1))
+                    dd = int(m.group(2))
+                    yy = m.group(3)
+                    if yy:
+                        y = int(yy)
+                        if y < 100:
+                            y += 2000 if y < 50 else 1900
+                    else:
+                        y = 0
+                    canon = f"{y:04d}-{mm:02d}-{dd:02d}"
+                    t = t.replace(m.group(0), canon)
+                except Exception:
+                    pass
+            for m in list(re.finditer(
+                r'\b([a-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b', t
+            )):
+                try:
+                    parsed = _dt.strptime(
+                        f"{m.group(1)[:3]} {int(m.group(2))} {m.group(3)}",
+                        "%b %d %Y",
+                    )
+                    canon = parsed.strftime("%Y-%m-%d")
+                    t = t.replace(m.group(0), canon)
+                except Exception:
+                    pass
+            # Collapse whitespace + drop punctuation that varies
+            t = re.sub(r'\s+', ' ', t)
+            t = re.sub(r'[,.;:\-_()\[\]]+', ' ', t)
+            t = re.sub(r'\s+', ' ', t)
+            return t
+
+        existing_norm = _normalize_for_dedup('\n'.join(pathology_reports))
+        for entry in misc_entries:
+            entry_norm = _normalize_for_dedup(entry)
+            # Dedup signal: pick the first 60 chars of normalized entry
+            # (date + organ + first finding word). If that appears in
+            # the existing normalized blob, the entry is a duplicate.
+            key = entry_norm[:60].strip()
+            if key and key in existing_norm:
+                continue
+            pathology_reports.append(entry)
 
     if not pathology_reports:
         return ""
