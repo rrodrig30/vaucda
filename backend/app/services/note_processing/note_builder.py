@@ -16,10 +16,13 @@ Performance optimizations:
 - Reduces total processing time from sequential sum to max single agent time
 """
 
+import logging
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from app.services.llm_config_manager import LLMTaskConfig
@@ -742,7 +745,7 @@ def build_urology_note(
                 pathology_data=_doc_path,
                 labs_data=_doc_labs,
             )
-        return synthesize_hpi(
+        v1_text = synthesize_hpi(
             gu_notes, non_gu_notes,
             psa_data=_doc_psa,
             pathology_data=_doc_path,
@@ -764,6 +767,45 @@ def build_urology_note(
             patient_facts=_hpi_pf,
             hpi_skeleton=_hpi_skeleton_text,
         )
+
+        # ---- HPI v2 (constrained-JSON) path ----
+        # Gated by VAUCDA_HPI_V2=1 env var. v2 has v1 text as its
+        # fallback, so any v2 failure transparently degrades to v1.
+        import os as _os
+        if _os.environ.get("VAUCDA_HPI_V2", "0") != "1":
+            return v1_text
+
+        try:
+            from .agents.hpi_agent_v2 import build_ground_truth, generate_hpi_v2
+            from .llm_helper import synthesize_with_llm as _synth
+
+            def _llm_call(prompt: str) -> str:
+                return _synth(prompt=prompt, temperature=0.0,
+                              task_config=task_config)
+
+            gt = build_ground_truth(
+                patient_name=_patient_name_val or "",
+                patient_age=int(_patient_age_val) if str(_patient_age_val or "").isdigit() else 0,
+                patient_sex=_patient_sex_val or "",
+                visit_date=_visit_date,
+                psa_data=_doc_psa or "",
+                psh_text=document_psh or "",
+                pmh_text=_doc_pmh or "",
+                pathology_text=_doc_path or "",
+                medications_text=_doc_meds or "",
+                imaging_text=_doc_imaging or "",
+                procedure_findings=(_hpi_pf.procedure_findings if _hpi_pf else []),
+                treatment_naive=(_hpi_pf.treatment_naive if _hpi_pf else True),
+            )
+            result = generate_hpi_v2(gt, _llm_call, max_retries=2,
+                                     v1_fallback_text=v1_text)
+            print(f"      HPI v2: {'fallback' if result.used_fallback else 'accepted'} "
+                  f"after {len(result.attempts)} attempt(s)"
+                  + (f" — {result.fallback_reason}" if result.used_fallback else ""))
+            return result.hpi_text
+        except Exception as _e:
+            logger.warning(f"HPI v2 path failed (using v1): {_e}")
+            return v1_text
 
     synthesis_tasks['cc'] = _build_cc
     synthesis_tasks['hpi'] = _build_hpi
