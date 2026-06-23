@@ -8,6 +8,29 @@ import re
 from typing import Optional
 
 
+# Standard pathology-lab disclaimer trailer (lab-developed test boilerplate
+# referencing FDA / CLIA). Has zero clinical value in a urology note and
+# leaks into Comment fields via long lazy captures.
+_LAB_DISCLAIMER_RE = re.compile(
+    r"\s*\*?\s*This\s+(?:[A-Z][A-Za-z]+\s+)?test\s+was\s+developed\b"
+    r".*?(?:clinical\s+laboratory\s+testing\.?|"
+    r"Clinical\s+Laboratory\s+Improvement\s+Amendments[^.]*\.?)\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_lab_disclaimer(text: str) -> str:
+    """Remove the lab-developed-test / FDA / CLIA boilerplate trailer.
+
+    Pathology Comment fields frequently end with a 4-sentence regulatory
+    disclaimer that the immunohistochemistry assay is lab-developed and
+    not FDA-cleared. It has no clinical value in the rendered note.
+    """
+    if not text:
+        return text
+    return _LAB_DISCLAIMER_RE.sub(" ", text).rstrip()
+
+
 def extract_prostate_biopsy(clinical_document: str) -> str:
     """
     Extract prostate biopsy results with adenocarcinoma/Gleason scores.
@@ -709,6 +732,7 @@ def extract_renal_pathology(clinical_document: str) -> str:
             # Clean up multi-line comments
             comment = re.sub(r'\n\s+', ' ', comment)
             comment = re.sub(r'\s+', ' ', comment)
+            comment = _strip_lab_disclaimer(comment)
 
             # Add as a separate comment line if not already included
             comment_line = f"Comment: {comment}"
@@ -810,6 +834,7 @@ def extract_addendum_pathology(clinical_document: str) -> str:
             comment_text = comment_match.group(1).strip()
             comment_text = re.sub(r'\n\s+', ' ', comment_text)
             comment_text = re.sub(r'\s+', ' ', comment_text)
+            comment_text = _strip_lab_disclaimer(comment_text)
             if re.search(r'positive|negative|stain|immunohistochem', comment_text, re.IGNORECASE):
                 comment = f"\n  Comment: {comment_text}"
 
