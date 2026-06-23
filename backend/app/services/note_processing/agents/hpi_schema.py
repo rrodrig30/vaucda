@@ -50,6 +50,80 @@ PROCEDURE_TYPES = {
     "retrograde-pyelogram", "voiding-cystogram",
 }
 
+# Common LLM variants that should normalize to canonical enum values.
+# Applied case-insensitively before enum membership check, so the LLM
+# can emit human-readable forms without triggering ENUM_VIOLATION.
+_ENUM_SYNONYMS = {
+    # PROCEDURE_TYPES
+    "prostate biopsy": "biopsy",
+    "transrectal biopsy": "biopsy",
+    "tru-cut biopsy": "biopsy",
+    "needle biopsy": "biopsy",
+    "renal biopsy": "biopsy",
+    "kidney biopsy": "biopsy",
+    "bladder biopsy": "biopsy",
+    "mp-mri": "mri",
+    "mpmri": "mri",
+    "prostate mri": "mri",
+    "ct scan": "ct",
+    "ct urogram": "ct",
+    "ct abdomen/pelvis": "ct",
+    "renal ultrasound": "ultrasound",
+    "transrectal ultrasound": "ultrasound",
+    "trus": "ultrasound",
+    "psma pet": "psma-pet",
+    "bone scan": "bone-scan",
+    "dexa scan": "dexa",
+    # TREATMENT_MODALITIES
+    "radical prostatectomy": "prostatectomy",
+    "robotic prostatectomy": "prostatectomy",
+    "open prostatectomy": "prostatectomy",
+    "rrp": "prostatectomy",
+    "rarp": "prostatectomy",
+    "xrt": "radiation",
+    "ebrt": "radiation",
+    "external beam radiation": "radiation",
+    "external beam radiotherapy": "radiation",
+    "radiation therapy": "radiation",
+    "radiotherapy": "radiation",
+    "imrt": "radiation",
+    "sbrt": "radiation",
+    "stereotactic body radiation therapy": "radiation",
+    "androgen deprivation therapy": "ADT",
+    "adt": "ADT",
+    "hormone therapy": "ADT",
+    "hormonal therapy": "ADT",
+    "active surveillance": "active-surveillance",
+    "watchful waiting": "active-surveillance",
+    "focal therapy": "focal-therapy",
+    "hifu": "focal-therapy",
+    "cryoablation": "focal-therapy",
+    "cryotherapy": "focal-therapy",
+    "partial nephrectomy": "nephrectomy",
+    "radical nephrectomy": "nephrectomy",
+    "robotic nephrectomy": "nephrectomy",
+    # VISIT_TYPES
+    "followup": "follow-up",
+    "f/u": "follow-up",
+    "new patient": "new-patient",
+    "preop": "pre-op",
+    "postop": "post-op",
+    # SEX_VALUES
+    "m": "male",
+    "f": "female",
+}
+
+
+def normalize_enum_value(value: Any) -> Any:
+    """Map common LLM variants to canonical enum values.
+
+    Case-insensitive lookup. Returns the original value when no synonym
+    is found, so the enum validator still rejects truly unknown values."""
+    if not isinstance(value, str):
+        return value
+    canonical = _ENUM_SYNONYMS.get(value.strip().lower())
+    return canonical if canonical is not None else value
+
 VERIFIED_IN_SOURCES = {
     "PSH", "PATHOLOGY", "IMAGING", "PSA_CURVE", "MEDICATIONS",
     "ALLERGIES", "PMH", "procedure_findings", "GU_NOTE",
@@ -153,13 +227,18 @@ PSA_TRAJECTORY_SCHEMA = {
     "type": "object",
     "required": False,
     "schema": {
-        "current_value": {"type": "number", "required": True},  # ng/mL
-        "current_date": {"type": "date", "required": True},
+        # All fields optional so the LLM can emit an empty/all-null
+        # trajectory for patients with no PSA (e.g. RCC). The fact
+        # validator still cross-checks any non-null value against the
+        # PSA Curve, and the renderer skips trajectories with no
+        # current_value. So nothing is lost by relaxing required here.
+        "current_value": {"type": "number"},  # ng/mL — from PSA CURVE
+        "current_date": {"type": "date"},
         "prior_value": {"type": "number"},
         "prior_date": {"type": "date"},
         "peak_value": {"type": "number"},
         "peak_date": {"type": "date"},
-        "direction": {"type": "enum", "enum": PSA_DIRECTIONS, "required": True},
+        "direction": {"type": "enum", "enum": PSA_DIRECTIONS},
         "narrative_descriptor": {"type": "string"},  # "stable", "rising", "declining"
     },
 }
@@ -169,7 +248,10 @@ PROCEDURE_FINDING_SCHEMA = {
     "schema": {
         "procedure_type": {"type": "enum", "enum": PROCEDURE_TYPES, "required": True},
         "date": {"type": "date", "required": True},
-        "finding": {"type": "string", "required": True},  # one short clause
+        # finding optional — LLM correctly emits null when the source
+        # records the procedure occurred but has no result text. The
+        # renderer omits the "showed ..." clause when finding is absent.
+        "finding": {"type": "string"},
         "verified_in": {"type": "enum", "enum": VERIFIED_IN_SOURCES, "required": True},
     },
 }
@@ -294,7 +376,8 @@ def _validate_field(value: Any, field_schema: Dict, path: str,
             ))
     elif ftype == "enum":
         allowed = field_schema.get("enum", set())
-        if value not in allowed:
+        canonical = normalize_enum_value(value)
+        if canonical not in allowed:
             errors.append(ValidationError(
                 path, "ENUM_VIOLATION",
                 f"value '{value}' not in allowed enum",
@@ -331,16 +414,47 @@ def _validate_field(value: Any, field_schema: Dict, path: str,
         ))
 
 
+def _normalize_enums_in_place(node: Any, field_schema: Dict) -> None:
+    """Walk a draft node alongside its schema and rewrite enum-shaped string
+    values to their canonical form. Mutates the node in place so downstream
+    consumers (renderer, fact validator) see canonical enum values."""
+    ftype = field_schema.get("type")
+    if ftype == "object" and isinstance(node, dict):
+        sub_schema = field_schema.get("schema", {})
+        for sub_field, sub_field_schema in sub_schema.items():
+            if sub_field not in node:
+                continue
+            sub_value = node[sub_field]
+            sub_type = sub_field_schema.get("type")
+            if sub_type == "enum" and isinstance(sub_value, str):
+                node[sub_field] = normalize_enum_value(sub_value)
+            else:
+                _normalize_enums_in_place(sub_value, sub_field_schema)
+    elif ftype == "array" and isinstance(node, list):
+        item_schema = field_schema.get("items", {})
+        for i, item in enumerate(node):
+            item_type = item_schema.get("type")
+            if item_type == "enum" and isinstance(item, str):
+                node[i] = normalize_enum_value(item)
+            else:
+                _normalize_enums_in_place(item, item_schema)
+
+
 def validate_hpi_draft(draft: Any) -> List[ValidationError]:
     """Validate an HPIDraft against HPI_DRAFT_SCHEMA.
 
     Returns a list of ValidationError objects (empty list = valid).
     Pure schema validation only — does not cross-check against ground
     truth (see hpi_fact_validator.py for that).
+
+    Normalizes LLM enum synonyms (e.g. "prostate biopsy" -> "biopsy")
+    in place before validation, so downstream consumers see canonical
+    enum values.
     """
     if not isinstance(draft, dict):
         return [ValidationError("$", "TYPE_MISMATCH",
                                 f"top-level must be object, got {type(draft).__name__}")]
+    _normalize_enums_in_place(draft, HPI_DRAFT_SCHEMA)
     errors: List[ValidationError] = []
     schema = HPI_DRAFT_SCHEMA.get("schema", {})
     for field, field_schema in schema.items():

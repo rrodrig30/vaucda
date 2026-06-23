@@ -260,6 +260,35 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$",
                        re.IGNORECASE | re.MULTILINE)
 
 
+def _try_recover_truncated(blob: str, opener_stack: List[str],
+                            in_string: bool) -> Optional[str]:
+    """Attempt to recover a JSON object truncated by output length cap.
+
+    The LLM commonly emits valid JSON but is cut off before its trailing
+    closers. Strategy:
+      1. If we ended mid-string, close it.
+      2. Strip a dangling trailing comma (truncation often leaves one).
+      3. Append the missing closers in reverse nesting order using the
+         opener stack so `}]}` vs `]}}` is correct.
+      4. json.loads gates the result — anything that doesn't actually
+         parse returns None.
+
+    Recovery is conservative: it does NOT discard partial trailing
+    tokens. If the LLM was cut off mid-key or mid-value, json.loads
+    will reject the patched blob and we return None.
+    """
+    if not opener_stack:
+        return None
+    s = blob
+    if in_string:
+        s = s + '"'
+    s = s.rstrip()
+    if s.endswith(','):
+        s = s[:-1]
+    closers = ''.join(']' if op == '[' else '}' for op in reversed(opener_stack))
+    return s + closers
+
+
 def parse_hpi_json(raw: str) -> Tuple[Optional[Dict], Optional[str]]:
     """Parse the LLM output into an HPIDraft dict.
 
@@ -281,8 +310,10 @@ def parse_hpi_json(raw: str) -> Tuple[Optional[Dict], Optional[str]]:
     if start < 0:
         return None, "no '{' found in LLM output"
 
-    # Walk forward, counting depth, ignoring braces inside strings.
-    depth = 0
+    # Walk forward, tracking a stack of unmatched openers so we can
+    # recover from LLM output truncation (a common failure mode — the
+    # model emits valid JSON but is cut off before its trailing closers).
+    opener_stack: List[str] = []
     in_string = False
     escape = False
     end = -1
@@ -300,14 +331,30 @@ def parse_hpi_json(raw: str) -> Tuple[Optional[Dict], Optional[str]]:
         if in_string:
             continue
         if c == "{":
-            depth += 1
+            opener_stack.append("{")
+        elif c == "[":
+            opener_stack.append("[")
         elif c == "}":
-            depth -= 1
-            if depth == 0:
+            if opener_stack and opener_stack[-1] == "{":
+                opener_stack.pop()
+            if not opener_stack:
                 end = i
                 break
+        elif c == "]":
+            if opener_stack and opener_stack[-1] == "[":
+                opener_stack.pop()
 
     if end < 0:
+        recovered = _try_recover_truncated(
+            text[start:], opener_stack, in_string,
+        )
+        if recovered is not None:
+            try:
+                draft = json.loads(recovered)
+                if isinstance(draft, dict):
+                    return draft, None
+            except json.JSONDecodeError:
+                pass
         return None, "unmatched '{' in LLM output (no balanced closing brace)"
 
     blob = text[start:end + 1]

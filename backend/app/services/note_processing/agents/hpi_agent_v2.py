@@ -21,8 +21,10 @@ or surface findings to a provider review panel.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .hpi_fact_validator import (
@@ -300,6 +302,7 @@ def generate_hpi_v2(
         if parse_err:
             audit.parse_error = parse_err
             attempts.append(audit)
+            _dump_failure(gt, attempt_n + 1, "parse_error", parse_err, raw)
             # Reset errors for next retry (parse failure → no schema/fact info)
             schema_errors = []
             fact_errors = []
@@ -309,6 +312,8 @@ def generate_hpi_v2(
         audit.schema_errors = list(schema_errors)
         if schema_errors:
             attempts.append(audit)
+            _dump_failure(gt, attempt_n + 1, "schema_errors",
+                          "; ".join(f"{e.path}:{e.code}" for e in schema_errors), raw)
             fact_errors = []  # don't run fact validator on schema-invalid draft
             continue
 
@@ -319,6 +324,8 @@ def generate_hpi_v2(
         if blocking_fact_errors:
             fact_errors = blocking_fact_errors  # only resurface ERRORs in retry
             attempts.append(audit)
+            _dump_failure(gt, attempt_n + 1, "fact_errors",
+                          "; ".join(f"{e.path}:{e.code}" for e in blocking_fact_errors), raw)
             continue
 
         # ---- ACCEPTED ----
@@ -342,6 +349,28 @@ def generate_hpi_v2(
         accepted_draft=None,
         attempts=attempts,
     )
+
+
+def _dump_failure(gt, attempt_n: int, kind: str, detail: str, raw: str) -> None:
+    """Optional debug dump of failing LLM output. Gated by VAUCDA_HPI_V2_DEBUG=1.
+
+    Appends one block per failure to logs/hpi_v2_failures.log so we can inspect
+    what the LLM actually emitted vs. what the validator rejected."""
+    if os.environ.get("VAUCDA_HPI_V2_DEBUG", "0") != "1":
+        return
+    try:
+        dump_path = Path(os.environ.get("VAUCDA_HPI_V2_DEBUG_FILE",
+                                         "logs/hpi_v2_failures.log"))
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with dump_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"PATIENT: {gt.name}  ATTEMPT {attempt_n}  KIND={kind}\n")
+            f.write(f"DETAIL: {detail}\n")
+            f.write(f"{'-'*80}\nRAW LLM OUTPUT (len={len(raw or '')}):\n")
+            f.write(raw or "<empty>")
+            f.write(f"\n{'='*80}\n")
+    except Exception as _e:
+        logger.warning(f"HPI v2 debug dump failed: {_e}")
 
 
 def _summarize_failure(attempts: List[AttemptAudit]) -> str:

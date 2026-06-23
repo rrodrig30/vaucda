@@ -207,10 +207,15 @@ def render_treatment_history(events: Optional[List[Dict]], sex: str) -> str:
 
 def render_psa_trajectory(psa: Optional[Dict]) -> str:
     """'PSA increased from 4.79 ng/mL (December 19, 2025) to 5.55 ng/mL
-    (February 2, 2026).'"""
+    (February 2, 2026).'
+
+    Skips the entire section when current_value is null/absent — RCC and
+    other non-prostate patients legitimately have no PSA trajectory."""
     if not psa:
         return ""
     current_v = psa.get("current_value")
+    if current_v is None:
+        return ""
     current_d = _format_date(psa.get("current_date"))
     direction = psa.get("direction", "stable")
     direction_verb = {
@@ -238,7 +243,10 @@ def render_psa_trajectory(psa: Optional[Dict]) -> str:
 
 
 def render_procedure_findings(findings: Optional[List[Dict]]) -> str:
-    """Bullet-style sentences for procedure findings, sorted newest first."""
+    """Bullet-style sentences for procedure findings, sorted newest first.
+
+    When `finding` is null the renderer emits the procedure date alone
+    rather than fabricating a finding clause."""
     if not findings:
         return ""
     def _date_key(f):
@@ -248,8 +256,12 @@ def render_procedure_findings(findings: Optional[List[Dict]]) -> str:
     for pf in sorted_findings:
         proc_label = _PROCEDURE_DISPLAY.get(pf["procedure_type"], pf["procedure_type"])
         date_str = _format_date(pf["date"])
-        finding = pf["finding"].strip().rstrip(".")
-        sentences.append(f"{proc_label.capitalize()} on {date_str} showed {finding}.")
+        finding_raw = pf.get("finding")
+        if finding_raw and finding_raw.strip():
+            finding = finding_raw.strip().rstrip(".")
+            sentences.append(f"{proc_label.capitalize()} on {date_str} showed {finding}.")
+        else:
+            sentences.append(f"{proc_label.capitalize()} on {date_str}.")
     return " ".join(sentences)
 
 

@@ -778,10 +778,19 @@ def build_urology_note(
         try:
             from .agents.hpi_agent_v2 import build_ground_truth, generate_hpi_v2
             from .llm_helper import synthesize_with_llm as _synth
+            from dataclasses import replace as _dc_replace
+
+            # JSON output is more verbose than v1 prose (schema overhead
+            # plus structural braces). Default max_tokens often truncates
+            # the trailing `}` of a 30+-line JSON object — give v2 headroom.
+            _v2_task_config = (
+                _dc_replace(task_config, max_tokens=max(task_config.max_tokens, 4096))
+                if task_config is not None else None
+            )
 
             def _llm_call(prompt: str) -> str:
                 return _synth(prompt=prompt, temperature=0.0,
-                              task_config=task_config)
+                              task_config=_v2_task_config)
 
             gt = build_ground_truth(
                 patient_name=_patient_name_val or "",
