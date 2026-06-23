@@ -9,6 +9,14 @@ Main entry point for the REST API server
 from llm.gpu_config import get_gpu_config
 _GPU_CONFIG = get_gpu_config()
 
+# Load .env into os.environ so VAUCDA_* feature flags read via
+# os.environ.get() (e.g. VAUCDA_HPI_V2, VAUCDA_CONSISTENCY_CHECK) pick
+# up values from the .env file. Pydantic-Settings reads .env only into
+# its Settings model — it does NOT populate os.environ, so flags read
+# with os.environ.get() would silently miss .env values without this.
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv()
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
