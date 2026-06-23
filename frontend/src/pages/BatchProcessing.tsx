@@ -4,7 +4,7 @@ import { Button } from '@/components/common/Button'
 import { notesApi } from '@/api'
 import {
   FiFolder, FiPlay, FiCheckCircle, FiXCircle, FiClock,
-  FiLoader, FiDownload, FiFileText, FiStopCircle,
+  FiLoader, FiDownload, FiFileText, FiStopCircle, FiSave,
 } from 'react-icons/fi'
 
 interface SelectedFile {
@@ -24,6 +24,10 @@ interface CompletedFile {
   generationTime?: number
   errorMessage?: string
   noteContent?: string
+  // Set true once written to the input folder's output/ subdir via the
+  // File System Access API. Used to mark which files still need writing
+  // when the "Save all" button is clicked.
+  savedToFolder?: boolean
 }
 
 function detectNoteType(filename: string): string {
@@ -44,10 +48,38 @@ function triggerDownload(filename: string, content: string) {
   URL.revokeObjectURL(url)
 }
 
+// File System Access API: returns true on browsers (Chrome/Edge/Opera)
+// where we can request a writable directory handle and stream `.vaucda`
+// files into an `output/` subfolder of the user's chosen input folder.
+const hasFSAccess = typeof window !== 'undefined'
+  && typeof (window as any).showDirectoryPicker === 'function'
+
+// Write one file into <dirHandle>/output/<filename>. Creates the
+// output/ subfolder if it doesn't exist.
+async function writeFileToOutputSubfolder(
+  dirHandle: any,
+  filename: string,
+  content: string,
+): Promise<void> {
+  const outputDir = await dirHandle.getDirectoryHandle('output', { create: true })
+  const fileHandle = await outputDir.getFileHandle(filename, { create: true })
+  const writable = await fileHandle.createWritable()
+  await writable.write(content)
+  await writable.close()
+}
+
 export const BatchProcessing: React.FC = () => {
   const [selectedFiles, setSelectedFiles] = useState<SelectedFile[]>([])
   const [selectionError, setSelectionError] = useState<string | null>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
+
+  // When the user picks a folder via the modern File System Access API
+  // (Chrome/Edge), we hold a writable handle so completed `.vaucda`
+  // files can be written directly into <input folder>/output/.
+  // Falls back to null in browsers without API support (Firefox/Safari).
+  const [dirHandle, setDirHandle] = useState<any>(null)
+  const [folderName, setFolderName] = useState<string | null>(null)
+  const [folderSaveError, setFolderSaveError] = useState<string | null>(null)
 
   const [visitDate, setVisitDate] = useState('')
 
@@ -73,15 +105,79 @@ export const BatchProcessing: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [showConfirm])
 
-  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const fileList = e.target.files
-    if (!fileList || fileList.length === 0) return
+  const sortFiles = (files: SelectedFile[]): SelectedFile[] => {
+    return files.sort((a, b) => {
+      const aMatch = a.name.match(/^(\d+)/)
+      const bMatch = b.name.match(/^(\d+)/)
+      if (aMatch && bMatch) return parseInt(aMatch[1]) - parseInt(bMatch[1])
+      if (aMatch) return -1
+      if (bMatch) return 1
+      return a.name.localeCompare(b.name)
+    })
+  }
 
+  const resetSelectionState = () => {
     setSelectionError(null)
     setBatchSummary(null)
     setProcessError(null)
     setCompletedFiles([])
     setTotalContent(null)
+    setFolderSaveError(null)
+  }
+
+  // Modern path: showDirectoryPicker gives a writable handle so we can
+  // save `.vaucda` files directly into <input>/output/. Falls through
+  // to the legacy <input webkitdirectory> picker when unavailable or
+  // the user cancels.
+  const handlePickFolder = async () => {
+    if (!hasFSAccess) {
+      folderInputRef.current?.click()
+      return
+    }
+    try {
+      const handle = await (window as any).showDirectoryPicker({
+        mode: 'readwrite',
+      })
+      const txtFiles: SelectedFile[] = []
+      for await (const [name, entry] of handle.entries()) {
+        if (entry.kind === 'file' && name.toLowerCase().endsWith('.txt')) {
+          const file = await entry.getFile()
+          txtFiles.push({
+            file, name: file.name, size: file.size,
+            noteType: detectNoteType(file.name),
+            outputName: file.name.replace(/\.[^/.]+$/, '') + '.vaucda',
+          })
+        }
+      }
+      resetSelectionState()
+      if (txtFiles.length === 0) {
+        setSelectionError('No .txt files found in the selected folder')
+        setSelectedFiles([])
+        setDirHandle(null)
+        setFolderName(null)
+        return
+      }
+      setSelectedFiles(sortFiles(txtFiles))
+      setDirHandle(handle)
+      setFolderName(handle.name)
+    } catch (err: any) {
+      // User cancelled the picker — leave existing state untouched.
+      if (err?.name === 'AbortError') return
+      setSelectionError(`Folder picker failed: ${err?.message || String(err)}`)
+    }
+  }
+
+  // Legacy path used by Firefox/Safari and as a fallback when the user
+  // explicitly chooses the legacy picker via the hidden input.
+  // Cannot write back to the input folder — completed files go to the
+  // browser's download folder instead.
+  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files
+    if (!fileList || fileList.length === 0) return
+
+    resetSelectionState()
+    setDirHandle(null)
+    setFolderName(null)
 
     const txtFiles: SelectedFile[] = []
     for (let i = 0; i < fileList.length; i++) {
@@ -101,16 +197,7 @@ export const BatchProcessing: React.FC = () => {
       return
     }
 
-    txtFiles.sort((a, b) => {
-      const aMatch = a.name.match(/^(\d+)/)
-      const bMatch = b.name.match(/^(\d+)/)
-      if (aMatch && bMatch) return parseInt(aMatch[1]) - parseInt(bMatch[1])
-      if (aMatch) return -1
-      if (bMatch) return 1
-      return a.name.localeCompare(b.name)
-    })
-
-    setSelectedFiles(txtFiles)
+    setSelectedFiles(sortFiles(txtFiles))
   }
 
   const handleStartBatch = useCallback(() => {
@@ -136,7 +223,25 @@ export const BatchProcessing: React.FC = () => {
           setTotalFiles(data.total_files)
         },
         onFileComplete: (data) => {
-          // Store the note content — user downloads via buttons (auto-download blocked by browsers)
+          // Save into <input>/output/ when a writable dirHandle exists
+          // (Chrome/Edge File System Access path). Otherwise the user
+          // re-downloads via the per-row button in the results table.
+          let saved = false
+          if (dirHandle && data.note_content) {
+            writeFileToOutputSubfolder(dirHandle, data.output_filename, data.note_content)
+              .then(() => {
+                setCompletedFiles(prev => prev.map(cf =>
+                  cf.outputFilename === data.output_filename
+                    ? { ...cf, savedToFolder: true } : cf))
+              })
+              .catch(err => {
+                setFolderSaveError(
+                  `Auto-save of ${data.output_filename} to <folder>/output/ failed: `
+                  + `${err?.message || String(err)}`,
+                )
+              })
+            saved = false // optimistic; flipped to true above on resolve
+          }
           setCompletedFiles(prev => [...prev, {
             filename: data.filename,
             outputFilename: data.output_filename,
@@ -145,6 +250,7 @@ export const BatchProcessing: React.FC = () => {
             attempts: data.attempts,
             generationTime: data.generation_time_seconds,
             noteContent: data.note_content,
+            savedToFolder: saved,
           }])
         },
         onFileFailed: (data) => {
@@ -159,6 +265,14 @@ export const BatchProcessing: React.FC = () => {
         },
         onTotal: (data) => {
           setTotalContent(data.note_content)
+          // Auto-save total.vaucda alongside the per-patient files when
+          // a writable folder handle is available.
+          if (dirHandle && data.note_content) {
+            writeFileToOutputSubfolder(dirHandle, 'total.vaucda', data.note_content)
+              .catch(err => setFolderSaveError(
+                `Auto-save of total.vaucda failed: ${err?.message || String(err)}`,
+              ))
+          }
         },
         onComplete: (data) => {
           setBatchSummary({ processed: data.processed, failed: data.failed, totalTime: data.total_time_seconds })
@@ -176,7 +290,39 @@ export const BatchProcessing: React.FC = () => {
     )
 
     abortRef.current = handle
-  }, [selectedFiles])
+  }, [selectedFiles, visitDate, dirHandle])
+
+  // Re-saves every completed `.vaucda` (and total.vaucda) to
+  // <input>/output/ in one click. Useful when the user wants to grab
+  // everything after the fact, or when an earlier auto-save failed.
+  const handleSaveAllToFolder = useCallback(async () => {
+    if (!dirHandle) return
+    setFolderSaveError(null)
+    let written = 0
+    const errors: string[] = []
+    for (const cf of completedFiles) {
+      if (cf.status !== 'completed' || !cf.noteContent) continue
+      try {
+        await writeFileToOutputSubfolder(dirHandle, cf.outputFilename, cf.noteContent)
+        written++
+      } catch (err: any) {
+        errors.push(`${cf.outputFilename}: ${err?.message || String(err)}`)
+      }
+    }
+    if (totalContent) {
+      try {
+        await writeFileToOutputSubfolder(dirHandle, 'total.vaucda', totalContent)
+        written++
+      } catch (err: any) {
+        errors.push(`total.vaucda: ${err?.message || String(err)}`)
+      }
+    }
+    setCompletedFiles(prev => prev.map(cf =>
+      cf.status === 'completed' ? { ...cf, savedToFolder: true } : cf))
+    if (errors.length > 0) {
+      setFolderSaveError(`Wrote ${written}; failed: ${errors.join('; ')}`)
+    }
+  }, [dirHandle, completedFiles, totalContent])
 
   const handleCancelBatch = useCallback(() => {
     if (abortRef.current) {
@@ -239,7 +385,7 @@ export const BatchProcessing: React.FC = () => {
           />
 
           <div className="flex items-center gap-4">
-            <Button onClick={() => folderInputRef.current?.click()} disabled={isProcessing} className="flex items-center gap-2" aria-label="Browse for folder">
+            <Button onClick={handlePickFolder} disabled={isProcessing} className="flex items-center gap-2" aria-label="Browse for folder">
               <FiFolder className="w-4 h-4" aria-hidden="true" />
               Browse for Folder...
             </Button>
@@ -258,6 +404,11 @@ export const BatchProcessing: React.FC = () => {
             {selectedFiles.length > 0 && (
               <span className="text-sm text-gray-600 dark:text-gray-400">
                 {selectedFiles.length} .txt file{selectedFiles.length !== 1 ? 's' : ''} selected
+                {folderName && (
+                  <span className="ml-2 text-green-700 dark:text-green-400">
+                    · auto-save to <span className="font-mono">{folderName}/output/</span>
+                  </span>
+                )}
               </span>
             )}
           </div>
@@ -270,7 +421,11 @@ export const BatchProcessing: React.FC = () => {
 
           <div className="mt-3 text-xs text-gray-500 dark:text-gray-400 space-y-1">
             <p>Files with <span className="font-mono font-semibold">CON</span> as a standalone word → <span className="font-semibold">Urology Consult</span>. All others → <span className="font-semibold">Urology Clinic Note</span>.</p>
-            <p>Each completed note auto-downloads to your browser's download folder. A combined <span className="font-mono">total.vaucda</span> downloads at the end.</p>
+            {hasFSAccess ? (
+              <p>Output files write directly into an <span className="font-mono">output/</span> subfolder of the folder you select. A combined <span className="font-mono">total.vaucda</span> is written alongside them.</p>
+            ) : (
+              <p>Your browser does not support direct folder writes. Each completed note downloads to your browser's download folder; combined <span className="font-mono">total.vaucda</span> downloads at the end.</p>
+            )}
           </div>
         </div>
       </Card>
@@ -392,16 +547,35 @@ export const BatchProcessing: React.FC = () => {
               </div>
             )}
 
-            {/* Download buttons */}
+            {/* Download / save buttons */}
             {batchSummary && (
               <div className="flex flex-col gap-3 mb-4">
-                {totalContent && (
-                  <Button onClick={() => triggerDownload('total.vaucda', totalContent)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 w-fit" aria-label="Download total.vaucda (all notes combined)">
-                    <FiDownload className="w-4 h-4" aria-hidden="true" /> Download total.vaucda (all notes combined)
-                  </Button>
+                <div className="flex flex-wrap gap-2">
+                  {dirHandle && (
+                    <Button
+                      onClick={handleSaveAllToFolder}
+                      className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 w-fit"
+                      aria-label={`Save all .vaucda files to ${folderName}/output/`}
+                    >
+                      <FiSave className="w-4 h-4" aria-hidden="true" />
+                      Save all to {folderName}/output/
+                    </Button>
+                  )}
+                  {totalContent && (
+                    <Button onClick={() => triggerDownload('total.vaucda', totalContent)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 w-fit" aria-label="Download total.vaucda (all notes combined)">
+                      <FiDownload className="w-4 h-4" aria-hidden="true" /> Download total.vaucda (all notes combined)
+                    </Button>
+                  )}
+                </div>
+                {folderSaveError && (
+                  <div role="alert" className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                    <p className="text-sm text-red-700 dark:text-red-400">{folderSaveError}</p>
+                  </div>
                 )}
                 <p className="text-xs text-gray-500 dark:text-gray-400">
-                  Use the download buttons in the table below for individual files.
+                  {dirHandle
+                    ? `Files were written to ${folderName}/output/ as each completed. Re-save anytime with the button above.`
+                    : 'Use the download buttons in the table below for individual files.'}
                 </p>
               </div>
             )}
