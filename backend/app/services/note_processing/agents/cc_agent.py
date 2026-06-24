@@ -675,6 +675,66 @@ def _most_recent_completed_modality(timeline: List) -> Optional[str]:
     return best[1] if best else None
 
 
+def _primary_cancer_anchored_cc(
+    gu_notes: List[Dict[str, str]],
+    document_pmh: Optional[str],
+    document_pathology: Optional[str],
+    document_psh: Optional[str],
+    clinical_document: Optional[str],
+) -> Optional[str]:
+    """Return the patient's own most-recent CC that names the primary
+    urologic cancer, when source confirms the cancer.
+
+    Anchors to: prostate cancer, renal cell carcinoma, bladder cancer.
+    Detection scans PMH + pathology + PSH + raw doc (capped) because
+    extract_pmh() returns "" for many real charts (only supports VA
+    ALL PROBLEMS LIST format) — pathology, PSH s/p entries, and the
+    raw document are reliable cancer-signal sources.
+
+    Returns the EARLIEST-in-list (most-recent) matching CC, with
+    length as tiebreaker. Picks "Prostate cancer on Active
+    Surveillance" over an older "Follow-up after prostate cancer
+    treatment." Falls through (returns None) when no cancer signal
+    exists or no CC mentions it.
+    """
+    all_ccs_raw = [n.get("CC", "") for n in gu_notes if n.get("CC")]
+    urologic_ccs = [cc for cc in all_ccs_raw if _is_urologic_text(cc)]
+    if not urologic_ccs:
+        return None
+    cancer_context = " ".join((
+        (document_pmh or "").lower(),
+        (document_pathology or "").lower(),
+        (document_psh or "").lower(),
+        (clinical_document or "").lower()[:50000],  # cap scan for perf
+    ))
+    cancer_anchors: List[str] = []
+    if ("prostate cancer" in cancer_context
+            or "prostatic adenocarcinoma" in cancer_context
+            or re.search(r'\bmalignant\s+neoplasm\s+of\s+(?:the\s+)?prostate\b',
+                          cancer_context)
+            or re.search(r'\bgleason\s+\d', cancer_context)
+            or re.search(r'\bs/p\s+(?:imrt|radical\s+prostatectomy|ralp|rrp|brachy)\b',
+                          cancer_context)):
+        cancer_anchors.append("prostate cancer")
+    if ("renal cell carcinoma" in cancer_context
+            or "kidney cancer" in cancer_context
+            or re.search(r'\bclear[\s-]cell\s+(?:rcc|renal)\b', cancer_context)):
+        cancer_anchors.append("renal cell carcinoma")
+        cancer_anchors.append("renal cell")
+    if ("bladder cancer" in cancer_context
+            or "urothelial carcinoma" in cancer_context
+            or "urothelial cancer" in cancer_context):
+        cancer_anchors.append("bladder cancer")
+        cancer_anchors.append("urothelial")
+    for anchor_key in cancer_anchors:
+        matching = [(i, c) for i, c in enumerate(urologic_ccs)
+                    if anchor_key in c.lower()]
+        if matching:
+            matching.sort(key=lambda x: (x[0], -len(x[1])))
+            return matching[0][1]
+    return None
+
+
 def _treatment_naive_cc_from_pmh(document_pmh: str) -> Optional[str]:
     """Derive a CC for a treatment-naive patient from PMH + pathology
     keywords. Returns None when no recognizable urologic primary
@@ -737,6 +797,24 @@ def synthesize_cc(
         Non-empty urologic CC string. Never "" — falls back to
         "Urology follow-up" as the final safety net.
     """
+    # 0. Primary-cancer anchor (runs FIRST — outranks phase classifier).
+    # When source unambiguously shows a urologic cancer AND >=1 of the
+    # patient's own GU note CCs explicitly names that cancer, that CC
+    # is authoritative regardless of what the phase classifier or
+    # PMH-derive heuristics say. This catches the Woods failure mode:
+    # phase classifier mislabeled an 11-year s/p-IMRT patient as
+    # TREATMENT_NAIVE, which routed CC selection through a PMH-derive
+    # path that picked "Follow-up for hematuria" from a 2012
+    # microhematuria PMH entry — even though the patient's actual
+    # recent CC is "Follow-up for prostate cancer, nephrolithiasis,
+    # and LUTS." The anchor here would have prevented that.
+    anchored_cc = _primary_cancer_anchored_cc(
+        gu_notes, document_pmh, document_pathology, document_psh,
+        clinical_document,
+    )
+    if anchored_cc:
+        return _apply_terminology(anchored_cc)
+
     # Phase-driven CC short-circuit. When the deterministic phase
     # classifier has a high-confidence verdict (mCRPC, mHSPC, salvage,
     # biochemical recurrence, on-initial-treatment, progression), the CC
@@ -808,58 +886,9 @@ def synthesize_cc(
     # non-urologic complaints ("annual physical", "back pain").
     urologic_ccs = [cc for cc in all_ccs if _is_urologic_text(cc)]
 
-    # 2b. Primary-cancer anchor. When the patient has a confirmed
-    # urologic cancer (per ANY of PMH / pathology / PSH / clinical
-    # document) AND at least one collected CC explicitly names that
-    # cancer, prefer the longest such CC over LLM-combine. The LLM was
-    # observed dropping the cancer ("prostate cancer") in favor of a
-    # secondary co-listed concern ("hematuria") when synthesizing —
-    # Woods + Cann on 2026-06-23. Length-tie-break favors the most
-    # informative variant.
-    #
-    # We check multiple sources (not just PMH) because the deterministic
-    # extract_pmh() only supports VA "ALL PROBLEMS LIST" format and
-    # returns "" for many real charts — pathology / PSH / raw document
-    # are reliable cancer-signal sources even when PMH is empty.
-    cancer_context = " ".join((
-        (document_pmh or "").lower(),
-        (document_pathology or "").lower(),
-        (document_psh or "").lower(),
-        (clinical_document or "").lower()[:50000],  # cap scan for perf
-    ))
-    cancer_anchors = []
-    if ("prostate cancer" in cancer_context
-            or "prostatic adenocarcinoma" in cancer_context
-            or re.search(r'\bmalignant\s+neoplasm\s+of\s+(?:the\s+)?prostate\b',
-                          cancer_context)
-            or re.search(r'\bgleason\s+\d', cancer_context)
-            or re.search(r'\bs/p\s+(?:imrt|radical\s+prostatectomy|ralp|rrp|brachy)\b',
-                          cancer_context)):
-        cancer_anchors.append("prostate cancer")
-    if ("renal cell carcinoma" in cancer_context
-            or "kidney cancer" in cancer_context
-            or re.search(r'\bclear[\s-]cell\s+(?:rcc|renal)\b', cancer_context)):
-        cancer_anchors.append("renal cell carcinoma")
-        cancer_anchors.append("renal cell")  # accept shorter variants in CC
-    if ("bladder cancer" in cancer_context
-            or "urothelial carcinoma" in cancer_context
-            or "urothelial cancer" in cancer_context):
-        cancer_anchors.append("bladder cancer")
-        cancer_anchors.append("urothelial")
-    anchored_ccs: List[str] = []
-    for anchor_key in cancer_anchors:
-        matching = [(i, c) for i, c in enumerate(urologic_ccs)
-                    if anchor_key in c.lower()]
-        if matching:
-            # Prefer the EARLIEST-in-list (most-recent) cancer-anchored
-            # CC, length as tiebreaker. urologic_ccs preserves document
-            # order from gu_notes, so position 0 is the freshest note.
-            # Picks "Prostate cancer on Active Surveillance" over an
-            # older "Follow-up after prostate cancer treatment" for the
-            # same patient.
-            matching.sort(key=lambda x: (x[0], -len(x[1])))
-            anchored_ccs = [c for _, c in matching]
-            break
+    # (Cancer-anchor preference handled at function entry; if it fired,
+    # we returned early. The shortcut + LLM-combine paths below run only
+    # when no anchored CC matched.)
 
     cc: str
     # Shortcut: if all urologic candidates are identical (case-insensitive,
@@ -868,10 +897,7 @@ def synthesize_cc(
     # follow-up" when 2-3 prior notes all carry the same CC ("Adrenal
     # myelolipoma" → "Urology follow-up" was the failure mode).
     _normalized_ccs = {re.sub(r'\s+', ' ', cc.strip().lower()) for cc in urologic_ccs}
-    if anchored_ccs:
-        # Cancer-anchored preference takes precedence over LLM-combine.
-        cc = _apply_terminology(anchored_ccs[0])
-    elif len(urologic_ccs) >= 1 and len(_normalized_ccs) == 1:
+    if len(urologic_ccs) >= 1 and len(_normalized_ccs) == 1:
         cc = _apply_terminology(urologic_ccs[0])
     elif len(urologic_ccs) == 1:
         # 3. Single urologic CC: clean.
