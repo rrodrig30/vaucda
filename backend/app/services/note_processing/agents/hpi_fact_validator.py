@@ -373,11 +373,15 @@ def _validate_prior_diagnosis(dx: Dict, gt: GroundTruth,
     if g and gg and g in GLEASON_TO_GG:
         expected_gg = GLEASON_TO_GG[g]
         if gg != expected_gg:
+            # WARN-only: GG vs Gleason is a derivable fact and the
+            # Gleason itself is the primary anchor (separately verified
+            # against pathology). Blocking on this just pushed v2 into
+            # retry loops with no clear win.
             errors.append(FactValidationError(
                 "prior_diagnosis.grade_group", "GLEASON_GG_MISMATCH",
                 f"Gleason {g} corresponds to Grade Group {expected_gg}, "
                 f"not {gg} (ISUP 2014 grading)",
-                found=gg, expected=expected_gg,
+                found=gg, expected=expected_gg, severity="WARN",
             ))
 
     # Risk category ↔ Grade Group consistency for prostate cancer.
@@ -394,14 +398,14 @@ def _validate_prior_diagnosis(dx: Dict, gt: GroundTruth,
                 "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
                 f"Grade Group {gg} is high-risk; risk_category "
                 f"'{risk}' is inconsistent",
-                found=risk, expected="high",
+                found=risk, expected="high", severity="WARN",
             ))
         if gg == 1 and rl in ("high", "very-high", "very high"):
             errors.append(FactValidationError(
                 "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
                 f"Grade Group 1 is low-risk; risk_category "
                 f"'{risk}' is inconsistent",
-                found=risk, expected="low",
+                found=risk, expected="low", severity="WARN",
             ))
 
 

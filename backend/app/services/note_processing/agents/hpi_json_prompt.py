@@ -197,6 +197,17 @@ def _retry_feedback_block(
                 line += f" (got: {e.found!r})"
             lines.append(line)
         lines.append("")
+        # Critical guardrail for VISIT_REASON_* errors: the LLM has been
+        # observed "fixing" these by REMOVING valid treatment data
+        # rather than rewriting visit_reason. Force the correct direction.
+        if any(e.code.startswith("VISIT_REASON_") for e in fact_errors):
+            lines.append("CRITICAL: To fix VISIT_REASON_* contradictions, "
+                         "REWRITE intro.visit_reason and today_reason to "
+                         "match the validated prior_diagnosis and "
+                         "treatment_history. DO NOT remove or alter "
+                         "treatment_history entries — those are anchored "
+                         "to PSH and pathology and must stay.")
+            lines.append("")
     lines.append("Re-emit the COMPLETE corrected JSON object. Do NOT explain — output JSON only.")
     return "\n".join(lines)
 
