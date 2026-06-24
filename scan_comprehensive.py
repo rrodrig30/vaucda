@@ -252,6 +252,28 @@ def scan_hpi(note, source):
                   "HPI says 'active surveillance' AND mentions completed "
                   "definitive treatment in the same paragraph"))
 
+    # Source-anchored AS check: HPI says 'active surveillance' but
+    # SOURCE explicitly documents s/p IMRT / s/p prostatectomy / etc.
+    # Catches the Woods failure mode where v2 omitted the radiation
+    # entry entirely AND framed the patient as AS — internally
+    # consistent draft but factually wrong against source.
+    sl = source.lower()
+    source_has_definitive_tx = bool(re.search(
+        r"\bs/p\s+(?:imrt|radiation|ebrt|xrt|brachy|radical\s+prostatectomy|"
+        r"ralp|rrp|rarp|prostatectomy|nephrectomy|cystectomy|sbrt)\b"
+        r"|\bstatus\s+post\s+(?:imrt|radiation|prostatectomy|ebrt|xrt|"
+        r"nephrectomy|cystectomy)\b"
+        r"|\b(?:imrt|radiation|prostatectomy|ebrt|xrt|brachy|sbrt)\s+completed\b"
+        r"|\bcompleted\s+(?:imrt|radiation|ebrt|xrt|brachy|sbrt)\s+(?:therapy|treatment)?",
+        sl,
+    ))
+    if mentions_as and source_has_definitive_tx and not mentions_completed_definitive:
+        f.append(("HIGH", "HPI_INTERNAL_CONTRADICTION",
+                  "HPI frames patient as 'active surveillance' but source "
+                  "explicitly documents completed definitive treatment "
+                  "(s/p IMRT / RP / etc.) — likely AS framing applied to "
+                  "an s/p-treatment patient"))
+
     # Treatment-tense mismatch — HPI uses future/planning language
     # ("we will proceed with radiation", "plan to undergo prostatectomy",
     # "would be for ADT") for a treatment the SOURCE explicitly marks
