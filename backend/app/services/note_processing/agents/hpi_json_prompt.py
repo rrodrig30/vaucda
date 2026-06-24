@@ -218,6 +218,20 @@ def build_hpi_json_prompt(
         "explanation. No markdown code fences. The first character of "
         "your output MUST be `{` and the last MUST be `}`.",
         "",
+        "VISIT CONTEXT: This is a real urology clinic visit occurring on "
+        "the BANNER visit_date below. Frame the HPI as the documentation "
+        "of an actual clinic encounter. Do NOT describe it as 'chart "
+        "preparation', 'chart-prep', or say 'patient has not been "
+        "interviewed today' — those framings are forbidden.",
+        "",
+        "SCOPE: This IS the urology clinic. NEVER frame any aspect of "
+        "the patient's care as 'referred to urology', 'by urology', "
+        "'urology consult', 'urology to evaluate', or 'urology to "
+        "follow up'. We ARE the urology team — describe management "
+        "in the first person plural ('we will...', 'our plan is...') "
+        "or active voice ('the patient is being followed for...', "
+        "'the patient is on active surveillance for...').",
+        "",
         "ABSOLUTE RULES:",
         "  1. EVERY value in the JSON must come from the authoritative "
         "ground truth shown below. Do not invent values.",
@@ -237,8 +251,22 @@ def build_hpi_json_prompt(
         "Do NOT use MM/DD/YYYY or 'Feb 2, 2026'.",
         "  9. If a section has no data (e.g., patient is treatment-naive), "
         "OMIT the field or set it to null. Do NOT invent placeholder content.",
-        "  10. The 'today_reason' field must reflect the documented reason "
-        "for THIS visit (chart-prep — patient has not been interviewed today).",
+        "  10. 'today_reason' must describe the REAL clinical reason for "
+        "this clinic visit (e.g., 'routine surveillance of low-risk "
+        "prostate cancer on active surveillance', 'follow-up of "
+        "biochemical recurrence after prostatectomy', 'evaluation of "
+        "elevated PSA', 'post-treatment follow-up after IMRT and ADT'). "
+        "Tie it to the patient's specific diagnosis, treatment status, "
+        "and pertinent recent changes — not to administrative wording.",
+        "  11. Populate interval_status whenever the source documents a "
+        "prior urology visit. Include a 1-2-sentence summary of the "
+        "interval (symptoms, treatment continuation, any changes) "
+        "anchored to the last visit date, and a 'denies' list of "
+        "pertinent negatives the source documents.",
+        "  12. Fill prior_diagnosis whenever the patient has a known "
+        "urologic diagnosis (prostate cancer, RCC, bladder cancer, BPH, "
+        "stones, etc.) — not just for cancer. The renderer uses this "
+        "to anchor the HPI's clinical framing.",
         "",
         _schema_block(),
         "",

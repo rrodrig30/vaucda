@@ -63,6 +63,17 @@ def _format_date(date_str: Optional[str]) -> str:
     return date_str
 
 
+def _date_preposition(date_str: Optional[str]) -> str:
+    """Return 'on' for a specific YYYY-MM-DD, 'in' for YYYY or YYYY-MM.
+
+    The grammar of "diagnosed in 2015" vs "diagnosed on January 7, 2026"
+    matters — using "in" for a fully specified date reads as a
+    template-leak."""
+    if not date_str:
+        return "in"
+    return "on" if date_str.count("-") == 2 else "in"
+
+
 # ---------------------------------------------------------------------------
 # Treatment modality display labels
 # ---------------------------------------------------------------------------
@@ -135,13 +146,14 @@ def render_intro(intro: Optional[Dict]) -> str:
 
 
 def render_prior_diagnosis(dx: Optional[Dict], sex: str) -> str:
-    """'He was diagnosed with X in YYYY (Gleason 3+3, Grade Group 1).'"""
+    """'He was diagnosed with X on January 7, 2026 (Gleason 3+3, Grade Group 1).'"""
     if not dx or not dx.get("primary_dx"):
         return ""
     p = _pron(sex)
     parts = [f"{p['sub'].capitalize()} was diagnosed with {dx['primary_dx']}"]
     if dx.get("dx_date"):
-        parts.append(f"in {_format_date(dx['dx_date'])}")
+        parts.append(f"{_date_preposition(dx['dx_date'])} "
+                     f"{_format_date(dx['dx_date'])}")
     qualifier_parts = []
     if dx.get("gleason"):
         gg = dx.get("grade_group")
@@ -151,8 +163,11 @@ def render_prior_diagnosis(dx: Optional[Dict], sex: str) -> str:
             qualifier_parts.append(f"Gleason {dx['gleason']}")
     elif dx.get("grade_group"):
         qualifier_parts.append(f"Grade Group {dx['grade_group']}")
-    if dx.get("risk_category"):
-        qualifier_parts.append(f"{dx['risk_category']} risk")
+    # Filter literal "null" / "none" strings emitted by the LLM when
+    # risk_category is unknown — they leak as "null risk" otherwise.
+    risk = dx.get("risk_category")
+    if risk and isinstance(risk, str) and risk.strip().lower() not in ("null", "none", "unknown", "n/a", ""):
+        qualifier_parts.append(f"{risk} risk")
     if qualifier_parts:
         parts.append(f"({'; '.join(qualifier_parts)})")
     return " ".join(parts) + "."
@@ -173,7 +188,7 @@ def render_treatment_history(events: Optional[List[Dict]], sex: str) -> str:
         status_verb = _STATUS_VERB.get(evt["status"], evt["status"])
         date_part = ""
         if evt.get("date"):
-            date_part = f" in {_format_date(evt['date'])}"
+            date_part = f" {_date_preposition(evt['date'])} {_format_date(evt['date'])}"
         if evt["status"] == "completed":
             sentence = f"{p['sub'].capitalize()} completed {modality_label}{date_part}."
         elif evt["status"] == "ongoing":
@@ -352,4 +367,9 @@ def render_full_hpi(draft: Dict) -> str:
         render_today_reason(draft.get("today_reason")),
     ]
     # Drop empty sections, join with single space (one paragraph).
-    return " ".join(s for s in sections if s)
+    text = " ".join(s for s in sections if s)
+    # Cross-specialty referral scrubber — even templated v2 text can
+    # carry a stray "by urology" if the LLM emitted it in a free-string
+    # field like visit_reason / today_reason / narrative_note.
+    from .history_cleaners import strip_urology_referral_framing
+    return strip_urology_referral_framing(text)

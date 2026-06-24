@@ -201,6 +201,56 @@ def _strip_rubric_leak(text: str) -> str:
     return text
 
 
+# This IS the urology clinic — cross-specialty referral framing must be
+# stripped from HPI prose. The LLM sometimes carries forward language
+# from source clinical notes that frame urologic management as a
+# referral from / to "urology" as if urology were a separate service:
+#
+#   "Our plan would be for androgen ablation by urology..." (Woods, v1)
+#   "Patient referred to urology for evaluation of elevated PSA"
+#   "Will obtain urology consult"
+#
+# All of these read awkwardly in a urology clinic note. Strip the
+# offending phrasing or rewrite to first-person/active voice.
+_UROLOGY_REFERRAL_PATTERNS = (
+    # "by urology" / "by the urology service" / "by the urology team"
+    (re.compile(r"\s+by\s+(?:the\s+)?urology(?:\s+(?:service|team|clinic|department))?\b",
+                re.IGNORECASE), ""),
+    # "to urology" in referral context — only strip when preceded by
+    # referral verbs to avoid stripping legitimate "transferred to
+    # urology for" in a non-urology note.
+    (re.compile(r"\b(?:refer(?:red)?|sent|forwarded|consulted)\s+to\s+(?:the\s+)?urology(?:\s+(?:service|team|clinic))?\b",
+                re.IGNORECASE), "evaluated"),
+    # "urology consult" / "consult urology" / "urology consultation"
+    (re.compile(r"\b(?:will\s+(?:obtain|get|request|order)\s+(?:a\s+)?)?urology\s+consult(?:ation)?\b",
+                re.IGNORECASE), "urologic evaluation"),
+    (re.compile(r"\b(?:will\s+)?consult\s+urology\b", re.IGNORECASE),
+     "perform urologic evaluation"),
+    # "urology will follow up" / "urology to follow" / "urology to evaluate"
+    (re.compile(r"\burology\s+(?:will\s+|to\s+)(?:follow(?:\s+up)?|evaluate|see|manage)\b",
+                re.IGNORECASE), "we will continue to manage"),
+    # "follow up with urology" / "f/u with urology"
+    (re.compile(r"\b(?:follow(?:\s*[-/]?\s*up)?|f/u)\s+with\s+(?:the\s+)?urology\b",
+                re.IGNORECASE), "follow up with us"),
+)
+
+
+def strip_urology_referral_framing(text: str) -> str:
+    """Strip cross-specialty referral language from HPI prose.
+
+    See _UROLOGY_REFERRAL_PATTERNS for the patterns. This is a
+    post-processor for v1-LLM-generated HPIs that carry forward
+    multi-specialty narrative from source notes."""
+    if not text:
+        return text
+    for pat, repl in _UROLOGY_REFERRAL_PATTERNS:
+        text = pat.sub(repl, text)
+    # Collapse any double-spaces / dangling spaces from substitutions
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"\s+([.,;])", r"\1", text)
+    return text.strip()
+
+
 # Trailing-fragment cleanup applied AFTER sentence drops. Removes
 # orphan tokens like "Here is," "Mr." (no name), "The patient,"
 # that survive the broader cleanup.
@@ -329,6 +379,11 @@ def clean_llm_commentary(text: str) -> str:
     # cleaner doesn't waste cycles on the meta-block, and so subsequent
     # sentence-split logic isn't confused by the label colons.
     text = _strip_rubric_leak(text)
+
+    # Pass 0b: strip cross-specialty urology-referral framing. This IS
+    # the urology clinic — "by urology", "urology consult", "refer to
+    # urology" etc. must not appear in HPI prose.
+    text = strip_urology_referral_framing(text)
 
     # Pass 1: line-level drops
     out_lines = []
