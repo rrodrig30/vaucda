@@ -226,6 +226,32 @@ def scan_hpi(note, source):
                          pathology_text + ' ' + psh_text):
             f.append(("CRITICAL", "HPI_BIOPSY_HALLUCINATION",
                       "HPI claims prostate biopsy with no PATH/PSH evidence"))
+    # Internal contradiction within the HPI itself. Catches the Woods
+    # failure mode where v2's visit_reason said "low-risk ... on active
+    # surveillance" while the rest of the HPI correctly said "high
+    # risk" + "completed radiation therapy". The LLM hallucinated
+    # framing inconsistent with its own validated facts.
+    hpi_l_low = hpi.lower()
+    has_low_risk = bool(re.search(r"\b(?:very[\s-]?low[\s-]?risk|low[\s-]?risk)\b", hpi_l_low))
+    has_high_risk = bool(re.search(r"\bhigh[\s-]?risk\b", hpi_l_low))
+    if has_low_risk and has_high_risk:
+        f.append(("HIGH", "HPI_INTERNAL_CONTRADICTION",
+                  "HPI mixes 'low-risk' and 'high-risk' framing"))
+    mentions_as = bool(re.search(r"\bactive\s+surveillance\b", hpi_l_low))
+    mentions_completed_definitive = bool(re.search(
+        r"\bcompleted\s+(?:radical\s+)?(?:radiation|imrt|ebrt|xrt|brachy|"
+        r"prostatectomy|sbrt|nephrectomy|cystectomy)",
+        hpi_l_low,
+    )) or bool(re.search(
+        r"\bs/p\s+(?:imrt|radical\s+prostatectomy|ralp|rrp|rarp|radiation|"
+        r"ebrt|xrt|brachy|nephrectomy|cystectomy)",
+        hpi_l_low,
+    ))
+    if mentions_as and mentions_completed_definitive:
+        f.append(("HIGH", "HPI_INTERNAL_CONTRADICTION",
+                  "HPI says 'active surveillance' AND mentions completed "
+                  "definitive treatment in the same paragraph"))
+
     # Treatment-tense mismatch — HPI uses future/planning language
     # ("we will proceed with radiation", "plan to undergo prostatectomy",
     # "would be for ADT") for a treatment the SOURCE explicitly marks

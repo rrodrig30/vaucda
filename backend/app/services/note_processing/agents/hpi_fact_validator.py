@@ -470,6 +470,95 @@ def _validate_current_regimen(regimen: List[Dict], gt: GroundTruth,
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _validate_visit_reason_consistency(draft: Dict,
+                                        errors: List[FactValidationError]) -> None:
+    """Check that intro.visit_reason and today_reason are internally
+    consistent with prior_diagnosis.risk_category and treatment_history.
+
+    Catches the Woods failure mode: visit_reason said "low-risk
+    prostate cancer on active surveillance" while prior_diagnosis
+    correctly said "high risk" and treatment_history said
+    "completed radiation therapy". The LLM hallucinated framing
+    that contradicted other validated sections of its own draft.
+    """
+    intro = draft.get("intro") or {}
+    visit_reason = (intro.get("visit_reason") or "").lower()
+    today_reason = (draft.get("today_reason") or "").lower()
+    combined = visit_reason + " " + today_reason
+
+    dx = draft.get("prior_diagnosis") or {}
+    risk = (dx.get("risk_category") or "")
+    risk_lc = risk.strip().lower() if isinstance(risk, str) else ""
+
+    # 1. Risk-category contradiction: visit_reason names a risk level
+    # that disagrees with prior_diagnosis.risk_category.
+    if risk_lc in ("high", "very-high", "very high"):
+        if re.search(r"\b(?:very[\s-]?low[\s-]?risk|low[\s-]?risk|low\s+grade)\b",
+                     combined):
+            errors.append(FactValidationError(
+                "intro.visit_reason", "VISIT_REASON_RISK_MISMATCH",
+                f"visit_reason describes 'low-risk' but "
+                f"prior_diagnosis.risk_category is {risk!r}",
+                found=visit_reason or today_reason,
+                expected=risk,
+            ))
+    if risk_lc in ("low", "very-low", "very low"):
+        if re.search(r"\bhigh[\s-]?risk\b", combined):
+            errors.append(FactValidationError(
+                "intro.visit_reason", "VISIT_REASON_RISK_MISMATCH",
+                f"visit_reason describes 'high-risk' but "
+                f"prior_diagnosis.risk_category is {risk!r}",
+                found=visit_reason or today_reason,
+                expected=risk,
+            ))
+
+    # 2. Treatment contradiction: visit_reason says "active surveillance"
+    # but treatment_history has a completed definitive treatment, or
+    # vice versa.
+    th = draft.get("treatment_history") or []
+    completed_definitive = {
+        e.get("modality") for e in th
+        if e.get("status") == "completed"
+        and e.get("modality") in {"prostatectomy", "radiation", "brachytherapy",
+                                    "focal-therapy", "nephrectomy", "cystectomy"}
+    }
+    ongoing_as = any(
+        e.get("modality") == "active-surveillance"
+        and e.get("status") in ("ongoing", "completed")
+        for e in th
+    )
+    mentions_as = re.search(r"\bactive\s+surveillance\b", combined) is not None
+    mentions_post_treatment = re.search(
+        r"\b(?:post[\s-]?(?:treatment|prostatectomy|radiation|imrt|xrt|ebrt)|"
+        r"after\s+(?:radiation|imrt|prostatectomy|ebrt|xrt|brachy|nephrectomy)|"
+        r"s/p\s+(?:imrt|radiation|prostatectomy|nephrectomy|ralp|rrp|rarp))\b",
+        combined,
+    )
+
+    if mentions_as and completed_definitive and not ongoing_as:
+        errors.append(FactValidationError(
+            "intro.visit_reason", "VISIT_REASON_TREATMENT_MISMATCH",
+            f"visit_reason / today_reason names 'active surveillance' "
+            f"but treatment_history has completed definitive treatment "
+            f"{sorted(completed_definitive)!r} — the patient is s/p "
+            f"treatment, not on AS",
+            found=visit_reason or today_reason,
+            expected=f"post-treatment framing referring to {sorted(completed_definitive)!r}",
+        ))
+    if (mentions_post_treatment and not completed_definitive
+            and not ongoing_as):
+        # Less common direction: visit_reason claims post-treatment but
+        # treatment_history is empty. Could be incomplete extraction;
+        # use WARN not ERROR.
+        errors.append(FactValidationError(
+            "intro.visit_reason", "VISIT_REASON_TREATMENT_MISMATCH",
+            f"visit_reason describes post-treatment status but "
+            f"treatment_history is empty",
+            found=visit_reason or today_reason,
+            severity="WARN",
+        ))
+
+
 def validate_facts(draft: Dict, gt: GroundTruth) -> List[FactValidationError]:
     """Cross-validate a schema-valid HPIDraft against ground truth.
 
@@ -483,6 +572,8 @@ def validate_facts(draft: Dict, gt: GroundTruth) -> List[FactValidationError]:
     _validate_prior_diagnosis(draft.get("prior_diagnosis") or {}, gt, errors)
     _validate_procedure_findings(draft.get("procedure_findings") or [], gt, errors)
     _validate_current_regimen(draft.get("current_regimen") or [], gt, errors)
+    # Cross-section internal consistency (visit_reason vs the rest)
+    _validate_visit_reason_consistency(draft, errors)
     return errors
 
 
