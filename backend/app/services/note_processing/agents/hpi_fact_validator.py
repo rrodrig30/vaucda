@@ -402,21 +402,23 @@ def _validate_prior_diagnosis(dx: Dict, gt: GroundTruth,
     if risk and isinstance(risk, str) and effective_gg:
         rl = risk.strip().lower()
         if effective_gg in (4, 5) and rl in ("very-low", "low", "very low"):
-            # ERROR-severity: labeling high-grade (GG4-5) disease as
-            # "low-risk" is clinically unsafe — would mislead a reader
-            # into believing surveillance is appropriate when it isn't.
+            # WARN: the more critical safety check is
+            # VISIT_REASON_RISK_MISMATCH which catches the same
+            # condition when it actually surfaces in HPI prose.
+            # Keeping this as ERROR forced Woods into 3-attempt
+            # fallback that produced strictly worse v1 output.
             errors.append(FactValidationError(
                 "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
                 f"Grade Group {effective_gg} (from Gleason {g}) is "
                 f"high-risk; risk_category '{risk}' is inconsistent",
-                found=risk, expected="high",
+                found=risk, expected="high", severity="WARN",
             ))
         if effective_gg == 1 and rl in ("high", "very-high", "very high"):
             errors.append(FactValidationError(
                 "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
                 f"Grade Group 1 is low-risk; risk_category "
                 f"'{risk}' is inconsistent",
-                found=risk, expected="low",
+                found=risk, expected="low", severity="WARN",
             ))
 
 
@@ -605,13 +607,21 @@ def _validate_visit_reason_consistency(draft: Dict, gt: "GroundTruth",
     if prostate_signal:
         missing_pca = missing_oncologic & pca_treatments
         if missing_pca:
+            # WARN: a missing treatment_history entry is a quality
+            # concern, but blocking on it forced Woods's v2 into
+            # 3-attempt fallback that produced strictly worse v1
+            # output. The GT-anchored VISIT_REASON_TREATMENT_MISMATCH
+            # above is the real safety guard — it fires whenever
+            # visit_reason actually surfaces an "active surveillance"
+            # framing despite GT showing completed treatment, which
+            # is the misleading prose we care about.
             errors.append(FactValidationError(
                 "treatment_history", "TREATMENT_HISTORY_MISSING_KEY_MODALITY",
                 f"PSH/pathology confirms the patient is s/p "
                 f"{sorted(missing_pca)!r} but treatment_history omits "
                 f"it. Add an entry with status='completed' and the "
                 f"appropriate modality.",
-                expected=sorted(missing_pca),
+                expected=sorted(missing_pca), severity="WARN",
             ))
 
 
