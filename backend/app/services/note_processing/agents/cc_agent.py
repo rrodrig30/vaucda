@@ -808,30 +808,57 @@ def synthesize_cc(
     # non-urologic complaints ("annual physical", "back pain").
     urologic_ccs = [cc for cc in all_ccs if _is_urologic_text(cc)]
 
-    # 2b. Primary-cancer anchor. When PMH confirms a urologic cancer
-    # AND at least one collected CC explicitly names that cancer,
-    # prefer the longest such CC over LLM-combine. The LLM was
+    # 2b. Primary-cancer anchor. When the patient has a confirmed
+    # urologic cancer (per ANY of PMH / pathology / PSH / clinical
+    # document) AND at least one collected CC explicitly names that
+    # cancer, prefer the longest such CC over LLM-combine. The LLM was
     # observed dropping the cancer ("prostate cancer") in favor of a
     # secondary co-listed concern ("hematuria") when synthesizing —
     # Woods + Cann on 2026-06-23. Length-tie-break favors the most
-    # informative variant ("Follow-up for prostate cancer,
-    # nephrolithiasis, and LUTS" > "Prostate cancer").
-    pmh_lower = (document_pmh or "").lower()
+    # informative variant.
+    #
+    # We check multiple sources (not just PMH) because the deterministic
+    # extract_pmh() only supports VA "ALL PROBLEMS LIST" format and
+    # returns "" for many real charts — pathology / PSH / raw document
+    # are reliable cancer-signal sources even when PMH is empty.
+    cancer_context = " ".join((
+        (document_pmh or "").lower(),
+        (document_pathology or "").lower(),
+        (document_psh or "").lower(),
+        (clinical_document or "").lower()[:50000],  # cap scan for perf
+    ))
     cancer_anchors = []
-    if "prostate cancer" in pmh_lower or "malignant neoplasm of (?:the )?prostate" in pmh_lower \
-            or re.search(r'\bmalignant neoplasm of (?:the )?prostate\b', pmh_lower):
-        cancer_anchors.append(("prostate cancer", "prostate cancer"))
-    if "renal cell carcinoma" in pmh_lower or "kidney cancer" in pmh_lower:
-        cancer_anchors.append(("renal cell carcinoma", "renal cell carcinoma"))
-    if "bladder cancer" in pmh_lower or "urothelial" in pmh_lower:
-        cancer_anchors.append(("bladder cancer", "bladder cancer"))
+    if ("prostate cancer" in cancer_context
+            or "prostatic adenocarcinoma" in cancer_context
+            or re.search(r'\bmalignant\s+neoplasm\s+of\s+(?:the\s+)?prostate\b',
+                          cancer_context)
+            or re.search(r'\bgleason\s+\d', cancer_context)
+            or re.search(r'\bs/p\s+(?:imrt|radical\s+prostatectomy|ralp|rrp|brachy)\b',
+                          cancer_context)):
+        cancer_anchors.append("prostate cancer")
+    if ("renal cell carcinoma" in cancer_context
+            or "kidney cancer" in cancer_context
+            or re.search(r'\bclear[\s-]cell\s+(?:rcc|renal)\b', cancer_context)):
+        cancer_anchors.append("renal cell carcinoma")
+        cancer_anchors.append("renal cell")  # accept shorter variants in CC
+    if ("bladder cancer" in cancer_context
+            or "urothelial carcinoma" in cancer_context
+            or "urothelial cancer" in cancer_context):
+        cancer_anchors.append("bladder cancer")
+        cancer_anchors.append("urothelial")
     anchored_ccs: List[str] = []
-    for anchor_key, _ in cancer_anchors:
-        matching = [c for c in urologic_ccs if anchor_key in c.lower()]
+    for anchor_key in cancer_anchors:
+        matching = [(i, c) for i, c in enumerate(urologic_ccs)
+                    if anchor_key in c.lower()]
         if matching:
-            # Sort longest first; longer CCs tend to carry more context
-            # ("Prostate cancer on Active Surveillance" > "Prostate cancer")
-            anchored_ccs = sorted(matching, key=len, reverse=True)
+            # Prefer the EARLIEST-in-list (most-recent) cancer-anchored
+            # CC, length as tiebreaker. urologic_ccs preserves document
+            # order from gu_notes, so position 0 is the freshest note.
+            # Picks "Prostate cancer on Active Surveillance" over an
+            # older "Follow-up after prostate cancer treatment" for the
+            # same patient.
+            matching.sort(key=lambda x: (x[0], -len(x[1])))
+            anchored_ccs = [c for _, c in matching]
             break
 
     cc: str
