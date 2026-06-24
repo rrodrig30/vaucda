@@ -726,12 +726,29 @@ def _primary_cancer_anchored_cc(
             or "urothelial cancer" in cancer_context):
         cancer_anchors.append("bladder cancer")
         cancer_anchors.append("urothelial")
+    # Length floor: refuse to override the downstream paths with a
+    # terse, low-information CC like "Prostate Cancer". Such bare
+    # cancer-name CCs ARE technically anchored but the LLM-combine /
+    # phase-driven paths usually produce a more informative variant
+    # ("Evaluation of biochemical recurrence after prior treatment for
+    # prostate cancer", "Follow-up after prostatectomy for prostate
+    # cancer"). Williams + Fritz regressed when the anchor returned
+    # bare cancer names from a single short source CC.
+    MIN_ANCHORED_CC_CHARS = 25
     for anchor_key in cancer_anchors:
         matching = [(i, c) for i, c in enumerate(urologic_ccs)
                     if anchor_key in c.lower()]
-        if matching:
-            matching.sort(key=lambda x: (x[0], -len(x[1])))
-            return matching[0][1]
+        if not matching:
+            continue
+        # Prefer EARLIEST + LONGEST among informative candidates only.
+        informative = [(i, c) for i, c in matching
+                       if len(c.strip()) >= MIN_ANCHORED_CC_CHARS]
+        if informative:
+            informative.sort(key=lambda x: (x[0], -len(x[1])))
+            return informative[0][1]
+        # All candidates are bare cancer names — fall through to
+        # downstream paths so they can synthesize a richer CC.
+        return None
     return None
 
 
