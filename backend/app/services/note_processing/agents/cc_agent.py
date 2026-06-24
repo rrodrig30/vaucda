@@ -808,6 +808,32 @@ def synthesize_cc(
     # non-urologic complaints ("annual physical", "back pain").
     urologic_ccs = [cc for cc in all_ccs if _is_urologic_text(cc)]
 
+    # 2b. Primary-cancer anchor. When PMH confirms a urologic cancer
+    # AND at least one collected CC explicitly names that cancer,
+    # prefer the longest such CC over LLM-combine. The LLM was
+    # observed dropping the cancer ("prostate cancer") in favor of a
+    # secondary co-listed concern ("hematuria") when synthesizing —
+    # Woods + Cann on 2026-06-23. Length-tie-break favors the most
+    # informative variant ("Follow-up for prostate cancer,
+    # nephrolithiasis, and LUTS" > "Prostate cancer").
+    pmh_lower = (document_pmh or "").lower()
+    cancer_anchors = []
+    if "prostate cancer" in pmh_lower or "malignant neoplasm of (?:the )?prostate" in pmh_lower \
+            or re.search(r'\bmalignant neoplasm of (?:the )?prostate\b', pmh_lower):
+        cancer_anchors.append(("prostate cancer", "prostate cancer"))
+    if "renal cell carcinoma" in pmh_lower or "kidney cancer" in pmh_lower:
+        cancer_anchors.append(("renal cell carcinoma", "renal cell carcinoma"))
+    if "bladder cancer" in pmh_lower or "urothelial" in pmh_lower:
+        cancer_anchors.append(("bladder cancer", "bladder cancer"))
+    anchored_ccs: List[str] = []
+    for anchor_key, _ in cancer_anchors:
+        matching = [c for c in urologic_ccs if anchor_key in c.lower()]
+        if matching:
+            # Sort longest first; longer CCs tend to carry more context
+            # ("Prostate cancer on Active Surveillance" > "Prostate cancer")
+            anchored_ccs = sorted(matching, key=len, reverse=True)
+            break
+
     cc: str
     # Shortcut: if all urologic candidates are identical (case-insensitive,
     # whitespace-normalized), skip the LLM call and return that CC. This
@@ -815,7 +841,10 @@ def synthesize_cc(
     # follow-up" when 2-3 prior notes all carry the same CC ("Adrenal
     # myelolipoma" → "Urology follow-up" was the failure mode).
     _normalized_ccs = {re.sub(r'\s+', ' ', cc.strip().lower()) for cc in urologic_ccs}
-    if len(urologic_ccs) >= 1 and len(_normalized_ccs) == 1:
+    if anchored_ccs:
+        # Cancer-anchored preference takes precedence over LLM-combine.
+        cc = _apply_terminology(anchored_ccs[0])
+    elif len(urologic_ccs) >= 1 and len(_normalized_ccs) == 1:
         cc = _apply_terminology(urologic_ccs[0])
     elif len(urologic_ccs) == 1:
         # 3. Single urologic CC: clean.
