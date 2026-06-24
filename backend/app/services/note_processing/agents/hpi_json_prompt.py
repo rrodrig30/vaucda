@@ -243,10 +243,13 @@ def build_hpi_json_prompt(
         "MEDICATIONS list.",
         "  5. Every Gleason / Grade Group cited MUST appear in PATHOLOGY.",
         "  6. The intro name/age/sex MUST match the banner exactly.",
-        "  7. PSA direction MUST be consistent with values: "
-        "if current > prior then direction is 'increased'; "
-        "if current < prior then 'decreased'; "
-        "if approximately equal then 'stable'.",
+        "  7. PSA direction MUST be consistent with values. Use a "
+        "'meaningful change' threshold = max(0.1 ng/mL, 10% of prior). "
+        "If current > prior by more than that threshold → 'increased'. "
+        "If current < prior by more than that threshold → 'decreased'. "
+        "Otherwise → 'stable'. So 0.02 vs 0.04 (delta 0.02, threshold "
+        "0.1) is STABLE, not 'decreased' — clinically meaningless "
+        "noise at undetectable PSA levels.",
         "  8. Dates MUST be ISO format (YYYY or YYYY-MM or YYYY-MM-DD). "
         "Do NOT use MM/DD/YYYY or 'Feb 2, 2026'.",
         "  9. If a section has no data (e.g., patient is treatment-naive), "

@@ -139,8 +139,12 @@ def render_intro(intro: Optional[Dict]) -> str:
         "post-op": "returns for post-operative follow-up of",
         "pre-op": "is seen for pre-operative evaluation of",
     }.get(intro.get("visit_type", "follow-up"), "returns for")
+    # "an" before age digits whose spoken form starts with a vowel:
+    # 8, 11, 18, 80-89 ("an eighty-two-year-old"). Others use "a".
+    age = intro['age']
+    article = "an" if str(age)[0] in ('8',) or age in (11, 18) else "a"
     return (
-        f"{intro['name']} is a {intro['age']}-year-old "
+        f"{intro['name']} is {article} {age}-year-old "
         f"{intro['sex']} who {visit_verb} {intro['visit_reason']}."
     )
 

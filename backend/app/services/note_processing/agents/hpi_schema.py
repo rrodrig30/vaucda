@@ -218,7 +218,11 @@ TREATMENT_EVENT_SCHEMA = {
         "modality": {"type": "enum", "enum": TREATMENT_MODALITIES, "required": True},
         "status": {"type": "enum", "enum": TREATMENT_STATUSES, "required": True},
         "date": {"type": "date"},
-        "verified_in": {"type": "enum", "enum": VERIFIED_IN_SOURCES, "required": True},
+        # verified_in is audit metadata — actual verification happens in
+        # hpi_fact_validator regardless. Making it required would block
+        # otherwise-valid drafts and force the LLM to fabricate a
+        # source name. Relaxed to optional.
+        "verified_in": {"type": "enum", "enum": VERIFIED_IN_SOURCES},
         "narrative_note": {"type": "string"},  # optional one-clause detail
     },
 }
@@ -252,7 +256,9 @@ PROCEDURE_FINDING_SCHEMA = {
         # records the procedure occurred but has no result text. The
         # renderer omits the "showed ..." clause when finding is absent.
         "finding": {"type": "string"},
-        "verified_in": {"type": "enum", "enum": VERIFIED_IN_SOURCES, "required": True},
+        # verified_in is audit metadata — relaxed to optional (see
+        # TREATMENT_EVENT_SCHEMA).
+        "verified_in": {"type": "enum", "enum": VERIFIED_IN_SOURCES},
     },
 }
 
@@ -261,7 +267,9 @@ CURRENT_REGIMEN_ITEM_SCHEMA = {
     "schema": {
         "medication": {"type": "string", "required": True},  # validated against UROLOGIC_MEDS
         "indication": {"type": "string"},
-        "verified_in": {"type": "enum", "enum": VERIFIED_IN_SOURCES, "required": True},
+        # verified_in is audit metadata — relaxed to optional (see
+        # TREATMENT_EVENT_SCHEMA).
+        "verified_in": {"type": "enum", "enum": VERIFIED_IN_SOURCES},
     },
 }
 

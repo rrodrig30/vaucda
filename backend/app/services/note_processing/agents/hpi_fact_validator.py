@@ -230,25 +230,36 @@ def _validate_psa_trajectory(psa: Dict, gt: GroundTruth,
                 found=pkv,
             ))
 
-    # direction MUST be consistent with current vs prior numbers
+    # direction MUST be consistent with current vs prior numbers.
+    # The 'meaningful change' threshold is the larger of an absolute
+    # floor (0.1 ng/mL — assay noise + biologic variability) and 10% of
+    # the prior value (relative noise scales with the value). For
+    # undetectable post-treatment PSAs (e.g. 0.02 → 0.04), the
+    # threshold is 0.1, so the change is correctly classified 'stable'
+    # rather than 'increased'.
     direction = psa.get("direction")
     if cv is not None and pv is not None and direction:
-        if cv > pv + 0.05 and direction not in ("increased", "fluctuating"):
+        meaningful_change = max(0.1, abs(pv) * 0.10)
+        diff = cv - pv
+        if diff > meaningful_change and direction not in ("increased", "fluctuating"):
             errors.append(FactValidationError(
                 "psa_trajectory.direction", "DIRECTION_INCONSISTENT",
-                f"current {cv} > prior {pv} but direction is '{direction}'",
+                f"current {cv} > prior {pv} (delta {diff:+.2f} > "
+                f"threshold {meaningful_change:.2f}) but direction is '{direction}'",
                 found=direction, expected="increased",
             ))
-        if cv < pv - 0.05 and direction not in ("decreased", "fluctuating"):
+        elif diff < -meaningful_change and direction not in ("decreased", "fluctuating"):
             errors.append(FactValidationError(
                 "psa_trajectory.direction", "DIRECTION_INCONSISTENT",
-                f"current {cv} < prior {pv} but direction is '{direction}'",
+                f"current {cv} < prior {pv} (delta {diff:+.2f} < "
+                f"-{meaningful_change:.2f}) but direction is '{direction}'",
                 found=direction, expected="decreased",
             ))
-        if abs(cv - pv) < 0.05 and direction not in ("stable",):
+        elif abs(diff) <= meaningful_change and direction not in ("stable",):
             errors.append(FactValidationError(
                 "psa_trajectory.direction", "DIRECTION_INCONSISTENT",
-                f"current {cv} ≈ prior {pv} but direction is '{direction}'",
+                f"current {cv} ≈ prior {pv} (delta {diff:+.2f} within "
+                f"±{meaningful_change:.2f}) but direction is '{direction}'",
                 found=direction, expected="stable",
             ))
 
@@ -344,6 +355,53 @@ def _validate_prior_diagnosis(dx: Dict, gt: GroundTruth,
                 "prior_diagnosis.grade_group", "GG_NOT_IN_PATHOLOGY",
                 f"Grade Group {gg} not in pathology",
                 found=gg, expected=sorted(gt.grade_groups),
+            ))
+
+    # Gleason ↔ Grade Group consistency. LLM frequently confuses the
+    # Gleason sum (which can be 6, 7, 8, 9, 10) with the Grade Group
+    # (1-5). E.g. Woods has Gleason 4+4 → GG4, not GG8. ISUP 2014:
+    #   3+3 → 1
+    #   3+4 → 2
+    #   4+3 → 3
+    #   4+4 / 3+5 / 5+3 → 4
+    #   4+5 / 5+4 / 5+5 → 5
+    GLEASON_TO_GG = {
+        "3+3": 1, "3+4": 2, "4+3": 3,
+        "4+4": 4, "3+5": 4, "5+3": 4,
+        "4+5": 5, "5+4": 5, "5+5": 5,
+    }
+    if g and gg and g in GLEASON_TO_GG:
+        expected_gg = GLEASON_TO_GG[g]
+        if gg != expected_gg:
+            errors.append(FactValidationError(
+                "prior_diagnosis.grade_group", "GLEASON_GG_MISMATCH",
+                f"Gleason {g} corresponds to Grade Group {expected_gg}, "
+                f"not {gg} (ISUP 2014 grading)",
+                found=gg, expected=expected_gg,
+            ))
+
+    # Risk category ↔ Grade Group consistency for prostate cancer.
+    # Approximate NCCN mapping:
+    #   GG1: very-low / low (depending on PSA, T-stage)
+    #   GG2: intermediate (favorable)
+    #   GG3: intermediate (unfavorable)
+    #   GG4-5: high / very-high
+    risk = dx.get("risk_category")
+    if risk and isinstance(risk, str) and gg:
+        rl = risk.strip().lower()
+        if gg in (4, 5) and rl in ("very-low", "low", "very low"):
+            errors.append(FactValidationError(
+                "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
+                f"Grade Group {gg} is high-risk; risk_category "
+                f"'{risk}' is inconsistent",
+                found=risk, expected="high",
+            ))
+        if gg == 1 and rl in ("high", "very-high", "very high"):
+            errors.append(FactValidationError(
+                "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
+                f"Grade Group 1 is low-risk; risk_category "
+                f"'{risk}' is inconsistent",
+                found=risk, expected="low",
             ))
 
 
