@@ -391,21 +391,32 @@ def _validate_prior_diagnosis(dx: Dict, gt: GroundTruth,
     #   GG3: intermediate (unfavorable)
     #   GG4-5: high / very-high
     risk = dx.get("risk_category")
-    if risk and isinstance(risk, str) and gg:
+    # Risk-category check anchored to DERIVED GG from Gleason rather
+    # than the (possibly-wrong) LLM-emitted GG. If LLM emits Gleason
+    # 4+4 (correct, validated against pathology) but GG=8 (wrong), we
+    # still want to catch risk="low" — derive GG from Gleason for the
+    # comparison. Gleason itself is independently validated as
+    # GLEASON_NOT_IN_PATHOLOGY so the derivation is sound.
+    derived_gg = GLEASON_TO_GG.get(g) if g else None
+    effective_gg = derived_gg if derived_gg is not None else gg
+    if risk and isinstance(risk, str) and effective_gg:
         rl = risk.strip().lower()
-        if gg in (4, 5) and rl in ("very-low", "low", "very low"):
+        if effective_gg in (4, 5) and rl in ("very-low", "low", "very low"):
+            # ERROR-severity: labeling high-grade (GG4-5) disease as
+            # "low-risk" is clinically unsafe — would mislead a reader
+            # into believing surveillance is appropriate when it isn't.
             errors.append(FactValidationError(
                 "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
-                f"Grade Group {gg} is high-risk; risk_category "
-                f"'{risk}' is inconsistent",
-                found=risk, expected="high", severity="WARN",
+                f"Grade Group {effective_gg} (from Gleason {g}) is "
+                f"high-risk; risk_category '{risk}' is inconsistent",
+                found=risk, expected="high",
             ))
-        if gg == 1 and rl in ("high", "very-high", "very high"):
+        if effective_gg == 1 and rl in ("high", "very-high", "very high"):
             errors.append(FactValidationError(
                 "prior_diagnosis.risk_category", "RISK_GG_MISMATCH",
                 f"Grade Group 1 is low-risk; risk_category "
                 f"'{risk}' is inconsistent",
-                found=risk, expected="low", severity="WARN",
+                found=risk, expected="low",
             ))
 
 
@@ -474,16 +485,20 @@ def _validate_current_regimen(regimen: List[Dict], gt: GroundTruth,
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def _validate_visit_reason_consistency(draft: Dict,
+def _validate_visit_reason_consistency(draft: Dict, gt: "GroundTruth",
                                         errors: List[FactValidationError]) -> None:
-    """Check that intro.visit_reason and today_reason are internally
-    consistent with prior_diagnosis.risk_category and treatment_history.
+    """Check that intro.visit_reason and today_reason are consistent
+    with both the draft's own prior_diagnosis/treatment_history AND
+    the ground truth's confirmed treatments.
 
-    Catches the Woods failure mode: visit_reason said "low-risk
-    prostate cancer on active surveillance" while prior_diagnosis
-    correctly said "high risk" and treatment_history said
-    "completed radiation therapy". The LLM hallucinated framing
-    that contradicted other validated sections of its own draft.
+    Two failure modes this catches:
+      (a) draft-internal contradiction (Woods earlier failure):
+          visit_reason "low-risk active surveillance" while
+          prior_diagnosis.risk_category="high".
+      (b) GT-anchored contradiction (Woods current failure):
+          visit_reason "active surveillance" while the LLM
+          omitted radiation from treatment_history but GT
+          (PSH/pathology) confirms the patient is s/p radiation.
     """
     intro = draft.get("intro") or {}
     visit_reason = (intro.get("visit_reason") or "").lower()
@@ -516,16 +531,24 @@ def _validate_visit_reason_consistency(draft: Dict,
                 expected=risk,
             ))
 
-    # 2. Treatment contradiction: visit_reason says "active surveillance"
-    # but treatment_history has a completed definitive treatment, or
-    # vice versa.
+    # 2. Treatment contradiction. Anchor to BOTH draft.treatment_history
+    # AND ground truth's confirmed treatments — the LLM can mask the
+    # contradiction by omitting the treatment from its draft, but the
+    # GT (extracted deterministically from PSH/pathology) is unforgiving.
     th = draft.get("treatment_history") or []
-    completed_definitive = {
+    draft_completed_definitive = {
         e.get("modality") for e in th
         if e.get("status") == "completed"
         and e.get("modality") in {"prostatectomy", "radiation", "brachytherapy",
                                     "focal-therapy", "nephrectomy", "cystectomy"}
     }
+    gt_completed_definitive = {
+        m for m in (gt.confirmed_treatment_modalities or set())
+        if m in {"prostatectomy", "radiation", "brachytherapy",
+                  "focal-therapy", "nephrectomy", "cystectomy",
+                  "ADT", "chemotherapy"}
+    }
+    completed_definitive = draft_completed_definitive | gt_completed_definitive
     ongoing_as = any(
         e.get("modality") == "active-surveillance"
         and e.get("status") in ("ongoing", "completed")
@@ -543,24 +566,53 @@ def _validate_visit_reason_consistency(draft: Dict,
         errors.append(FactValidationError(
             "intro.visit_reason", "VISIT_REASON_TREATMENT_MISMATCH",
             f"visit_reason / today_reason names 'active surveillance' "
-            f"but treatment_history has completed definitive treatment "
-            f"{sorted(completed_definitive)!r} — the patient is s/p "
-            f"treatment, not on AS",
+            f"but the patient has completed definitive treatment "
+            f"{sorted(completed_definitive)!r} (per PSH/pathology). "
+            f"The patient is s/p treatment, not on AS.",
             found=visit_reason or today_reason,
             expected=f"post-treatment framing referring to {sorted(completed_definitive)!r}",
         ))
     if (mentions_post_treatment and not completed_definitive
             and not ongoing_as):
         # Less common direction: visit_reason claims post-treatment but
-        # treatment_history is empty. Could be incomplete extraction;
-        # use WARN not ERROR.
+        # neither draft nor GT has any completed treatment. Could be
+        # incomplete extraction; use WARN not ERROR.
         errors.append(FactValidationError(
             "intro.visit_reason", "VISIT_REASON_TREATMENT_MISMATCH",
-            f"visit_reason describes post-treatment status but "
-            f"treatment_history is empty",
+            f"visit_reason describes post-treatment status but no "
+            f"completed treatment is recorded",
             found=visit_reason or today_reason,
             severity="WARN",
         ))
+
+    # 3. Missing oncologic treatment in draft. If GT confirms a completed
+    # cancer-directed treatment but draft.treatment_history omits it,
+    # the HPI will inevitably misframe the patient. ERROR-severity so
+    # the LLM is forced to include it.
+    missing_oncologic = gt_completed_definitive - draft_completed_definitive
+    # Filter to treatments meaningful to surface — surgical-treatment-
+    # only entries like nephrectomy aren't always documented as
+    # "completed" in PSH-based GT, so be conservative: only require
+    # prostate-cancer-directed entries when there's a prostate cancer
+    # signal in pathology or prior_diagnosis.
+    prostate_signal = (
+        "prostate" in (dx.get("primary_dx") or "").lower()
+        or "prostate" in (gt.pathology_text or "").lower()
+        or bool(gt.gleason_scores)
+    )
+    pca_treatments = {"prostatectomy", "radiation", "brachytherapy",
+                      "focal-therapy", "ADT"}
+    if prostate_signal:
+        missing_pca = missing_oncologic & pca_treatments
+        if missing_pca:
+            errors.append(FactValidationError(
+                "treatment_history", "TREATMENT_HISTORY_MISSING_KEY_MODALITY",
+                f"PSH/pathology confirms the patient is s/p "
+                f"{sorted(missing_pca)!r} but treatment_history omits "
+                f"it. Add an entry with status='completed' and the "
+                f"appropriate modality.",
+                expected=sorted(missing_pca),
+            ))
 
 
 def validate_facts(draft: Dict, gt: GroundTruth) -> List[FactValidationError]:
@@ -577,7 +629,7 @@ def validate_facts(draft: Dict, gt: GroundTruth) -> List[FactValidationError]:
     _validate_procedure_findings(draft.get("procedure_findings") or [], gt, errors)
     _validate_current_regimen(draft.get("current_regimen") or [], gt, errors)
     # Cross-section internal consistency (visit_reason vs the rest)
-    _validate_visit_reason_consistency(draft, errors)
+    _validate_visit_reason_consistency(draft, gt, errors)
     return errors
 
 

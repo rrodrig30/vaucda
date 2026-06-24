@@ -173,6 +173,19 @@ _RUBRIC_LEAK_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Trailing self-evaluation sentences the LLM emits about the narrative
+# style/structure rather than the patient. Distinctive subject phrasing
+# ("The narrative", "The HPI", "This narrative", "This HPI") + a
+# self-descriptive predicate. Strip from the first such sentence
+# onward.
+_RUBRIC_NARRATIVE_RE = re.compile(
+    r"\.?\s+(?:The|This)\s+(?:narrative|HPI|note|summary)\s+"
+    r"(?:is\s+written|has\s+been\s+(?:written|composed|structured)|"
+    r"follows|adheres|maintains|uses|reflects|incorporates)\b"
+    r".*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # Trailing "I hope this..." / "Hope this..." closing remarks the LLM
 # emits as a polite sign-off after the rubric leak. Truncation often
 # leaves bare "I hope" with no terminal punctuation.
@@ -184,18 +197,34 @@ _TRAILING_SIGNOFF_RE = re.compile(
 
 
 def _strip_rubric_leak(text: str) -> str:
-    """Truncate at first rubric-label echo (e.g. "Non-redundancy:").
+    """Truncate at first rubric-label echo (e.g. "Non-redundancy:")
+    or self-descriptive sentence about the narrative ("The narrative
+    is written in a fluent and coherent manner...").
 
-    These labels never appear in real clinical narrative — they're the
-    LLM regurgitating sections from its instruction rubric as a
-    self-evaluation block. Everything from the first label onwards is
-    meta-commentary and must be removed.
+    These never appear in real clinical narrative — they're the LLM
+    regurgitating sections from its instruction rubric or
+    self-evaluating its own output. Everything from the first match
+    onwards is meta-commentary and must be removed.
     """
     if not text:
         return text
-    m = _RUBRIC_LEAK_LABEL_RE.search(text)
-    if m:
-        text = text[:m.start()].rstrip()
+    # Find earliest match of either pattern
+    label_m = _RUBRIC_LEAK_LABEL_RE.search(text)
+    narrative_m = _RUBRIC_NARRATIVE_RE.search(text)
+    cut = None
+    if label_m and narrative_m:
+        cut = min(label_m.start(), narrative_m.start())
+    elif label_m:
+        cut = label_m.start()
+    elif narrative_m:
+        cut = narrative_m.start()
+    if cut is not None:
+        text = text[:cut].rstrip()
+        # Ensure the surviving text ends in a period (the narrative
+        # match starts with optional ".\s" — when present we want to
+        # keep that period as terminal punctuation).
+        if text and text[-1] not in '.!?':
+            text += '.'
     # Strip any trailing polite sign-off ("I hope this helps.")
     text = _TRAILING_SIGNOFF_RE.sub('', text).rstrip()
     return text

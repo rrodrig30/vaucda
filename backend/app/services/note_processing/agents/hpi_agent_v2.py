@@ -227,15 +227,24 @@ def build_ground_truth(
 ) -> GroundTruth:
     """Build a GroundTruth from existing-extractor outputs."""
     gleasons, ggs = _extract_gleason_grade_groups(pathology_text)
+    confirmed = _extract_confirmed_modalities(psh_text, pathology_text, pmh_text)
+    # treatment_naive can be wrong when the patient-status-facts agent
+    # misclassifies a post-treatment patient (Woods: s/p IMRT 2015 per
+    # PSH but pf.treatment_naive=True). When confirmed_treatment_modalities
+    # contains any cancer-directed treatment, force treatment_naive=False
+    # so the prompt doesn't tell the LLM the opposite of the GT.
+    ONCOLOGIC = {"prostatectomy", "radiation", "brachytherapy",
+                 "focal-therapy", "ADT", "chemotherapy", "nephrectomy",
+                 "cystectomy"}
+    if confirmed & ONCOLOGIC:
+        treatment_naive = False
     return GroundTruth(
         name=patient_name,
         age=int(patient_age) if patient_age else 0,
         sex=patient_sex.lower() if patient_sex else "",
         visit_date=visit_date,
         psa_entries=_extract_psa_entries(psa_data),
-        confirmed_treatment_modalities=_extract_confirmed_modalities(
-            psh_text, pathology_text, pmh_text,
-        ),
+        confirmed_treatment_modalities=confirmed,
         treatment_naive=treatment_naive,
         pathology_text=pathology_text or "",
         gleason_scores=gleasons,
