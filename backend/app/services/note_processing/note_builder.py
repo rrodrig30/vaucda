@@ -805,6 +805,15 @@ def build_urology_note(
                 imaging_text=_doc_imaging or "",
                 procedure_findings=(_hpi_pf.procedure_findings if _hpi_pf else []),
                 treatment_naive=(_hpi_pf.treatment_naive if _hpi_pf else True),
+                # Treatment course already assembled by patient_status_facts.
+                # The structured PSH/MEDS/PATH extractors return empty on
+                # narrative oncology-consult inputs; these fields are what
+                # keep the HPI from collapsing to a "new patient" stub.
+                clinical_timeline=(_hpi_pf.clinical_timeline if _hpi_pf else []),
+                current_active_treatments=(_hpi_pf.current_active_treatments if _hpi_pf else []),
+                confirmed_urologic_treatments=(_hpi_pf.confirmed_urologic_treatments if _hpi_pf else []),
+                cancer_status=(_hpi_pf.cancer_status if _hpi_pf else ""),
+                narrative_text=(clinical_document or ""),
             )
             result = generate_hpi_v2(gt, _llm_call, max_retries=2,
                                      v1_fallback_text=v1_text)

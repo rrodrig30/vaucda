@@ -57,6 +57,22 @@ class GroundTruth:
     confirmed_treatment_modalities: Set[str] = field(default_factory=set)
     treatment_naive: bool = True
 
+    # Narrative treatment course derived from patient_status_facts /
+    # clinical_timeline. These exist precisely because the structured
+    # PSH/MEDS/PATH extractors return EMPTY on narrative oncology-consult
+    # inputs; without them the v2 HPI collapses a heavily-treated patient
+    # to a "new patient" stub. Readable dated events, e.g.
+    # "2008: prostatectomy (completed)".
+    treatment_timeline: List[str] = field(default_factory=list)
+    # Currently-active systemic/local therapies (e.g. ["abiraterone", "leuprolide"]).
+    current_active_treatments: List[str] = field(default_factory=list)
+    # Authoritative cancer status from PatientStatusFacts
+    # ("TREATED" / "ACTIVE" / "NED" / "TREATMENT_NAIVE" / ...).
+    cancer_status: str = ""
+    # Source narrative text (sanitized) so the fact validator can verify
+    # treatments that are documented in prose rather than structured sections.
+    narrative_text: str = ""
+
     # Pathology
     pathology_text: str = ""  # raw PATHOLOGY section text
     gleason_scores: Set[str] = field(default_factory=set)  # {"3+3", "3+4", ...}
@@ -279,7 +295,17 @@ def _validate_treatment_history(events: List[Dict], gt: GroundTruth,
                                 errors: List[FactValidationError]) -> None:
     if not events:
         return
-    truth_lc = (gt.psh_text + "\n" + gt.pathology_text + "\n" + gt.pmh_text).lower()
+    # Include narrative + derived treatment timeline so treatments documented
+    # in prose (not just structured PSH/PATH/PMH) can be verified. Without
+    # this, a treated patient's prostatectomy/radiation/ADT — captured by
+    # patient_status_facts but absent from the empty structured sections —
+    # would be wrongly rejected as TREATMENT_UNSUPPORTED.
+    truth_lc = (
+        gt.psh_text + "\n" + gt.pathology_text + "\n" + gt.pmh_text + "\n"
+        + "\n".join(gt.treatment_timeline) + "\n"
+        + "\n".join(gt.current_active_treatments) + "\n"
+        + gt.narrative_text
+    ).lower()
     for i, evt in enumerate(events):
         modality = evt.get("modality", "")
         status = evt.get("status", "")

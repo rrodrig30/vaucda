@@ -17,6 +17,7 @@ Renderer guarantees:
 """
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Any
 
 
@@ -243,15 +244,20 @@ def render_psa_trajectory(psa: Optional[Dict]) -> str:
         "stable": "remains stable at",
         "fluctuating": "has fluctuated, most recently at",
     }.get(direction, "is")
-    if direction in ("stable", "fluctuating"):
+    has_prior = psa.get("prior_value") is not None
+    if not has_prior:
+        # Only one PSA value — a direction word ("remains stable",
+        # "increased") falsely implies a comparison and contradicts the
+        # Assessment (HOLES: HPI "remains stable at 93.36" vs Assessment
+        # "markedly elevated"). State the value without a trend.
+        sentence = f"Most recent PSA {current_v} ng/mL ({current_d})."
+    elif direction in ("stable", "fluctuating"):
         sentence = f"PSA {direction_verb} {current_v} ng/mL ({current_d})."
-    elif psa.get("prior_value") is not None:
+    else:
         prior_v = psa["prior_value"]
         prior_d = _format_date(psa.get("prior_date"))
         sentence = (f"PSA {direction_verb} from {prior_v} ng/mL "
                     f"({prior_d}) to {current_v} ng/mL ({current_d}).")
-    else:
-        sentence = f"Most recent PSA {current_v} ng/mL ({current_d})."
     # Optional peak context
     if (psa.get("peak_value") is not None
             and psa.get("peak_value") != current_v
@@ -334,11 +340,29 @@ def render_interval_status(interval: Optional[Dict], sex: str) -> str:
     return ". ".join(parts) + "."
 
 
+# Lead-in phrases the LLM commonly prefixes onto today_reason. Stripped so
+# the rendered "Today's visit is for ..." sentence doesn't double up into
+# "Today's visit is for The patient presents for ...".
+_TODAY_REASON_LEADIN_RE = re.compile(
+    r"^(?:the\s+patient\s+|he\s+|she\s+|patient\s+)?"
+    r"(?:presents?|is\s+here|is\s+seen|returns?|comes?\s+in|is\s+being\s+seen)"
+    r"(?:\s+today)?\s+(?:for|to|with)\s+",
+    re.IGNORECASE,
+)
+
+
 def render_today_reason(today_reason: Optional[str]) -> str:
     """Final sentence stating reason for today's visit."""
     if not today_reason or not today_reason.strip():
         return ""
     reason = today_reason.strip().rstrip(".")
+    # Drop a redundant "The patient presents for"/"returns for"/etc. lead-in
+    # so it doesn't concatenate with our "Today's visit is for" stem.
+    reason = _TODAY_REASON_LEADIN_RE.sub("", reason).strip()
+    # Also drop a bare leading "for " left after partial matches.
+    reason = re.sub(r"^for\s+", "", reason, flags=re.IGNORECASE).strip()
+    if not reason:
+        return ""
     return f"Today's visit is for {reason}."
 
 

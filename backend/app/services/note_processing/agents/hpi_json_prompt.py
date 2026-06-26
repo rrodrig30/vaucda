@@ -127,14 +127,46 @@ def _ground_truth_block(gt: GroundTruth) -> str:
         lines.append("")
     if gt.confirmed_treatment_modalities:
         lines.append(
-            f"CONFIRMED PRIOR TREATMENTS (from PSH/pathology — only these "
-            f"may be cited as 'completed' / 'ongoing'):"
+            f"CONFIRMED PRIOR TREATMENTS (from PSH/pathology/timeline — only "
+            f"these may be cited as 'completed' / 'ongoing'):"
         )
         for m in sorted(gt.confirmed_treatment_modalities):
             lines.append(f"  - {m}")
         lines.append("")
-    else:
+    elif gt.treatment_naive:
         lines.append("CONFIRMED PRIOR TREATMENTS: (none — patient is treatment-naive)")
+        lines.append("")
+    else:
+        # Treated patient whose specific modalities didn't map to the
+        # canonical vocabulary. Do NOT tell the LLM the patient is
+        # treatment-naive — that is the bug that collapsed treated
+        # patients to a "new patient" HPI. The timeline below carries
+        # the detail.
+        lines.append(
+            "CONFIRMED PRIOR TREATMENTS: this patient HAS been treated "
+            "(NOT treatment-naive)"
+            + (f" — cancer status: {gt.cancer_status}" if gt.cancer_status else "")
+            + ". Narrate the treatment course from the TREATMENT TIMELINE below."
+        )
+        lines.append("")
+    # Treatment / diagnosis timeline assembled from the clinical record.
+    # This is the primary anchor for the HPI's disease-course narrative on
+    # narrative oncology inputs where structured sections are empty.
+    if gt.treatment_timeline:
+        lines.append(
+            "TREATMENT / DIAGNOSIS TIMELINE (oldest→newest as documented; "
+            "narrate the disease course from these events — do NOT omit the "
+            "treatment history):"
+        )
+        for line in gt.treatment_timeline[:40]:
+            lines.append(f"  - {line}")
+        lines.append("")
+    if gt.current_active_treatments:
+        lines.append(
+            "CURRENTLY ACTIVE TREATMENTS (the patient is presently on these):"
+        )
+        for t in gt.current_active_treatments[:20]:
+            lines.append(f"  - {t}")
         lines.append("")
     if gt.gleason_scores or gt.grade_groups:
         lines.append("PATHOLOGY FACTS:")

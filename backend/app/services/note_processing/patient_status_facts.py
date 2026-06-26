@@ -513,6 +513,37 @@ _ADT_ACTIVE_RE = re.compile(
 )
 
 
+_ADT_CLASS_TOKENS = (
+    "eligard", "leuprolide", "lupron", "degarelix", "goserelin", "zoladex",
+    "zoladez", "relugolix", "orgovyx", "firmagon", "abiraterone", "zytiga",
+    "enzalutamide", "xtandi", "apalutamide", "erleada", "darolutamide",
+    "nubeqa", "bicalutamide", "casodex",
+)
+_CHEMO_CLASS_TOKENS = ("docetaxel", "cabazitaxel", "taxotere", "jevtana")
+
+
+def _drop_meds_for_inactive_category(
+    active_meds: List[str], status: Dict[str, str],
+) -> List[str]:
+    """Drop ADT/chemo-class drugs from the active-med list when the
+    category-level status detector marked that class DISCONTINUED/COMPLETED."""
+    if not active_meds or not status:
+        return active_meds
+    adt_inactive = status.get("adt") in ("DISCONTINUED", "COMPLETED")
+    chemo_inactive = status.get("chemo") in ("DISCONTINUED", "COMPLETED")
+    if not (adt_inactive or chemo_inactive):
+        return active_meds
+    kept: List[str] = []
+    for med in active_meds:
+        ml = med.lower()
+        if adt_inactive and any(t in ml for t in _ADT_CLASS_TOKENS):
+            continue
+        if chemo_inactive and any(t in ml for t in _CHEMO_CLASS_TOKENS):
+            continue
+        kept.append(med)
+    return kept
+
+
 def _detect_treatment_active_status(
     raw_text: str,
     confirmed_treatments: Optional[List[str]] = None,
@@ -841,6 +872,12 @@ def extract_patient_status_facts(
         timeline = extract_clinical_timeline(raw_for_timeline)
         current_phase = classify_current_phase(timeline)
         active_meds = detect_current_active_treatments(raw_for_timeline)
+        # Category-level reconciliation: if the status detector concluded an
+        # ADT/chemo class is no longer active (e.g. "completed ADT course" —
+        # phrasing the per-med strong-verb filter intentionally skips), drop
+        # those drugs from the "currently active" list so the Plan does not
+        # recommend continuing a finished treatment.
+        active_meds = _drop_meds_for_inactive_category(active_meds, treatment_active)
         proc_findings = extract_procedure_findings(raw_for_timeline)
 
     return PatientStatusFacts(

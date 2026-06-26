@@ -925,6 +925,126 @@ def extract_psa_trajectory(raw_text: str) -> List[Tuple[str, str, float]]:
 # ---------------------------------------------------------------------------
 # Master extractor
 # ---------------------------------------------------------------------------
+# Named oncologic agents / discrete procedures for which a dated mention in
+# a prostate-cancer context is sufficient evidence of a real treatment event
+# — NO started/completed trigger verb required. This is what catches the
+# numbered "Treatment." narrative lists in oncology consults that the
+# trigger-gated _find_treatment_events misses. Generic words
+# ("radiation therapy", bare "ADT") stay on the trigger-gated path to avoid
+# false positives from planning / discussion language. The 3rd field forces
+# a status for one-time procedures (always COMPLETED if dated in the past).
+_TX_NAMED_VOCAB = (
+    (r"radical\s+(?:retropubic\s+)?prostatectomy|\bprostatectomy\b|\bRALP\b|\bRARP\b|\bRRP\b",
+     "prostatectomy", "COMPLETED"),
+    (r"external\s+beam\s+radiation|radiation\s+therapy|\bEBRT\b|\bIMRT\b|\bSBRT\b|\bXRT\b|\bIGRT\b|radiotherapy",
+     "radiation therapy", None),
+    (r"androgen\s+deprivation(?:\s+therapy)?|\bADT\b", "ADT", None),
+    (r"\bbrachytherapy\b|seed\s+implant", "brachytherapy", "COMPLETED"),
+    (r"\babiraterone\b|\bZytiga\b", "abiraterone", None),
+    (r"\benzalutamide\b|\bXtandi\b", "enzalutamide", None),
+    (r"\bapalutamide\b|apaluatimide|\bErleada\b", "apalutamide", None),
+    (r"\bdarolutamide\b|\bNubeqa\b", "darolutamide", None),
+    (r"\bbicalutamide\b|\bCasodex\b", "bicalutamide", None),
+    (r"\b(?:Lupron|Eligard|leuprolide|degarelix|goserelin|relugolix|Firmagon|Orgovyx)\b",
+     "Eligard / leuprolide", None),
+    (r"\bdocetaxel\b|\bcabazitaxel\b|\bTaxotere\b|\bJevtana\b", "chemotherapy", None),
+    (r"\bsipuleucel(?:-T)?\b|\bProvenge\b", "Provenge", "COMPLETED"),
+    (r"\bradium[\s\-]?223\b|\bXofigo\b", "Ra-223", "COMPLETED"),
+    (r"\b(?:177\s*Lu|Lu[\s\-]?177|Lutetium[\s\-]?177|Pluvicto)\b", "Lu-177 PSMA", "COMPLETED"),
+)
+
+# Local context that forces a COMPLETED classification for the otherwise
+# ambiguous named drugs (no forced status). E.g. "Abiraterone April 2019 -
+# dcd December 2021", "Docetaxel ... -November 2022".
+# Strong, treatment-specific completion signals only. Deliberately EXCLUDES
+# "until"/"through" — in these narratives those usually qualify a PSA value
+# ("PSA stable until Jul 2014"), not treatment completion, and were
+# mislabeling ongoing ADT as completed.
+_COMPLETED_CTX_RE = re.compile(
+    r"complet|stopped|\bd/?c'?d\b|\bdcd\b|discontinu|finished|\bs/?p\b|status\s+post|"
+    r"ceased|off\s+therapy",
+    re.IGNORECASE,
+)
+
+
+def _iter_numbered_items(raw_text: str):
+    """Yield (item_text, offset) for each item in a numbered list
+    ("1. ...", "2. ...") anywhere in the document.
+
+    Item boundaries are the NEXT numbered-line marker, so adjacent
+    list lines (no blank line between them — the norm in these
+    oncology 'Treatment' lists) are split correctly. The final item is
+    cut at the first blank line (section break) so it doesn't run away
+    into the following paragraph.
+    """
+    matches = list(re.finditer(r"(?m)^[ \t]*\d{1,3}\.\s+", raw_text))
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw_text)
+        item = raw_text[start:end]
+        cut = item.find("\n\n")
+        if cut != -1:
+            item = item[:cut]
+        yield item, start
+
+
+def _first_date_after(item_text: str, pos: int):
+    """First parseable date at/after `pos` within the item, else first
+    date anywhere in the item. Returns (date_key, date_display) or None."""
+    return (_date_in_window(item_text, pos, window=len(item_text) + 1)
+            or _date_in_window(item_text, 0, window=len(item_text) + 1))
+
+
+def _extract_narrative_treatment_list(raw_text: str) -> List[TimelineEvent]:
+    """Catch named oncologic treatments documented in narrative HPI
+    'Treatment' lists where the trigger-verb-gated extractor fails.
+
+    Parses NUMBERED list items so each treatment is anchored to the date
+    in ITS OWN item — not a date that happens to be nearby in a dense
+    list or a later summary sentence. A named agent/procedure (from
+    _TX_NAMED_VOCAB) in a prostate-cancer context, not negated, is taken
+    as a real treatment event.
+    """
+    events: List[TimelineEvent] = []
+    seen = set()
+    for item_text, item_offset in _iter_numbered_items(raw_text):
+        for tx_pattern, tx_display, forced_status in _TX_NAMED_VOCAB:
+            m = re.search(tx_pattern, item_text, re.IGNORECASE)
+            if not m:
+                continue
+            if _preceded_by_negation(item_text, m.start()):
+                continue
+            # prostate-cancer context evaluated against the full document
+            # at this item's location. Use a wide window: a numbered
+            # treatment list spans hundreds of chars and the prostate
+            # anchor (item 1 "prostatectomy", or "PSMA Therapy for
+            # Prostate Cancer") may be far from a middle item.
+            if not _in_prostate_context(raw_text, item_offset + m.start(),
+                                        window=2000):
+                continue
+            d = _first_date_after(item_text, m.end())
+            if not d:
+                continue
+            date_key, date_display = d
+            if forced_status:
+                etype = "TREATMENT_" + forced_status
+            else:
+                etype = ("TREATMENT_COMPLETED"
+                         if _COMPLETED_CTX_RE.search(item_text)
+                         else "TREATMENT_STARTED")
+            key = (date_key, tx_display.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            detail = re.sub(r"\s+", " ", item_text).strip()
+            events.append(TimelineEvent(
+                date_key=date_key, date_display=date_display,
+                event_type=etype, modality=tx_display,
+                detail=detail[:140], source_quote=detail[:200],
+            ))
+    return events
+
+
 def extract_clinical_timeline(
     raw_text: str,
     today: Optional[date] = None,
@@ -940,9 +1060,53 @@ def extract_clinical_timeline(
     events += _find_treatment_events(raw_text, _COMPLETION_TRIGGERS, "TREATMENT_COMPLETED")
     events += _find_treatment_events(raw_text, _RESTART_TRIGGERS, "TREATMENT_RESTARTED")
     events += _find_treatment_events(raw_text, _DECLINE_TRIGGERS, "TREATMENT_DECLINED")
+    narrative_tx = _extract_narrative_treatment_list(raw_text)
+    events += narrative_tx
     events += _extract_pathology_events(raw_text)
     events += _extract_imaging_events(raw_text)
     events += _extract_staging_events(raw_text)
+
+    # The narrative numbered-list parser anchors each treatment to the date
+    # in its own item; the trigger-gated _find_treatment_events uses fuzzy
+    # char windows and garbles dense lists (grabbing a neighbor's date or
+    # spanning items). When the narrative parser found a modality, treat it
+    # as authoritative: drop trigger-gated events for that SAME modality so
+    # the wrong-date duplicate doesn't survive.
+    _narrative_modalities = {e.modality.lower() for e in narrative_tx if e.modality}
+
+    # Dedup treatment events by (date, modality); prefer the more definitive
+    # status (COMPLETED/RESTARTED over STARTED) for the same modality+date.
+    _TX_PRIORITY = {"TREATMENT_COMPLETED": 3, "TREATMENT_RESTARTED": 3,
+                    "TREATMENT_DECLINED": 2, "TREATMENT_STARTED": 1}
+    _best: dict = {}
+    _passthrough: List[TimelineEvent] = []
+    _dx_best: dict = {}
+    _narrative_ids = {id(e) for e in narrative_tx}
+    for e in events:
+        if e.event_type.startswith("TREATMENT_") and e.modality:
+            mod = e.modality.lower()
+            # Suppress trigger-gated events for modalities the narrative
+            # parser already covers authoritatively.
+            if mod in _narrative_modalities and id(e) not in _narrative_ids:
+                continue
+            k = (e.date_key, mod)
+            cur = _best.get(k)
+            if cur is None or _TX_PRIORITY.get(e.event_type, 0) > _TX_PRIORITY.get(cur.event_type, 0):
+                _best[k] = e
+        elif e.event_type == "DIAGNOSIS" and e.modality:
+            # A cancer is diagnosed ONCE. The extractor emits a DIAGNOSIS
+            # event every time "<cancer> diagnosed" appears near a date —
+            # including later encounter/note dates — which lets the HPI pick
+            # a recent encounter date (EVERETT: "diagnosed Nov 26 2025")
+            # instead of the true diagnosis (2023). Keep only the EARLIEST
+            # date per cancer modality.
+            mod = e.modality.lower()
+            cur = _dx_best.get(mod)
+            if cur is None or (e.date_key or "9999") < (cur.date_key or "9999"):
+                _dx_best[mod] = e
+        else:
+            _passthrough.append(e)
+    events = _passthrough + list(_best.values()) + list(_dx_best.values())
 
     # PROCEDURE events from the findings extractor
     for pf in extract_procedure_findings(raw_text):
@@ -1063,6 +1227,31 @@ _ONCOLOGIC_MED_HINTS = (
 )
 
 
+# Strong, unambiguous discontinuation verbs. Deliberately EXCLUDES bare
+# "completed" (a chemo CYCLE can be "completed" while the drug continues) —
+# the goal is to stop the Plan from saying "Continue abiraterone" when the
+# narrative says the patient STOPPED it, without falsely dropping a drug the
+# patient is still on.
+_MED_DISCONT_VERB = (
+    r"(?:stop(?:ped|ping)?|discontinu\w+|\bd/?c'?d\b|\bdc'?d\b|held|"
+    r"no\s+longer\s+(?:on|taking|using)|taken\s+off|came\s+off|"
+    r"\boff\s+(?:of\s+)?(?:the\s+)?|ceased|declined|elected\s+to\s+stop)"
+)
+
+
+def _drug_discontinued_in_narrative(drug: str, text_lc: str) -> bool:
+    """True if the narrative explicitly says `drug` was stopped/discontinued.
+    Checks both verb→drug ("stopped abiraterone") and drug→verb
+    ("abiraterone was discontinued") within a short window."""
+    d = re.escape(drug)
+    if re.search(_MED_DISCONT_VERB + r"\s+(?:\w+[\s,]+){0,4}?" + d, text_lc):
+        return True
+    if re.search(d + r"\b[^.\n]{0,40}?\b(?:was\s+|is\s+|been\s+|now\s+)?"
+                 + _MED_DISCONT_VERB, text_lc):
+        return True
+    return False
+
+
 def detect_current_active_treatments(raw_text: str) -> List[str]:
     """Return a short list of meds the patient is currently taking, anchored
     to the most-recent medications list block in the source.
@@ -1070,9 +1259,16 @@ def detect_current_active_treatments(raw_text: str) -> List[str]:
     Without this, the HPI/Plan agents have only an unordered set of "drugs
     mentioned somewhere" and can flip-flop on whether the patient is still
     on ADT (which is the Ketnick failure mode).
+
+    Reconciliation: the structured "Active Outpatient Medications" list lags
+    the clinical narrative — it can still list abiraterone/finasteride after
+    the clinician documented stopping it, causing the Plan to recommend
+    CONTINUING a discontinued drug. Drugs the narrative explicitly says were
+    stopped are filtered out here.
     """
     if not raw_text:
         return []
+    text_lc = raw_text.lower()
     out: List[str] = []
     seen = set()
     for m in _MED_LIST_HEADER_RE.finditer(raw_text):
@@ -1085,6 +1281,12 @@ def detect_current_active_treatments(raw_text: str) -> List[str]:
             line_l = line.lower()
             for hint in _ONCOLOGIC_MED_HINTS:
                 if hint in line_l:
+                    # Skip a drug the narrative says was stopped. Supplements
+                    # (calcium/vitamin d) and bare prednisone are not gated —
+                    # they are low-stakes and prednisone tracks its partner drug.
+                    if hint not in ("calcium", "vitamin d", "prednisone") \
+                            and _drug_discontinued_in_narrative(hint, text_lc):
+                        break
                     quote = re.sub(r"\s+", " ", line).strip()
                     if quote and quote not in seen:
                         seen.add(quote)
