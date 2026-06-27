@@ -8,8 +8,8 @@ free-text correction box per note. NO JSON editing. A "Download review" button
 saves your verdicts; re-run apply_review.py to fold them into the labels.
 
 Usage:
-  ./venv/bin/python scripts/l1/review_report.py <gold_dir>
-  # opens tests/l1_gold/review.html
+  ./venv/bin/python scripts/l1/review_report.py <gold_dir>                 # all
+  ./venv/bin/python scripts/l1/review_report.py <gold_dir> --out review_sample.html <id1> <id2>
 """
 import html
 import json
@@ -125,9 +125,21 @@ window.onload=prog;
 
 def main():
     gold = Path(sys.argv[1])
+    argv = sys.argv[2:]
+    out_name = "review.html"
+    if "--out" in argv:
+        i = argv.index("--out")
+        out_name = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    only_ids = set(argv) or None
+
     seg_dir, lab_dir = gold / "segments", gold / "labels"
     cards = []
-    for lab_p in sorted(lab_dir.glob("*.json")):
+    label_files = ([lab_dir / f"{i}.json" for i in argv]
+                   if only_ids else sorted(lab_dir.glob("*.json")))
+    for lab_p in label_files:
+        if not lab_p.exists():
+            continue
         sid = lab_p.stem
         lab = json.loads(lab_p.read_text())
         text = (seg_dir / f"{sid}.txt").read_text(errors="ignore") if (seg_dir / f"{sid}.txt").exists() else ""
@@ -155,7 +167,7 @@ def main():
 <span id=prog></span></header>
 {''.join(cards)}
 <script>{JS}</script>"""
-    out = gold / "review.html"
+    out = gold / out_name
     out.write_text(doc)
     print(f"wrote {out}  ({len(cards)} notes)")
     print(f"open it in a browser:  file://{out.resolve()}")
