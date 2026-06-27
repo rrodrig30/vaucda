@@ -159,10 +159,42 @@ documenting the encounter.
 """
 
 
+def build_authoritative_patient_facts(
+    clinical_text: str,
+    source_format: str = "cprs",
+):
+    """Compute the SINGLE authoritative ``PatientStatusFacts`` from the raw
+    clinical document, the same way Stage 1's HPI defense layer does.
+
+    Phase 1 (shared-facts architecture): both ``build_urology_note`` (Stage 1)
+    and ``build_stage2_note`` (Stage 2 Assessment/Plan) must consume this
+    identical object. Previously each stage re-derived facts from a different
+    input — Stage 2 grounded on the *rendered* Stage-1 note (itself
+    LLM-generated), letting the Assessment invent a divergent set of
+    dates/treatments/status. Computing once, from the raw source, kills that
+    class of Stage-1↔Stage-2 contradiction and Stage-2 hallucination.
+    """
+    try:
+        from .source_normalizers import normalize_to_cprs
+        normalized = normalize_to_cprs(clinical_text, source_format) or clinical_text
+    except Exception:
+        normalized = clinical_text
+    _pmh = extract_pmh(normalized) or ""
+    _psh = extract_psh(normalized) or ""
+    _path = extract_pathology(normalized) or ""
+    stub = (
+        "PAST MEDICAL HISTORY:\n" + _pmh + "\n\n"
+        "PAST SURGICAL HISTORY:\n" + _psh + "\n\n"
+        "PATHOLOGY RESULTS:\n" + _path + "\n"
+    )
+    return extract_patient_status_facts(stub, raw_clinical_text=normalized)
+
+
 def build_urology_note(
     clinical_text: str,
     task_config: Optional["LLMTaskConfig"] = None,
     source_format: str = "cprs",
+    patient_facts: Optional["PatientStatusFacts"] = None,
 ) -> str:
     """
     Build a comprehensive urology clinic note from a clinical document.
@@ -330,10 +362,16 @@ def build_urology_note(
     # text — the most common shape for radiation and ADT histories. The
     # raw scanner is gated by strict prostate-cancer co-occurrence rules
     # so dermatology cryotherapy etc. cannot trip it.
-    _hpi_patient_facts = extract_patient_status_facts(
-        _deterministic_stub_for_hpi,
-        raw_clinical_text=clinical_document,
-    )
+    # Phase 1: prefer the shared authoritative facts passed by the caller so
+    # Stage 1 and Stage 2 ground on the IDENTICAL object. Fall back to the
+    # inline computation when called standalone (backward compatible).
+    if patient_facts is not None:
+        _hpi_patient_facts = patient_facts
+    else:
+        _hpi_patient_facts = extract_patient_status_facts(
+            _deterministic_stub_for_hpi,
+            raw_clinical_text=clinical_document,
+        )
     _hpi_authoritative_facts = format_facts_for_prompt(_hpi_patient_facts)
     print(f"      Patient facts (for HPI): cancer={_hpi_patient_facts.cancer_status}, "
           f"naive={_hpi_patient_facts.treatment_naive}, "

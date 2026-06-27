@@ -511,6 +511,28 @@ _ADT_ACTIVE_RE = re.compile(
     r"(?:ADT|androgen\s+deprivation|Lupron|Eligard|leuprolide|degarelix)",
     re.IGNORECASE,
 )
+# A FINITE oncologic course that has reached its end. "completed" (not just
+# "stopped/discontinued") is the phrasing the verb-based detectors miss, and
+# it is the dominant context-blind-recommendation driver once both stages
+# share these facts: the Plan is told to "continue Eligard" because a finished
+# fixed course still looks active.
+_ADT_FINITE_COMPLETED_RE = re.compile(
+    r"(?:completed|finished|received\s+all\s+of)\s+(?:his\s+|her\s+|the\s+|a\s+|an\s+)?"
+    r"(?:\d+[-\s]?(?:year|yr|month|mo)s?|planned|prescribed|"
+    r"\d+\s*(?:of|/)\s*\d+\s*(?:dose|injection|shot|cycle))"
+    r"[^.\n]{0,40}?(?:course|therapy|ADT|androgen\s+deprivation|"
+    r"leuprolide|lupron|eligard|goserelin|zoladex|degarelix|"
+    r"abiraterone|enzalutamide|apalutamide|darolutamide)"
+    r"|(?:final|last)\s+(?:dose|injection|shot)\s+(?:of\s+)?"
+    r"(?:ADT|leuprolide|lupron|eligard|goserelin|zoladex|degarelix)",
+    re.IGNORECASE,
+)
+_ADT_TOKEN_RE = re.compile(
+    r"\b(?:ADT|androgen\s+deprivation|leuprolide|lupron|eligard|goserelin|"
+    r"zoladex|degarelix|relugolix|orgovyx|abiraterone|enzalutamide|"
+    r"apalutamide|darolutamide)\b",
+    re.IGNORECASE,
+)
 
 
 _ADT_CLASS_TOKENS = (
@@ -562,20 +584,21 @@ def _detect_treatment_active_status(
     out: Dict[str, str] = {}
     if not raw_text:
         return out
-    if not confirmed_treatments:
-        return out
-    joined = "\n".join(confirmed_treatments).lower()
+    joined = "\n".join(confirmed_treatments).lower() if confirmed_treatments else ""
 
-    # ADT — explicit discontinuation language dominates over active language.
-    # Only emit a verdict when a confirmed ADT-class treatment was detected.
-    if re.search(
+    _adt_in_confirmed = bool(re.search(
         r"\b(?:adt|androgen\s+deprivation|leuprolide|lupron|eligard|"
         r"degarelix|abiraterone|enzalutamide|apalutamide|darolutamide)\b",
         joined,
-    ):
+    ))
+    _adt_finite_completed = bool(_ADT_FINITE_COMPLETED_RE.search(raw_text))
+
+    # ADT — explicit discontinuation language dominates over active language.
+    if _adt_in_confirmed:
         has_adt_discontinued = bool(
             _ADT_DISCONTINUED_RE.search(raw_text)
             or _ADT_DISCONTINUED_BY_FOLLOWING_RE.search(raw_text)
+            or _adt_finite_completed
         )
         has_adt_active = bool(_ADT_ACTIVE_RE.search(raw_text))
         if has_adt_discontinued:
@@ -584,6 +607,13 @@ def _detect_treatment_active_status(
             out['adt'] = 'ACTIVE'
         else:
             out['adt'] = 'UNCERTAIN'
+    elif _adt_finite_completed and _ADT_TOKEN_RE.search(raw_text):
+        # Ungated SAFE-direction path: when confirmed_treatments missed the ADT
+        # (patient_status_facts misclassified a treated patient as naive), we
+        # still mark a FINITE-COMPLETED course as DISCONTINUED. We only emit in
+        # the completed direction here — never ACTIVE — so this cannot create a
+        # false "continue ADT" recommendation.
+        out['adt'] = 'DISCONTINUED'
 
     # One-time treatments — confirmed-list membership IS the COMPLETED signal.
     if re.search(
@@ -871,13 +901,13 @@ def extract_patient_status_facts(
         )
         timeline = extract_clinical_timeline(raw_for_timeline)
         current_phase = classify_current_phase(timeline)
+        # current_active_treatments now comes from the AUTHORITATIVE VistA
+        # RXOP active-outpatient list (see detect_current_active_treatments).
+        # That list is definitive for current meds, so we do NOT post-filter
+        # it by narrative treatment-status. (ADT/Eligard is handled separately
+        # via treatment_active_status because intermittent ADT is often absent
+        # from the active Rx list even when ongoing.)
         active_meds = detect_current_active_treatments(raw_for_timeline)
-        # Category-level reconciliation: if the status detector concluded an
-        # ADT/chemo class is no longer active (e.g. "completed ADT course" —
-        # phrasing the per-med strong-verb filter intentionally skips), drop
-        # those drugs from the "currently active" list so the Plan does not
-        # recommend continuing a finished treatment.
-        active_meds = _drop_meds_for_inactive_category(active_meds, treatment_active)
         proc_findings = extract_procedure_findings(raw_for_timeline)
 
     return PatientStatusFacts(
@@ -1097,10 +1127,23 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
         lines.append("CURRENT_ACTIVE_TREATMENTS (last-known-active per source):")
         for med in facts.current_active_treatments[:8]:
             lines.append(f"  - {med}")
+        # Differentiate CHRONIC meds (continue) from FINITE oncologic courses
+        # (do NOT auto-continue). The old blanket "MUST keep every med" forced
+        # the Plan to write "continue Eligard/abiraterone" even when the course
+        # was completed — the dominant context-blind-recommendation error once
+        # both stages share these facts.
         lines.append(
-            "  Note: the Plan MUST keep every continuing med listed above on "
-            "the patient's regimen unless the source explicitly documents "
-            "discontinuation."
+            "  Note: keep CHRONIC medications (BPH alpha-blockers / 5-ARIs, "
+            "supplements, etc.) on the regimen unless the source documents "
+            "discontinuation. But a FINITE oncologic course — LHRH-agonist "
+            "ADT (leuprolide/Eligard/goserelin/degarelix), an ARSI "
+            "(abiraterone/enzalutamide/apalutamide/darolutamide), or "
+            "chemotherapy — must NOT be auto-continued: consult "
+            "CURRENT_TREATMENT_STATUS and CLINICAL_TIMELINE. If that course is "
+            "completed/finite (e.g. 'completed a 2-year course', 'final/last "
+            "dose', a fixed number of injections/cycles delivered, or "
+            "CURRENT_TREATMENT_STATUS shows COMPLETED/DISCONTINUED), frame it "
+            "as COMPLETED and do NOT order its continuation."
         )
 
     if facts.clinical_timeline:

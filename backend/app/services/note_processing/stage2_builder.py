@@ -307,7 +307,8 @@ def build_stage2_note(
     note_type: str = "clinic_note",
     patient_name: Optional[str] = None,
     ssn_last4: Optional[str] = None,
-    task_config: Optional["LLMTaskConfig"] = None
+    task_config: Optional["LLMTaskConfig"] = None,
+    patient_facts: Optional["PatientStatusFacts"] = None,
 ) -> str:
     """
     Complete the clinical note by adding Assessment and Plan (Stage 2).
@@ -435,10 +436,19 @@ def build_stage2_note(
             if v:
                 _raw_for_facts_parts.append(v)
     _raw_for_facts = "\n\n".join(_raw_for_facts_parts)
-    patient_facts = extract_patient_status_facts(
-        stage1_note,
-        raw_clinical_text=_raw_for_facts or None,
-    )
+    # Phase 1: consume the SHARED authoritative facts from Stage 1 when
+    # provided. Re-deriving here from the rendered stage1_note (LLM output)
+    # let the Assessment ground on Stage-1 hallucinations and invent a
+    # divergent timeline/status — the dominant Stage-2 hallucination +
+    # contradiction source. Fall back to local derivation only when called
+    # standalone (no shared facts passed).
+    if patient_facts is not None:
+        print("      Using SHARED authoritative facts from Stage 1")
+    else:
+        patient_facts = extract_patient_status_facts(
+            stage1_note,
+            raw_clinical_text=_raw_for_facts or None,
+        )
     authoritative_facts = format_facts_for_prompt(patient_facts)
 
     # PHASE 2.1: rebuild the HPI skeleton at Stage 2 so the Assessment

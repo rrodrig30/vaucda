@@ -8,6 +8,44 @@ session.
 
 ---
 
+## 0. Update log — empirical findings since v1 (Phase 1 + facts-accuracy fixes)
+
+Three architectural/facts fixes were implemented and measured on Tumor-56
+after the original plan, and they sharpen the thesis:
+
+- **Phase 1 (shared authoritative facts object across Stage 1 & 2)** —
+  IMPLEMENTED. Hallucinations 87→73 and Assessment findings 104→90, but
+  context-blind recs rose 52→71 because both stages then propagate the facts
+  object's *errors* faithfully. This is the empirical proof of the plan's core
+  thesis: **shared facts is correct architecture and makes facts-accuracy the
+  rate-limiter.**
+- **treatment_active_status fix** (finite ADT course → completed) — recovered
+  10 of the 19 context-blind regression and pushed the aggregate to a new best
+  (total 395, critical 111).
+- **RXOP authoritative-medication fix** (read only the VistA OUTPT-RX-ACTIVE
+  list, not stale embedded med-rec blocks; Eligard/ADT exception) — the
+  *targeted* class fell decisively (MEDICATIONS findings 8→3; "continue the
+  wrong drug" context-blind 17→5 across the arc, −71%), and is clinically
+  correct per the urologist. See [[project-vista-medication-authority]].
+
+**Measurement finding (important):** the LLM-judge eval has run-to-run variance
+of ≈±20 on total / ±15-23 on HPI & context-blind (an *unchanged* HPI dimension
+ranged 140–163 across builds). That noise now EXCEEDS the per-fix signal, so
+single deterministic fixes can only be validated on their *targeted sub-class*,
+not the aggregate. Two consequences: (a) upgrade eval to **multi-run averaging
+or deterministic per-class checks** before more single fixes; (b) this is the
+strongest signal yet that the next real lever is **L1 (narrative extractor) —
+fix many classes at once**, because one-at-a-time deterministic fixing has
+reached diminishing returns relative to what we can measure.
+
+**Refined deterministic-vs-ML boundary (validated this session):** structured
+sources (RXOP meds, lab tables) → deterministic wins (RXOP fix); narrative
+(treatment course, dates-in-prose, staging, risk) → L1 ML extractor; clinical
+decision logic (Eligard intermittency, screening cessation) → deterministic
+rules + domain knowledge, NOT a black box; verification → L3 NLI gate.
+
+---
+
 ## 1. Executive summary
 
 Three rounds of root-cause fixes on the 56-patient Tumor-clinic test set cut

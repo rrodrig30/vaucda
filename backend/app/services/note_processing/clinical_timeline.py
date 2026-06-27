@@ -1252,47 +1252,67 @@ def _drug_discontinued_in_narrative(drug: str, text_lc: str) -> bool:
     return False
 
 
+def _scan_block_for_meds(block: str) -> List[str]:
+    """Pull oncologic / urologic med lines out of one medication block."""
+    out: List[str] = []
+    seen = set()
+    for line in block.split("\n"):
+        line_l = line.lower()
+        for hint in _ONCOLOGIC_MED_HINTS:
+            if hint in line_l:
+                quote = re.sub(r"\s+", " ", line).strip()
+                if quote and quote not in seen:
+                    seen.add(quote)
+                    out.append(quote[:160])
+                break
+    return out
+
+
 def detect_current_active_treatments(raw_text: str) -> List[str]:
-    """Return a short list of meds the patient is currently taking, anchored
-    to the most-recent medications list block in the source.
+    """Return the patient's CURRENT medications from the AUTHORITATIVE VistA
+    RXOP active-outpatient list (rendered by the normalizer with
+    ``RXOP_AUTHORITATIVE_SENTINEL``).
 
-    Without this, the HPI/Plan agents have only an unordered set of "drugs
-    mentioned somewhere" and can flip-flop on whether the patient is still
-    on ADT (which is the Ketnick failure mode).
+    The VistA "OUTPT RX-ACTIVE ONLY" list is the active meds AS OF COLLECTION
+    and is authoritative above all other sources. We read ONLY that block —
+    NOT the stale "Active Outpatient Medications" med-reconciliation snapshots
+    embedded in older notes (which is what caused the Plan to "continue"
+    long-finished drugs). The list is taken as-is; narrative "stopped X"
+    statements do NOT override it.
 
-    Reconciliation: the structured "Active Outpatient Medications" list lags
-    the clinical narrative — it can still list abiraterone/finasteride after
-    the clinician documented stopping it, causing the Plan to recommend
-    CONTINUING a discontinued drug. Drugs the narrative explicitly says were
-    stopped are filtered out here.
+    EXCEPTION — Eligard/ADT: an LHRH agonist is dosed intermittently in-clinic
+    and is frequently ABSENT from the active outpatient Rx list even when the
+    patient is on ongoing ADT. So ADT active/completed status must come from
+    the treatment timeline / administration dates / course-completion language
+    (see patient_status_facts.treatment_active_status), NOT from this list's
+    presence or absence of Eligard.
     """
     if not raw_text:
         return []
-    text_lc = raw_text.lower()
-    out: List[str] = []
-    seen = set()
-    for m in _MED_LIST_HEADER_RE.finditer(raw_text):
-        block = raw_text[m.end():m.end() + 2000]
-        # Stop at next ALL-CAPS header / separator
-        stop_m = re.search(r"^\s*(?:[A-Z]{4,}:\s*$|={5,})", block, re.MULTILINE)
-        if stop_m:
-            block = block[:stop_m.start()]
-        for line in block.split("\n"):
-            line_l = line.lower()
-            for hint in _ONCOLOGIC_MED_HINTS:
-                if hint in line_l:
-                    # Skip a drug the narrative says was stopped. Supplements
-                    # (calcium/vitamin d) and bare prednisone are not gated —
-                    # they are low-stakes and prednisone tracks its partner drug.
-                    if hint not in ("calcium", "vitamin d", "prednisone") \
-                            and _drug_discontinued_in_narrative(hint, text_lc):
-                        break
-                    quote = re.sub(r"\s+", " ", line).strip()
-                    if quote and quote not in seen:
-                        seen.add(quote)
-                        out.append(quote[:160])
-                    break
-    return out
+    from .source_normalizers.vista_to_cprs import RXOP_AUTHORITATIVE_SENTINEL
+    idx = raw_text.find(RXOP_AUTHORITATIVE_SENTINEL)
+    if idx != -1:
+        block = raw_text[idx + len(RXOP_AUTHORITATIVE_SENTINEL):]
+        # The RXOP block uses "====" lines as separators BETWEEN med entries,
+        # so we must NOT stop on those. The block ends at the next real
+        # section — a VistA dash-bar ("---- SURGICAL PATHOLOGY ----") or an
+        # ALL-CAPS CPRS section header.
+        stop_m = re.search(r"\n(?:-{3,}\s*[A-Z]|[A-Z][A-Z /]{4,}:)", block)
+        block = block[:stop_m.start()] if stop_m else block[:4000]
+        return _scan_block_for_meds(block)
+
+    # Fallback (non-VistA / cprs input with no authoritative block): use the
+    # most-recent med-list block only, rather than aggregating every stale
+    # snapshot across the document.
+    headers = list(_MED_LIST_HEADER_RE.finditer(raw_text))
+    if not headers:
+        return []
+    m = headers[-1]
+    block = raw_text[m.end():m.end() + 2000]
+    stop_m = re.search(r"^\s*(?:[A-Z]{4,}:\s*$|={5,})", block, re.MULTILINE)
+    if stop_m:
+        block = block[:stop_m.start()]
+    return _scan_block_for_meds(block)
 
 
 # ---------------------------------------------------------------------------

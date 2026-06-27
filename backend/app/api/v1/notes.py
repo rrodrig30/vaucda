@@ -837,11 +837,24 @@ async def generate_express_note(
 
         logger.info("Express Step 1: Building Stage 1 preliminary note...")
         _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        # Phase 1: compute the authoritative PatientStatusFacts ONCE and feed
+        # the same object to Stage 1 and Stage 2, so the Assessment grounds on
+        # the same facts as the HPI instead of re-deriving (and inventing) a
+        # divergent timeline/status from the rendered note.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts,
+            clinical_input_with_date,
+            _src_fmt,
+        )
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
             clinical_text=clinical_input_with_date,
             task_config=stage1_config,
             source_format=_src_fmt,
+            patient_facts=_shared_facts,
         )
         logger.info(
             f"Express: preliminary note ready ({len(preliminary_note)} chars)"
@@ -939,6 +952,7 @@ async def generate_express_note(
             note_type=request.note_type,
             patient_name=request.patient_name,
             ssn_last4=request.ssn_last4,
+            patient_facts=_shared_facts,  # Phase 1: shared authoritative facts
         )
 
         generation_time = time.time() - start_time

@@ -27,7 +27,10 @@ from dotenv import load_dotenv as _load_dotenv
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 _load_dotenv(_ENV_PATH)
 
-from app.services.note_processing.note_builder import build_urology_note
+from app.services.note_processing.note_builder import (
+    build_urology_note,
+    build_authoritative_patient_facts,
+)
 from app.services.note_processing.note_identifier import identify_notes
 from app.services.note_processing.stage2_builder import build_stage2_note
 from app.services.llm_config_manager import LLMConfigManager, LLMTaskType
@@ -74,8 +77,12 @@ def generate_one(text: str, s1, s2) -> str:
     # Prepend the visit date so age/IPSS extractors anchor on the real
     # clinic date for THIS file (batches span 6/21, 6/24, 6/29).
     clinical_input = f"VISIT DATE: {_detect_visit_date(text)}\n\n{text}"
+    # Phase 1: compute the authoritative facts ONCE and pass to both stages
+    # so Stage 2's Assessment grounds on the same facts as the HPI.
+    facts = build_authoritative_patient_facts(clinical_input, SOURCE_FORMAT)
     stage1 = build_urology_note(
-        clinical_text=clinical_input, task_config=s1, source_format=SOURCE_FORMAT
+        clinical_text=clinical_input, task_config=s1,
+        source_format=SOURCE_FORMAT, patient_facts=facts,
     )
     notes_dict = identify_notes(text)
     gu_notes = notes_dict.get("gu_notes", [])
@@ -89,6 +96,7 @@ def generate_one(text: str, s1, s2) -> str:
         rag_content="",
         task_config=s2,
         note_type="clinic_note",
+        patient_facts=facts,
     )
     return final
 
