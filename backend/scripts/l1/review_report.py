@@ -13,8 +13,72 @@ Usage:
 """
 import html
 import json
+import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from app.services.note_processing.source_normalizers import normalize_to_cprs  # noqa: E402
+from app.services.note_processing.clinical_timeline import extract_psa_trajectory  # noqa: E402
+
+# Where the patient source extracts live (to pull read-only PSA/meds context).
+SOURCE_DIRS = [
+    Path(__file__).resolve().parents[2] / "../tests/Tumor_6_24_2026",
+    Path(__file__).resolve().parents[2] / "../tests/loose_batch",
+    Path(__file__).resolve().parents[2] / "../tests/Monday_batch",
+]
+_CTX_CACHE: dict = {}
+
+
+def _locate_source(patient_file: str):
+    for d in SOURCE_DIRS:
+        p = d / patient_file
+        if p.exists():
+            return p
+    return None
+
+
+def _active_meds(raw: str):
+    """(drug, sig) pairs from the authoritative RXOP active-outpatient list."""
+    m = re.search(r"-+ RXOP - OUTPT RX-ACTIVE ONLY -+\n(.*?)(?=\n-{6,} [A-Z])",
+                  raw, re.S)
+    if not m:
+        return []
+    body = m.group(1)
+    if re.search(r"No data available", body, re.I):
+        return [("(no active outpatient medications on file)", "")]
+    out, lines = [], body.splitlines()
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        # Drug-name line: uppercase start, has a strength/form, not a field label.
+        if re.match(r"^[A-Z][A-Z0-9/,\.\-\(\) ]{2,}$", s) and \
+           re.search(r"\b(MG|MCG|GM|G|%|UNIT|TAB|CAP|CAPS?|SOLN|CREAM|INJ|PEN|ML|"
+                     r"SUPP|PATCH|GEL|OINT|SUSP|LIQUID|INHALER)\b", s) and \
+           not s.startswith(("RX ", "SIG", "INDICATION", "PROVIDER", "DRUG")):
+            sig = ""
+            for j in range(i + 1, min(i + 4, len(lines))):
+                sm = re.search(r"SIG:\s*(.+)", lines[j])
+                if sm:
+                    sig = sm.group(1).strip()
+                    break
+            out.append((s, sig))
+    return out
+
+
+def _patient_context(patient_file: str):
+    if patient_file in _CTX_CACHE:
+        return _CTX_CACHE[patient_file]
+    src = _locate_source(patient_file)
+    psa, meds = [], []
+    if src:
+        raw = src.read_text(errors="ignore")
+        try:
+            psa = extract_psa_trajectory(normalize_to_cprs(raw, "vista"))
+        except Exception:
+            psa = []
+        meds = _active_meds(raw)
+    _CTX_CACHE[patient_file] = (psa, meds)
+    return psa, meds
 
 
 def esc(s):
@@ -68,6 +132,29 @@ def render_facts(lab):
     return "".join(rows) or "<i>no facts extracted</i>"
 
 
+def render_context(patient_file):
+    """Read-only PSA curve + active meds for clinical reference (NOT labeled)."""
+    psa, meds = _patient_context(patient_file)
+    psa_html = "<i>none</i>"
+    if psa:
+        cells = "".join(
+            f"<span class=psa>{esc(disp)} <b>{esc(val)}</b></span>"
+            for _k, disp, val in psa[:14]
+        )
+        psa_html = f"<div class=psa-row>{cells}</div>"
+    meds_html = "<i>none</i>"
+    if meds:
+        meds_html = "".join(
+            f"<div class=med><b>{esc(d)}</b>{(' — ' + esc(sig)) if sig else ''}</div>"
+            for d, sig in meds[:14]
+        )
+    return (f"<div class=ctx><div class=ctxh>REFERENCE (auto-extracted, not "
+            f"reviewed here)</div>"
+            f"<div class=ctxbody><div><span class=ctxlbl>PSA curve</span>{psa_html}</div>"
+            f"<div><span class=ctxlbl>Active outpatient meds (RXOP)</span>{meds_html}</div>"
+            f"</div></div>")
+
+
 def all_spans(lab):
     spans = []
     dx = lab.get("diagnosis")
@@ -94,6 +181,13 @@ table{border-collapse:collapse;margin:4px 0 10px;width:100%}
 td,th{border:1px solid #e3e6ee;padding:2px 6px;text-align:left;vertical-align:top;font-size:12px}
 th{background:#f0f3f9}
 .grp{margin-bottom:8px}
+.ctx{background:#eef6ff;border-top:1px solid #d6e6fb;border-bottom:1px solid #d6e6fb;padding:8px 14px;font-size:12px}
+.ctxh{font-size:10px;letter-spacing:.5px;color:#5a7ab0;font-weight:700;margin-bottom:4px}
+.ctxbody{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.ctxlbl{display:block;font-weight:700;color:#34507e;margin-bottom:2px}
+.psa-row{display:flex;flex-wrap:wrap;gap:4px}
+.psa{background:#fff;border:1px solid #cfe0f5;border-radius:4px;padding:1px 5px;white-space:nowrap}
+.med{padding:1px 0}
 .ctl{padding:10px 14px;background:#fafbfd;border-top:1px solid #eee;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .ctl textarea{flex:1;min-width:240px;min-height:34px;font:13px sans-serif;padding:6px;border:1px solid #ccd;border-radius:6px}
 label.v{font-weight:600;cursor:pointer;padding:4px 8px;border-radius:6px}
@@ -149,6 +243,7 @@ def main():
         cards.append(f"""
 <div class=card data-id="{sid}">
   <h3>{esc(title)} <span style="color:#888">[{sid}]</span></h3>
+  {render_context(meta.get('patient_file',''))}
   <div class=cols>
     <div class=note>{highlight(text, all_spans(lab))}</div>
     <div class=facts>{render_facts(lab)}</div>
