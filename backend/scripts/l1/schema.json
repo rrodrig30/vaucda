@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "L1NarrativeExtraction",
+  "description": "Structured clinical facts extracted from ONE narrative note segment. Every record carries a source_span (char offsets into the segment) for provenance and deterministic verification. Emit null/empty when a field is not present in THIS segment.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["segment_id", "diagnosis", "treatment_events", "procedures", "metastases"],
+  "properties": {
+    "segment_id": { "type": "string" },
+    "diagnosis": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "cancer_type": { "type": "string", "description": "e.g. 'prostate adenocarcinoma', 'clear cell RCC', 'urothelial carcinoma'" },
+        "diagnosis_date": { "type": ["string", "null"], "description": "ISO YYYY[-MM[-DD]] — the BIOPSY-CONFIRMED diagnosis date, NOT the earliest elevated-PSA date" },
+        "gleason": { "type": ["string", "null"], "description": "e.g. '4+4'" },
+        "grade_group": { "type": ["integer", "null"], "minimum": 1, "maximum": 5, "description": "MAX grade group across cores" },
+        "stage_tnm": { "type": ["string", "null"], "description": "explicit TNM if documented, e.g. 'cT3bN0M0'" },
+        "risk": { "type": ["string", "null"], "enum": ["low", "favorable-intermediate", "unfavorable-intermediate", "high", "very-high", null] },
+        "source_span": { "$ref": "#/$defs/span" }
+      },
+      "required": ["cancer_type", "source_span"]
+    },
+    "treatment_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["modality", "status", "source_span"],
+        "properties": {
+          "modality": { "type": "string", "enum": ["prostatectomy", "radiation", "brachytherapy", "focal", "ADT", "ARSI", "chemotherapy", "radioligand", "immunotherapy", "active-surveillance", "nephrectomy", "cystectomy", "TURBT", "other"] },
+          "agent": { "type": ["string", "null"], "description": "specific drug/technique when named (leuprolide, abiraterone, Lu-177 PSMA, IMRT, ...) — preserved, never collapsed into modality" },
+          "start_date": { "type": ["string", "null"], "description": "ISO" },
+          "end_date": { "type": ["string", "null"], "description": "ISO; populate when a course range is documented so a START date is never rendered as completion" },
+          "status": { "type": "string", "enum": ["started", "ongoing", "completed", "discontinued", "declined", "planned"] },
+          "intent": { "type": ["string", "null"], "enum": ["definitive", "adjuvant", "neoadjuvant", "salvage", "palliative", "maintenance", null] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    },
+    "procedures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "source_span"],
+        "properties": {
+          "type": { "type": "string", "description": "biopsy / cystoscopy / urodynamics / PSMA-PET / bone-scan / MRI / CT / ureteroscopy / ..." },
+          "date": { "type": ["string", "null"], "description": "ISO — the PROCEDURE/collection date, NOT the results-notification/sign-out date" },
+          "finding": { "type": ["string", "null"] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    },
+    "metastases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["site", "source_span"],
+        "properties": {
+          "site": { "type": "string", "description": "bone / node / liver / lung / brain / ..." },
+          "date": { "type": ["string", "null"] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "span": {
+      "type": "array",
+      "description": "[start_char, end_char] offsets into the segment text supporting this record",
+      "items": { "type": "integer", "minimum": 0 },
+      "minItems": 2,
+      "maxItems": 2
+    }
+  }
+}
