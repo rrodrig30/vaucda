@@ -34,10 +34,17 @@ tests/l1_<model>/labels/<id>.json      an L1 candidate
 1. **Sample** (done): `python scripts/l1/sample_segments.py tests/l1_gold 100`
 2. **Teacher draft-label** (done): run `label_segments.workflow.js` over the
    manifest ids, then `python scripts/l1/write_labels.py tests/l1_gold <result.json>`
-3. **Urologist review** (the gating step): correct `tests/l1_gold/labels/*.json`.
-   Focus on the rules the pipeline gets wrong — biopsy-confirmed diagnosis_date
-   (not earliest PSA), MAX grade_group, specific `agent` preserved
-   (Lu-177/abiraterone not collapsed), start+end dates. Then **freeze**.
+3. **Urologist review** (the gating step) — NO JSON editing:
+   - `python scripts/l1/review_report.py tests/l1_gold` → open
+     `tests/l1_gold/review.html` in a browser.
+   - Each note shows next to its extracted facts; highlighted text is the AI's
+     evidence. Mark ✓ looks right / ✗ needs fix, and type the correction in
+     plain English. Focus on the rules the pipeline gets wrong — biopsy-confirmed
+     diagnosis_date (not earliest PSA), MAX grade_group, specific `agent`
+     preserved (Lu-177/abiraterone not collapsed), start+end dates.
+   - Click **Download review** → `review_verdicts.json`.
+   - `python scripts/l1/apply_review.py tests/l1_gold review_verdicts.json`
+     stamps approvals and lists the fixes to apply, then **freeze**.
 4. **Baseline**: `python scripts/l1/regex_baseline.py tests/l1_gold tests/l1_gold_regex`
 5. **Score** any candidate: `python scripts/l1/score.py tests/l1_gold tests/l1_gold_regex`
 
