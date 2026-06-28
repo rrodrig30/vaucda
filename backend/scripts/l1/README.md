@@ -8,6 +8,7 @@ and a one-command eval. See `../../../docs/VAUCDA_L1_Extractor_Scope.md`.
 
 | file | role |
 |---|---|
+| `router.py` | **(M1)** route a whole extract: narrative sections -> L1 segments (each flagged urologic/non_urologic), structured sections -> deterministic path (unchanged); SP pathology surfaced as L1 grade ref. `--validate` proves corpus coverage |
 | `segments.py` | split a VistA extract into narrative note segments (L1's input unit; structured sections stay deterministic) |
 | `schema.json` | the L1 output contract (span-grounded structured facts) |
 | `sample_segments.py` | deterministic, stratified sampler → frozen gold segment set |
@@ -67,6 +68,10 @@ per-fix signal.
   treatment→diagnosis links, pathology-augmented labeling), teacher labeler,
   span resolution, regex baseline, per-field scorer, deterministic checks,
   freeze tool.
-- **Next (Milestones 1–3):** section router into the production pipeline →
-  teacher silver-label corpus (the 925 treatment-narrative segments) → LoRA
-  fine-tune medgemma-27b, scored against this frozen gold with `score.py`.
+- **Milestone 1 COMPLETE:** `router.py` routes every section (0 orphans across
+  all 100 patients); narrative → L1 (2,504 segments, deterministic urologic
+  flag 98% agreement with gold), structured path unchanged; SP pathology fed to
+  L1. M4 wires this into `build_authoritative_patient_facts` behind a flag.
+- **Next (Milestones 2–3):** teacher silver-label corpus (the 925
+  treatment-narrative segments) → LoRA fine-tune medgemma-27b, scored against
+  the frozen gold with `score.py`.
