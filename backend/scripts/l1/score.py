@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Per-field scorer for L1 extractions vs the gold labels.
+Per-field scorer for L1 v2 extractions vs gold labels.
 
-Computes deterministic, noise-free metrics (the L1 yardstick from the scope
-doc): treatment-event P/R/F1, and per-field accuracy for diagnosis_date,
-grade_group, and stage_tnm — over the segments present in BOTH label sets.
-
-Label files: <dir>/labels/<segment_id>.json (gold = urologist-reviewed;
-candidate = L1 or the regex baseline). Schema is schema.json (or the
-source_quote draft variant — only the fields below are scored).
+Deterministic, noise-free metrics (the L1 yardstick): diagnosis P/R/F1,
+treatment-event P/R/F1, diagnosis_date accuracy, grade accuracy (cancer-aware:
+prostate GG, RCC Fuhrman, bladder WHO), and procedures-vs-imaging separation.
+Scored over segments present in BOTH label sets.
 
 Usage:
   ./venv/bin/python scripts/l1/score.py <gold_dir> <candidate_dir>
@@ -20,49 +17,50 @@ from pathlib import Path
 
 
 def _norm_date(d):
-    """Normalize ISO date to (year, month) for tolerant matching; month/day
-    precision differences are tolerated, year mismatches are not."""
     if not d:
         return None
     m = re.match(r"(\d{4})(?:-(\d{2}))?", str(d))
-    if not m:
-        return None
-    return (m.group(1), m.group(2))
+    return (m.group(1), m.group(2)) if m else None
 
 
-def _date_match(a, b, month_tol=True):
+def _date_match(a, b):
     na, nb = _norm_date(a), _norm_date(b)
     if na is None or nb is None:
         return na == nb
-    if na[0] != nb[0]:
+    return na[0] == nb[0]
+
+
+def _name_key(s):
+    s = (s or "").lower()
+    for kw in ("prostate", "renal", "rcc", "kidney", "bladder", "urotheli",
+               "erectile", "bph", "luts", "stone", "lithiasis", "cyst", "mass",
+               "hydronephro", "stricture", "testic", "ureter"):
+        if kw in s:
+            return "rcc" if kw in ("renal", "rcc", "kidney") else \
+                   ("bladder" if kw in ("bladder", "urotheli") else
+                    ("stone" if kw in ("stone", "lithiasis") else kw))
+    return s[:8]
+
+
+def _grade_val(g):
+    if not g:
+        return None
+    return (g.get("grade_group"), g.get("nuclear_grade"),
+            g.get("who_grade"), g.get("bladder_stage"))
+
+
+def _ev_match(a, b):
+    if (a.get("modality") or "").lower() != (b.get("modality") or "").lower():
         return False
-    if not month_tol and na[1] and nb[1] and na[1] != nb[1]:
-        return False
-    return True
-
-
-def _modality_key(ev):
-    mod = (ev.get("modality") or "").lower()
-    agent = (ev.get("agent") or "").lower()
-    return mod, agent
-
-
-def _events_match(g, c):
-    """A candidate event matches a gold event if modality matches and either
-    the agent matches or the start dates align (same year)."""
-    gm, ga = _modality_key(g)
-    cm, ca = _modality_key(c)
-    if gm != cm:
-        return False
-    if ga and ca and ga.split()[0] == ca.split()[0]:
+    aa, ba = (a.get("agent") or "").lower(), (b.get("agent") or "").lower()
+    if aa and ba and aa.split()[0] == ba.split()[0]:
         return True
-    return _date_match(g.get("start_date"), c.get("start_date"))
+    return _date_match(a.get("start_date"), b.get("start_date"))
 
 
-def _load(dirpath):
+def _load(d):
     out = {}
-    ld = Path(dirpath) / "labels"
-    for f in ld.glob("*.json"):
+    for f in (Path(d) / "labels").glob("*.json"):
         try:
             out[f.stem] = json.loads(f.read_text())
         except Exception:
@@ -70,71 +68,80 @@ def _load(dirpath):
     return out
 
 
+def _prf(tp, fp, fn):
+    p = tp / (tp + fp) if (tp + fp) else 0
+    r = tp / (tp + fn) if (tp + fn) else 0
+    f = 2 * p * r / (p + r) if (p + r) else 0
+    return p, r, f
+
+
 def main():
-    gold = _load(sys.argv[1])
-    cand = _load(sys.argv[2])
+    gold, cand = _load(sys.argv[1]), _load(sys.argv[2])
     common = sorted(set(gold) & set(cand))
     if not common:
         print("no overlapping labeled segments")
         return
-
-    tp = fp = fn = 0
-    date_ok = date_n = 0
-    status_ok = status_n = 0
-    dx_date_ok = dx_date_n = 0
-    gg_ok = gg_n = 0
+    dtp = dfp = dfn = 0
+    etp = efp = efn = 0
+    dxd_ok = dxd_n = gr_ok = gr_n = 0
+    img_in_proc = 0  # candidate procedures that are actually imaging
+    IMG = re.compile(r"\b(CT|MRI|US|ultrasound|PET|PSMA|bone scan|x-ray|NM|scan)\b", re.I)
 
     for sid in common:
         g, c = gold[sid], cand[sid]
-        gev = list(g.get("treatment_events") or [])
-        cev = list(c.get("treatment_events") or [])
+        # diagnoses
+        gd, cd = list(g.get("diagnoses") or []), list(c.get("diagnoses") or [])
         used = set()
-        for ge in gev:
+        for ge in gd:
             hit = None
-            for i, ce in enumerate(cev):
+            for i, ce in enumerate(cd):
                 if i in used:
                     continue
-                if _events_match(ge, ce):
+                if _name_key(ge.get("name")) == _name_key(ce.get("name")):
                     hit = i
                     break
             if hit is not None:
                 used.add(hit)
-                tp += 1
-                # field accuracy on matched events
-                date_n += 1
-                if _date_match(ge.get("start_date"), cev[hit].get("start_date")):
-                    date_ok += 1
-                status_n += 1
-                if (ge.get("status") or "") == (cev[hit].get("status") or ""):
-                    status_ok += 1
+                dtp += 1
+                if ge.get("diagnosis_date"):
+                    dxd_n += 1
+                    if _date_match(ge.get("diagnosis_date"), cd[hit].get("diagnosis_date")):
+                        dxd_ok += 1
+                if ge.get("grade") and _grade_val(ge.get("grade")) != (None, None, None, None):
+                    gr_n += 1
+                    if _grade_val(ge.get("grade")) == _grade_val(cd[hit].get("grade")):
+                        gr_ok += 1
             else:
-                fn += 1
-        fp += len(cev) - len(used)
+                dfn += 1
+        dfp += len(cd) - len(used)
+        # treatments
+        gev, cev = list(g.get("treatment_events") or []), list(c.get("treatment_events") or [])
+        u2 = set()
+        for ge in gev:
+            hit = next((i for i, ce in enumerate(cev) if i not in u2 and _ev_match(ge, ce)), None)
+            if hit is not None:
+                u2.add(hit)
+                etp += 1
+            else:
+                efn += 1
+        efp += len(cev) - len(u2)
+        # procedures/imaging separation (candidate hygiene)
+        for p in c.get("procedures") or []:
+            if IMG.search(p.get("type") or ""):
+                img_in_proc += 1
 
-        # diagnosis fields
-        gd, cd = g.get("diagnosis") or {}, c.get("diagnosis") or {}
-        if gd.get("diagnosis_date"):
-            dx_date_n += 1
-            if _date_match(gd.get("diagnosis_date"), cd.get("diagnosis_date")):
-                dx_date_ok += 1
-        if gd.get("grade_group"):
-            gg_n += 1
-            if gd.get("grade_group") == cd.get("grade_group"):
-                gg_ok += 1
-
-    prec = tp / (tp + fp) if (tp + fp) else 0
-    rec = tp / (tp + fn) if (tp + fn) else 0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0
+    dp, dr, df = _prf(dtp, dfp, dfn)
+    ep, er, ef = _prf(etp, efp, efn)
 
     def pct(a, b):
         return f"{(100*a/b):.0f}% ({a}/{b})" if b else "n/a"
 
-    print(f"=== L1 EVAL vs gold ({len(common)} segments) ===")
-    print(f"treatment_events  P={prec:.2f} R={rec:.2f} F1={f1:.2f}  (tp={tp} fp={fp} fn={fn})")
-    print(f"  start_date acc (matched events): {pct(date_ok, date_n)}")
-    print(f"  status acc     (matched events): {pct(status_ok, status_n)}")
-    print(f"diagnosis_date acc:                {pct(dx_date_ok, dx_date_n)}")
-    print(f"grade_group (max) acc:             {pct(gg_ok, gg_n)}")
+    print(f"=== L1 v2 EVAL vs gold ({len(common)} segments) ===")
+    print(f"diagnoses        P={dp:.2f} R={dr:.2f} F1={df:.2f}  (tp={dtp} fp={dfp} fn={dfn})")
+    print(f"  diagnosis_date acc:  {pct(dxd_ok, dxd_n)}")
+    print(f"  grade acc (by system): {pct(gr_ok, gr_n)}")
+    print(f"treatment_events P={ep:.2f} R={er:.2f} F1={ef:.2f}  (tp={etp} fp={efp} fn={efn})")
+    print(f"candidate procedures that are actually imaging: {img_in_proc}")
 
 
 if __name__ == "__main__":

@@ -99,29 +99,63 @@ def highlight(text, spans):
     return "".join(out)
 
 
+def _grade_str(g):
+    if not g:
+        return ""
+    sys_ = g.get("system")
+    if sys_ == "gleason-isup":
+        return f"Gleason {esc(g.get('gleason'))} / GG{esc(g.get('grade_group'))}"
+    if sys_ == "fuhrman":
+        return f"Fuhrman nuclear grade {esc(g.get('nuclear_grade'))}"
+    if sys_ == "who":
+        s = f"WHO {esc(g.get('who_grade'))}"
+        if g.get("bladder_stage"):
+            s += f", stage {esc(g.get('bladder_stage'))}"
+        return s
+    return esc(g.get("value") or "")
+
+
 def render_facts(lab):
     rows = []
-    dx = lab.get("diagnosis")
-    if dx:
-        rows.append("<div class=grp><b>Diagnosis</b><table>"
-                    + f"<tr><td>type</td><td>{esc(dx.get('cancer_type'))}</td></tr>"
-                    + f"<tr><td>dx date</td><td>{esc(dx.get('diagnosis_date'))}</td></tr>"
-                    + f"<tr><td>Gleason / GG</td><td>{esc(dx.get('gleason'))} / GG{esc(dx.get('grade_group'))}</td></tr>"
-                    + f"<tr><td>stage</td><td>{esc(dx.get('stage_tnm'))}</td></tr>"
-                    + f"<tr><td>risk</td><td>{esc(dx.get('risk'))}</td></tr></table></div>")
+    if lab.get("primary_context") == "non_urologic":
+        rows.append("<div class=badge>⚠ NON-UROLOGIC note (kept for "
+                    "cross-specialty facts — chemo / radiation / "
+                    "hospitalization / palliative; no primary urologic "
+                    "diagnosis minted)</div>")
+    dxs = lab.get("diagnoses") or []
+    for d in dxs:
+        gr = _grade_str(d.get("grade"))
+        rows.append(
+            f"<div class=grp><b>Diagnosis {esc(d.get('id'))}</b> "
+            f"<span class=cat>{esc(d.get('category'))}</span><table>"
+            f"<tr><td>name</td><td>{esc(d.get('name'))}</td></tr>"
+            f"<tr><td>site</td><td>{esc(d.get('site'))}</td></tr>"
+            f"<tr><td>dx date</td><td>{esc(d.get('diagnosis_date'))}</td></tr>"
+            + (f"<tr><td>grade</td><td>{gr}</td></tr>" if gr else "")
+            + (f"<tr><td>stage</td><td>{esc(d.get('stage_tnm'))}</td></tr>" if d.get('stage_tnm') else "")
+            + (f"<tr><td>risk</td><td>{esc(d.get('risk'))}</td></tr>" if d.get('risk') else "")
+            + "</table></div>")
+    if not dxs:
+        rows.append("<div class=grp><b>Diagnoses</b> <i>none extracted</i></div>")
     tev = lab.get("treatment_events") or []
     if tev:
-        r = "<div class=grp><b>Treatments</b><table><tr><th>modality</th><th>agent</th><th>start</th><th>end</th><th>status</th></tr>"
+        r = "<div class=grp><b>Treatments</b><table><tr><th>for dx</th><th>modality</th><th>agent</th><th>start</th><th>end</th><th>status</th></tr>"
         for e in tev:
-            r += (f"<tr><td>{esc(e.get('modality'))}</td><td>{esc(e.get('agent'))}</td>"
-                  f"<td>{esc(e.get('start_date'))}</td><td>{esc(e.get('end_date'))}</td>"
-                  f"<td>{esc(e.get('status'))}</td></tr>")
+            r += (f"<tr><td>{esc(e.get('for_diagnosis'))}</td><td>{esc(e.get('modality'))}</td>"
+                  f"<td>{esc(e.get('agent'))}</td><td>{esc(e.get('start_date'))}</td>"
+                  f"<td>{esc(e.get('end_date'))}</td><td>{esc(e.get('status'))}</td></tr>")
         rows.append(r + "</table></div>")
     pr = lab.get("procedures") or []
     if pr:
-        r = "<div class=grp><b>Procedures</b><table><tr><th>type</th><th>date</th><th>finding</th></tr>"
+        r = "<div class=grp><b>Procedures (interventions)</b><table><tr><th>type</th><th>date</th><th>finding</th></tr>"
         for p in pr:
             r += f"<tr><td>{esc(p.get('type'))}</td><td>{esc(p.get('date'))}</td><td>{esc(p.get('finding'))}</td></tr>"
+        rows.append(r + "</table></div>")
+    im = lab.get("imaging") or []
+    if im:
+        r = "<div class=grp><b>Imaging</b><table><tr><th>modality</th><th>date</th><th>impression</th></tr>"
+        for p in im:
+            r += f"<tr><td>{esc(p.get('modality'))}</td><td>{esc(p.get('date'))}</td><td>{esc(p.get('impression'))}</td></tr>"
         rows.append(r + "</table></div>")
     mets = lab.get("metastases") or []
     if mets:
@@ -157,10 +191,7 @@ def render_context(patient_file):
 
 def all_spans(lab):
     spans = []
-    dx = lab.get("diagnosis")
-    if dx and dx.get("source_span"):
-        spans.append(dx["source_span"])
-    for k in ("treatment_events", "procedures", "metastases"):
+    for k in ("diagnoses", "treatment_events", "procedures", "imaging", "metastases"):
         for r in lab.get(k) or []:
             if r.get("source_span"):
                 spans.append(r["source_span"])
@@ -188,6 +219,8 @@ th{background:#f0f3f9}
 .psa-row{display:flex;flex-wrap:wrap;gap:4px}
 .psa{background:#fff;border:1px solid #cfe0f5;border-radius:4px;padding:1px 5px;white-space:nowrap}
 .med{padding:1px 0}
+.badge{background:#ffe7c2;border:1px solid #f0b860;color:#7a4a00;padding:4px 8px;border-radius:6px;margin-bottom:8px;font-weight:600;font-size:11px}
+.cat{font-size:10px;background:#e6ecf6;border-radius:4px;padding:1px 6px;color:#34507e;text-transform:uppercase}
 .ctl{padding:10px 14px;background:#fafbfd;border-top:1px solid #eee;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .ctl textarea{flex:1;min-width:240px;min-height:34px;font:13px sans-serif;padding:6px;border:1px solid #ccd;border-radius:6px}
 label.v{font-weight:600;cursor:pointer;padding:4px 8px;border-radius:6px}

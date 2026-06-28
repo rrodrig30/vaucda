@@ -67,32 +67,36 @@ def _max_gg(text: str):
 
 
 def to_l1(segment_text: str, sid: str) -> dict:
+    """Map current extractors into the v2 schema (the bar L1 must beat).
+    The regex layer only knows prostate, has no benign-dx / imaging split /
+    Fuhrman/WHO grading — those gaps become measured recall losses."""
     tl = extract_clinical_timeline(segment_text)
-    tx, dx = [], None
+    tx, dx_date = [], None
     for e in tl:
         if e.event_type.startswith("TREATMENT_") and e.modality:
             mod, agent = _map_mod(e.modality)
             tx.append({
-                "modality": mod, "agent": agent,
+                "for_diagnosis": "dx1", "modality": mod, "agent": agent,
                 "start_date": _iso(e.date_key), "end_date": None,
                 "status": _STATUS.get(e.event_type, "started"),
                 "intent": None, "source_span": None,
             })
-        elif e.event_type == "DIAGNOSIS" and dx is None:
-            dx = {"cancer_type": e.modality or "cancer",
-                  "diagnosis_date": _iso(e.date_key),
-                  "gleason": None, "grade_group": None,
-                  "stage_tnm": None, "risk": None, "source_span": None}
-    # Grade group / Gleason — the production pipeline extracts these in
-    # patient_status_facts/pathology, so include them for a fair baseline.
+        elif e.event_type == "DIAGNOSIS" and dx_date is None:
+            dx_date = _iso(e.date_key)
+    diagnoses = []
     gg, gl = _max_gg(segment_text)
-    if gg is not None:
-        if dx is None:
-            dx = {"cancer_type": "prostate cancer", "diagnosis_date": None,
-                  "stage_tnm": None, "risk": None, "source_span": None}
-        dx["grade_group"], dx["gleason"] = gg, gl
-    return {"segment_id": sid, "diagnosis": dx, "treatment_events": tx,
-            "procedures": [], "metastases": []}
+    if gg is not None or dx_date or tx:
+        grade = ({"system": "gleason-isup", "gleason": gl, "grade_group": gg,
+                  "nuclear_grade": None, "who_grade": None,
+                  "bladder_stage": None, "value": None} if gg is not None else None)
+        diagnoses.append({
+            "id": "dx1", "category": "cancer", "name": "prostate cancer",
+            "site": "prostate", "diagnosis_date": dx_date, "stage_tnm": None,
+            "grade": grade, "risk": None, "source_span": None,
+        })
+    return {"segment_id": sid, "primary_context": "urologic",
+            "diagnoses": diagnoses, "treatment_events": tx,
+            "procedures": [], "imaging": [], "metastases": []}
 
 
 def main():
