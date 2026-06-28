@@ -56,8 +56,17 @@ is given and gold is frozen) the per-field score. This is L1's yardstick —
 deterministic, so it is immune to the LLM-judge variance that now exceeds
 per-fix signal.
 
-## Status
-- Built & validated: segmentation, sampling (100 segments / 65 patients),
-  schema, teacher labeler, span resolution, regex baseline, scorer, checks.
-- Pending (needs the urologist): review/freeze `tests/l1_gold/labels/`.
-  Until then `score.py` runs against the teacher draft as a pipeline smoke test.
+## Status — Milestone 0 COMPLETE
+- **Gold FROZEN: v1.0** (schema_version 2), urologist-reviewed & approved
+  2026-06-27. 99 segments; diagnoses 81 cancer / 147 benign / 15 indeterminate;
+  141 imaging, 158 procedures, 169 treatments. Manifest + sha256:
+  `scripts/l1/GOLD_FREEZE.json`; read-only snapshot:
+  `tests/l1_gold/frozen/1.0/`.
+- Built & validated: segmentation, stratified sampling, v2 schema
+  (cancer-aware grading, multi-dx incl. indeterminate masses, imaging split,
+  treatment→diagnosis links, pathology-augmented labeling), teacher labeler,
+  span resolution, regex baseline, per-field scorer, deterministic checks,
+  freeze tool.
+- **Next (Milestones 1–3):** section router into the production pipeline →
+  teacher silver-label corpus (the 925 treatment-narrative segments) → LoRA
+  fine-tune medgemma-27b, scored against this frozen gold with `score.py`.
