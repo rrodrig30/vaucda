@@ -1,0 +1,25 @@
+{
+ "corpus": "l1_silver",
+ "teacher": "glm-5.2:cloud",
+ "schema_version": 2,
+ "built_date": "2026-06-27",
+ "n_segments": 819,
+ "n_sft_examples": 819,
+ "diagnoses_by_category": {
+  "cancer": 844,
+  "benign": 1150,
+  "indeterminate": 95
+ },
+ "n_treatment_events": 1223,
+ "n_imaging": 759,
+ "n_procedures": 1584,
+ "n_metastases": 189,
+ "non_urologic_segments": 89,
+ "span_resolution_pct": 88,
+ "confidence_tiers": {
+  "high": 757,
+  "low": 36,
+  "medium": 26
+ },
+ "gold_held_out": "l1_gold v1.0 (99 segments) \u2014 NOT in this corpus"
+}

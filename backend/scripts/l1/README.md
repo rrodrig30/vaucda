@@ -72,6 +72,12 @@ per-fix signal.
   all 100 patients); narrative → L1 (2,504 segments, deterministic urologic
   flag 98% agreement with gold), structured path unchanged; SP pathology fed to
   L1. M4 wires this into `build_authoritative_patient_facts` behind a flag.
-- **Next (Milestones 2–3):** teacher silver-label corpus (the 925
-  treatment-narrative segments) → LoRA fine-tune medgemma-27b, scored against
-  the frozen gold with `score.py`.
+- **Milestone 2 COMPLETE:** silver training corpus (`SILVER_CORPUS.json`).
+  Teacher = **glm-5.2:cloud** (local Ollama, off the Claude API). 819 segments
+  (gold held out); 844 cancer / 1150 benign / 95 indeterminate diagnoses;
+  1223 treatments, 759 imaging, 1584 procedures; 88% span-resolution; agreement
+  tiers 757 high / 26 med / 36 low. → **`tests/l1_train/l1_sft.jsonl`** (819
+  LoRA SFT chat pairs: instruction + segment + pathology → v2 JSON).
+- **Next (Milestone 3):** LoRA fine-tune medgemma-27b on `l1_sft.jsonl`
+  (weight by confidence tier), scored against the frozen gold with `score.py`;
+  then M4 shadow-integration behind `VAUCDA_L1=1`.

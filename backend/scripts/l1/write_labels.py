@@ -9,6 +9,7 @@ Usage:
   ./venv/bin/python scripts/l1/write_labels.py <gold_dir> <workflow_result.json>
 """
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -16,17 +17,25 @@ from pathlib import Path
 _REC_LISTS = ("diagnoses", "treatment_events", "procedures", "imaging", "metastases")
 
 
-def _resolve(rec: dict, text: str, stats: list):
+def _resolve(rec: dict, haystacks: list, stats: list):
+    """Resolve source_quote -> [span, source] using a flexible-whitespace regex
+    over each haystack (segment, then pathology). Tolerates the newline/space
+    normalization teachers apply when copying multi-line text into JSON, while
+    keeping exact offsets in the original."""
     q = rec.pop("source_quote", None)
     span = None
-    if q:
-        i = text.find(q)
-        if i < 0:
-            i = text.replace("\n", " ").find(" ".join(q.split()))
-        if i >= 0:
-            span = [i, i + len(q)]
+    src = None
+    if q and q.split():
+        pat = re.compile(r"\s+".join(re.escape(t) for t in q.split()), re.S)
+        for name, text in haystacks:
+            m = pat.search(text)
+            if m:
+                span = [m.start(), m.end()]
+                src = name
+                break
     stats.append(span is not None)
     rec["source_span"] = span
+    rec["source"] = src  # "segment" | "pathology" | None
     return rec
 
 
@@ -45,11 +54,14 @@ def main():
         if not sid:
             continue
         seg_p = seg_dir / f"{sid}.txt"
-        text = seg_p.read_text(errors="ignore") if seg_p.exists() else ""
+        path_p = seg_dir / f"{sid}.pathology.txt"
+        seg_text = seg_p.read_text(errors="ignore") if seg_p.exists() else ""
+        path_text = path_p.read_text(errors="ignore") if path_p.exists() else ""
+        haystacks = [("segment", seg_text), ("pathology", path_text)]
         out = {"segment_id": sid,
                "primary_context": lab.get("primary_context", "urologic")}
         for key in _REC_LISTS:
-            out[key] = [_resolve(dict(r), text, quote_stats) for r in (lab.get(key) or [])]
+            out[key] = [_resolve(dict(r), haystacks, quote_stats) for r in (lab.get(key) or [])]
         (out_dir / f"{sid}.json").write_text(json.dumps(out, indent=1))
         written += 1
 
