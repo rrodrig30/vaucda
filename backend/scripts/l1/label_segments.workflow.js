@@ -35,7 +35,7 @@ const EXTRACT_SCHEMA = {
         required: ['id', 'category', 'name', 'source_quote'],
         properties: {
           id: { type: 'string', description: "short ref e.g. 'dx1'" },
-          category: { type: 'string', enum: ['cancer', 'benign'] },
+          category: { type: 'string', enum: ['cancer', 'benign', 'indeterminate'], description: 'cancer=pathology-confirmed; benign=known-benign condition; indeterminate=mass/lesion of unknown pathology (unbiopsied). NEVER benign for an unbiopsied mass.' },
           name: { type: 'string' },
           site: { type: ['string', 'null'] },
           diagnosis_date: { type: ['string', 'null'], description: 'ISO; biopsy-confirmed, NOT earliest PSA date' },
@@ -108,7 +108,19 @@ const PROMPT = (id) => `You are a meticulous urologic-oncology data abstractor c
 
 Segment text file: ${goldDir}/segments/${id}.txt
 
-Read that file, then extract per the schema. RULES (these encode the exact errors to avoid — follow precisely):
+ALSO read the patient's pathology reference (definitive grades often live here, NOT in the consult narrative):
+Surgical pathology file: ${goldDir}/segments/${id}.pathology.txt
+
+Read BOTH files, then extract per the schema. RULES (these encode the exact errors to avoid — follow precisely):
+
+DIAGNOSIS CATEGORY (clinical/benefits-critical):
+- category="cancer" only when pathology/biopsy CONFIRMS malignancy (check the SP pathology file).
+- category="indeterminate" for a mass/lesion of UNKNOWN pathology (e.g. an UNBIOPSIED renal mass). Name it "renal mass of uncertain significance" (or "... of unknown pathology"). NEVER call an unbiopsied/unconfirmed mass "benign" — that has VA service-connection/benefits implications.
+- category="benign" only for conditions KNOWN benign (ED, BPH/LUTS, urolithiasis, simple cyst, stricture).
+
+GRADE — ALWAYS SEARCH THE PATHOLOGY:
+- Before leaving a cancer's grade empty, SEARCH the SP pathology file (and the segment) for it — prostate Gleason/Grade Group, RCC Fuhrman nuclear grade, bladder WHO grade. A mass that the pathology proves malignant becomes category="cancer" WITH its grade.
+- If no grade information exists anywhere, leave grade null (do not invent one).
 
 PRIMARY CONTEXT:
 - Set primary_context = "non_urologic" if this note's primary cancer is NOT urologic (e.g. a lung/colon/breast tumor-board note; VistA downloads all tumor-board notes, not just urologic). For such notes, STILL capture cross-specialty facts relevant to urology (systemic chemotherapy, radiation, recent hospitalization, palliative-care decisions) as treatment_events, but do NOT create a urologic cancer diagnosis. Otherwise "urologic".

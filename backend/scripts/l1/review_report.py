@@ -125,9 +125,11 @@ def render_facts(lab):
     dxs = lab.get("diagnoses") or []
     for d in dxs:
         gr = _grade_str(d.get("grade"))
+        cat = (d.get("category") or "")
+        catcls = "cat cat-" + (cat if cat in ("cancer", "benign", "indeterminate") else "x")
         rows.append(
             f"<div class=grp><b>Diagnosis {esc(d.get('id'))}</b> "
-            f"<span class=cat>{esc(d.get('category'))}</span><table>"
+            f"<span class=\"{catcls}\">{esc(cat)}</span><table>"
             f"<tr><td>name</td><td>{esc(d.get('name'))}</td></tr>"
             f"<tr><td>site</td><td>{esc(d.get('site'))}</td></tr>"
             f"<tr><td>dx date</td><td>{esc(d.get('diagnosis_date'))}</td></tr>"
@@ -220,7 +222,10 @@ th{background:#f0f3f9}
 .psa{background:#fff;border:1px solid #cfe0f5;border-radius:4px;padding:1px 5px;white-space:nowrap}
 .med{padding:1px 0}
 .badge{background:#ffe7c2;border:1px solid #f0b860;color:#7a4a00;padding:4px 8px;border-radius:6px;margin-bottom:8px;font-weight:600;font-size:11px}
-.cat{font-size:10px;background:#e6ecf6;border-radius:4px;padding:1px 6px;color:#34507e;text-transform:uppercase}
+.cat{font-size:10px;border-radius:4px;padding:1px 6px;text-transform:uppercase;font-weight:700}
+.cat-cancer{background:#fde0e0;color:#a01818}
+.cat-benign{background:#e2f3e6;color:#1c6b32}
+.cat-indeterminate{background:#fff0c2;color:#8a5a00;border:1px solid #e0b04a}
 .ctl{padding:10px 14px;background:#fafbfd;border-top:1px solid #eee;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .ctl textarea{flex:1;min-width:240px;min-height:34px;font:13px sans-serif;padding:6px;border:1px solid #ccd;border-radius:6px}
 label.v{font-weight:600;cursor:pointer;padding:4px 8px;border-radius:6px}

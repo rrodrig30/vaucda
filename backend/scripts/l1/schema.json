@@ -22,8 +22,8 @@
         "required": ["id", "category", "name", "source_span"],
         "properties": {
           "id": { "type": "string", "description": "short stable ref within this segment, e.g. 'dx1' — treatments reference it via for_diagnosis" },
-          "category": { "type": "string", "enum": ["cancer", "benign"] },
-          "name": { "type": "string", "description": "e.g. 'prostate adenocarcinoma', 'clear cell RCC', 'urothelial carcinoma', 'erectile dysfunction', 'nephrolithiasis', 'complex left renal cyst'" },
+          "category": { "type": "string", "enum": ["cancer", "benign", "indeterminate"], "description": "cancer = biopsy/pathology-confirmed malignancy. benign = a condition known benign (ED, BPH, stones, simple cyst). indeterminate = a mass/lesion of UNKNOWN pathology (e.g. an unbiopsied renal mass). NEVER label an unbiopsied/unconfirmed mass 'benign' — that has VA benefits implications." },
+          "name": { "type": "string", "description": "e.g. 'prostate adenocarcinoma', 'clear cell RCC', 'urothelial carcinoma' (cancer); 'erectile dysfunction', 'nephrolithiasis', 'simple renal cyst' (benign); 'renal mass of uncertain significance' / 'renal mass of unknown pathology' (indeterminate, NOT 'benign')" },
           "site": { "type": ["string", "null"], "description": "'prostate', 'left kidney', 'bladder', ..." },
           "diagnosis_date": { "type": ["string", "null"], "description": "ISO; biopsy-confirmed date for cancers, NOT earliest elevated-PSA date" },
           "stage_tnm": { "type": ["string", "null"] },
