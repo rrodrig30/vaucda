@@ -20,9 +20,40 @@ import re
 from typing import Optional
 
 from .llm_helper import synthesize_with_llm
-from .extractors import extract_imaging
+from .extractors import extract_imaging, extract_medications
 from .extractors.lab_extractor import extract_labs
 from .gu_diagnoses import detect_patient_sex, detect_gu_diagnoses
+
+# Clinical context the cysto HPI needs beyond imaging/labs/diagnoses.
+_ANTICOAG_RE = re.compile(
+    r"\b(apixaban|Eliquis|rivaroxaban|Xarelto|dabigatran|Pradaxa|edoxaban|"
+    r"warfarin|Coumadin|clopidogrel|Plavix|ticagrelor|prasugrel|aspirin|"
+    r"enoxaparin|Lovenox|heparin)\b", re.IGNORECASE)
+_HELD_RE = re.compile(
+    r"\b(held|hold|holding|stopped?|discontinued?|paused?|d/c'?d?|last\s+dose)\b",
+    re.IGNORECASE)
+_CULTURE_RE = re.compile(r"urine\s+cultur|urine\s+cx|\bUCx\b|no\s+growth", re.IGNORECASE)
+_SYMPTOM_RE = re.compile(
+    r"\b(gross|painless|microscopic|micro(?:hematuria)?)?\s*hematuria|"
+    r"blood\s+in\s+(?:the\s+)?urine|dysuria|urinary\s+frequency|"
+    r"lower\s+urinary\s+tract\s+symptoms|\bLUTS\b|irritative\s+voiding", re.IGNORECASE)
+
+
+def _scan_sentences(text: str, pattern, max_n: int = 4) -> str:
+    """Return up to max_n de-duplicated source sentences matching `pattern`."""
+    seen, out = set(), []
+    for sent in re.split(r"(?<=[.\n])\s+", text):
+        s = re.sub(r"\s+", " ", sent).strip()
+        if not s or len(s) < 8 or not pattern.search(s):
+            continue
+        key = s.lower()[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s[:220])
+        if len(out) >= max_n:
+            break
+    return "\n".join(f"- {s}" for s in out)
 
 _FIXED_INTRO = (
     "After informed consent was obtained, the patient was brought to the "
@@ -230,20 +261,45 @@ def build_cystoscopy_note(
         f"{d.organ} {d.name} [{d.category}]" for d in gu
     ) or "none documented"
 
-    # LLM: indication + the four per-patient sections in one call.
+    # Extra clinical context the procedural HPI needs.
+    try:
+        meds = (extract_medications(text) or "").strip()
+    except Exception:
+        meds = ""
+    anticoag = _scan_sentences(text, _ANTICOAG_RE, 4)
+    culture = _scan_sentences(text, _CULTURE_RE, 3)
+    symptoms = _scan_sentences(text, _SYMPTOM_RE, 4)
+    tobacco = _scan_sentences(text, re.compile(r"tobacco|smok|cigarette|pack[\s-]?year", re.I), 2)
+
+    # LLM: HPI + indication + the four per-patient sections in one call.
     ctx = (
         f"PATIENT SEX: {sex or 'unknown'}\n"
         f"KNOWN UROLOGIC DIAGNOSES: {dx_summary}\n"
         f"PRIOR TURBTs (oldest first, most recent last):\n{turbt_ctx}\n\n"
+        f"PRESENTING SYMPTOMS / REASON:\n{symptoms or '(none stated)'}\n\n"
+        f"TOBACCO / RISK FACTORS:\n{tobacco or '(none stated)'}\n\n"
+        f"ANTICOAGULATION / ANTIPLATELET (and any hold):\n{anticoag or '(none stated)'}\n\n"
+        f"URINE CULTURE / PRE-OP:\n{culture or '(none stated)'}\n\n"
+        f"CURRENT MEDICATIONS:\n{meds or '(none on file)'}\n\n"
         f"RELEVANT IMAGING (last 2 years):\n{imaging or '(none on file)'}\n\n"
         f"RELEVANT LABS:\n{labs or '(none on file)'}\n"
     )
     prompt = (
         ctx + "\n"
-        "Write the following sections for this cystoscopy note, each on its own "
-        "line and prefixed EXACTLY with the header shown (uppercase, colon):\n"
-        "INDICATION: a one-line indication for the cystoscopy (the reason it is "
-        "being performed for THIS patient).\n"
+        "Write the following sections for this cystoscopy note, each prefixed "
+        "EXACTLY with the header shown (uppercase, colon):\n"
+        "HPI: a concise NARRATIVE paragraph (flowing prose, not a list) that "
+        "explains why THIS patient is undergoing cystoscopy today. Weave in, "
+        "when supported by the data: prior bladder tumor and its resection "
+        "date + pathology (e.g. noninvasive urothelial carcinoma), the "
+        "presenting symptom (e.g. painless gross hematuria), risk factors "
+        "(tobacco), the most recent relevant imaging with its date and finding "
+        "(e.g. CT urogram on 6/22/26 with no upper-tract abnormality but "
+        "concern for a bladder mass), the pre-procedure urine culture result, "
+        "the absence of contraindications, and the anticoagulation status "
+        "including when it was held (e.g. 'on apixaban, held 3 days ago'). "
+        "State only what the data supports.\n"
+        "INDICATION: a one-line indication for the cystoscopy.\n"
         "FINDINGS: the anticipated cystoscopic findings of the urethra and "
         "bladder based on the indication, imaging, and PRIOR TURBT findings "
         "(name a specific lesion/location if flagged; otherwise state no new "
@@ -256,12 +312,15 @@ def build_cystoscopy_note(
     try:
         llm_raw = synthesize_with_llm(
             prompt, task_config=task_config, system_prompt=_CYSTO_SYSTEM,
-            max_tokens=900,
+            max_tokens=1300,
         ) or ""
     except Exception:
         llm_raw = ""
 
     sections = _parse_llm_sections(llm_raw)
+    hpi_m = re.search(r"(?:^|\n)\s*HPI\s*:\s*(.*?)(?=\n\s*(?:INDICATION|FINDINGS)\s*:|\Z)",
+                      llm_raw, re.S | re.I)
+    cysto_hpi = re.sub(r"\s+\n", "\n", hpi_m.group(1).strip()) if hpi_m else ""
     ind_m = re.search(r"INDICATION\s*:\s*(.*?)(?=\n\s*FINDINGS\s*:|\Z)", llm_raw, re.S | re.I)
     indication = (ind_m.group(1).strip() if ind_m else "").strip()
     if not indication:
@@ -279,6 +338,10 @@ def build_cystoscopy_note(
         "",
         f"Indication for Procedure: {indication}",
         "",
+    ]
+    if cysto_hpi:
+        lines += [f"HPI: {cysto_hpi}", ""]
+    lines += [
         "Relevant Imaging for this Visit:",
         (imaging or "None available for this visit."),
         "",
