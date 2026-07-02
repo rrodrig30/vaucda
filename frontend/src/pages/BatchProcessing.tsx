@@ -13,7 +13,16 @@ interface SelectedFile {
   size: number
   noteType: string
   outputName: string
+  included: boolean
 }
+
+// Batch note-type options — 'auto' keeps the per-file filename detection.
+const BATCH_NOTE_TYPES = [
+  { value: 'auto', label: 'Auto-detect (from filename)' },
+  { value: 'urology_clinic', label: 'Urology Clinic' },
+  { value: 'urology_consult', label: 'Urology Consult' },
+  { value: 'cystoscopy', label: 'Cystoscopy Note' },
+]
 
 interface CompletedFile {
   filename: string
@@ -72,6 +81,10 @@ export const BatchProcessing: React.FC = () => {
   const [selectedFiles, setSelectedFiles] = useState<SelectedFile[]>([])
   const [selectionError, setSelectionError] = useState<string | null>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
+  // Separate <input> for picking one or more individual files (not a folder).
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  // Note-type override applied to every file in the batch ('auto' = per-file).
+  const [batchNoteType, setBatchNoteType] = useState<string>('auto')
 
   // When the user picks a folder via the modern File System Access API
   // (Chrome/Edge), we hold a writable handle so completed `.vaucda`
@@ -146,6 +159,7 @@ export const BatchProcessing: React.FC = () => {
             file, name: file.name, size: file.size,
             noteType: detectNoteType(file.name),
             outputName: file.name.replace(/\.[^/.]+$/, '') + '.vaucda',
+            included: true,
           })
         }
       }
@@ -171,6 +185,15 @@ export const BatchProcessing: React.FC = () => {
   // explicitly chooses the legacy picker via the hidden input.
   // Cannot write back to the input folder — completed files go to the
   // browser's download folder instead.
+  // Include/exclude individual files from the batch.
+  const toggleFileIncluded = (name: string) => {
+    setSelectedFiles(prev => prev.map(sf =>
+      sf.name === name ? { ...sf, included: !sf.included } : sf))
+  }
+  const setAllIncluded = (val: boolean) => {
+    setSelectedFiles(prev => prev.map(sf => ({ ...sf, included: val })))
+  }
+
   const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = e.target.files
     if (!fileList || fileList.length === 0) return
@@ -187,6 +210,7 @@ export const BatchProcessing: React.FC = () => {
           file, name: file.name, size: file.size,
           noteType: detectNoteType(file.name),
           outputName: file.name.replace(/\.[^/.]+$/, '') + '.vaucda',
+          included: true,
         })
       }
     }
@@ -202,7 +226,8 @@ export const BatchProcessing: React.FC = () => {
 
   const handleStartBatch = useCallback(() => {
     setShowConfirm(false)
-    if (selectedFiles.length === 0) return
+    const filesToProcess = selectedFiles.filter(sf => sf.included)
+    if (filesToProcess.length === 0) return
 
     setIsProcessing(true)
     setProcessError(null)
@@ -211,11 +236,14 @@ export const BatchProcessing: React.FC = () => {
     setTotalContent(null)
     setCurrentFile(null)
     setCurrentIndex(0)
-    setTotalFiles(selectedFiles.length)
+    setTotalFiles(filesToProcess.length)
 
     const handle = notesApi.batchUploadProcessStream(
-      selectedFiles.map(sf => sf.file),
-      { visitDate: visitDate || undefined },
+      filesToProcess.map(sf => sf.file),
+      {
+        visitDate: visitDate || undefined,
+        noteType: batchNoteType !== 'auto' ? batchNoteType : undefined,
+      },
       {
         onFileStart: (data) => {
           setCurrentFile(data.filename)
@@ -371,7 +399,7 @@ export const BatchProcessing: React.FC = () => {
       {/* Folder Selection */}
       <Card>
         <div className="p-6">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Select Folder</h2>
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Select Files or Folder</h2>
 
           <input
             ref={folderInputRef}
@@ -383,12 +411,41 @@ export const BatchProcessing: React.FC = () => {
             accept=".txt"
             aria-label="Select folder containing clinical documents"
           />
+          {/* Individual-file picker: choose one or several .txt files (not a whole folder). */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={handleFolderSelect}
+            accept=".txt"
+            aria-label="Select one or more clinical document files"
+          />
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 flex-wrap">
             <Button onClick={handlePickFolder} disabled={isProcessing} className="flex items-center gap-2" aria-label="Browse for folder">
               <FiFolder className="w-4 h-4" aria-hidden="true" />
               Browse for Folder...
             </Button>
+            <Button variant="secondary" onClick={() => fileInputRef.current?.click()} disabled={isProcessing} className="flex items-center gap-2" aria-label="Select individual files">
+              <FiFileText className="w-4 h-4" aria-hidden="true" />
+              Select File(s)...
+            </Button>
+            <div>
+              <label htmlFor="batch-note-type" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Note Type</label>
+              <select
+                id="batch-note-type"
+                value={batchNoteType}
+                onChange={(e) => setBatchNoteType(e.target.value)}
+                disabled={isProcessing}
+                className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                aria-label="Note type applied to all files in the batch"
+              >
+                {BATCH_NOTE_TYPES.map(nt => (
+                  <option key={nt.value} value={nt.value}>{nt.label}</option>
+                ))}
+              </select>
+            </div>
             <div>
               <label htmlFor="batch-visit-date" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Visit Date</label>
               <input
@@ -420,7 +477,7 @@ export const BatchProcessing: React.FC = () => {
           )}
 
           <div className="mt-3 text-xs text-gray-500 dark:text-gray-400 space-y-1">
-            <p>Files with <span className="font-mono font-semibold">CON</span> as a standalone word → <span className="font-semibold">Urology Consult</span>. All others → <span className="font-semibold">Urology Clinic Note</span>.</p>
+            <p>Pick a whole folder or individual <span className="font-mono">.txt</span> file(s), then use the checkboxes to include/exclude any. <span className="font-semibold">Note Type</span> = <span className="font-semibold">Auto-detect</span> uses the filename (<span className="font-mono">CON</span> as a standalone word → Consult, else Clinic); choose a specific type to force it for the whole batch.</p>
             {hasFSAccess ? (
               <p>Output files write directly into an <span className="font-mono">output/</span> subfolder of the folder you select. A combined <span className="font-mono">total.vaucda</span> is written alongside them.</p>
             ) : (
@@ -435,17 +492,26 @@ export const BatchProcessing: React.FC = () => {
         <Card>
           <div className="p-6">
             <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Files to Process ({selectedFiles.length})</h2>
-              <Button onClick={() => setShowConfirm(true)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700" aria-label="Start batch processing">
-                <FiPlay className="w-4 h-4" aria-hidden="true" /> Start Batch Processing
-              </Button>
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
+                Files to Process ({selectedFiles.filter(sf => sf.included).length} of {selectedFiles.length})
+              </h2>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => setAllIncluded(true)} className="text-xs text-primary hover:underline" aria-label="Select all files">All</button>
+                <span className="text-gray-300">·</span>
+                <button type="button" onClick={() => setAllIncluded(false)} className="text-xs text-primary hover:underline" aria-label="Deselect all files">None</button>
+                <Button onClick={() => setShowConfirm(true)} disabled={selectedFiles.every(sf => !sf.included)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 ml-2" aria-label="Start batch processing">
+                  <FiPlay className="w-4 h-4" aria-hidden="true" /> Start Batch Processing
+                </Button>
+              </div>
             </div>
 
             {showConfirm && (
               <div role="alertdialog" aria-labelledby="confirm-title" aria-describedby="confirm-desc" className="mb-4 p-4 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 rounded-lg">
                 <p id="confirm-title" className="font-semibold text-yellow-800 dark:text-yellow-300">Confirm Batch Processing</p>
                 <p id="confirm-desc" className="text-sm text-yellow-700 dark:text-yellow-400 mt-1">
-                  This will upload and process {selectedFiles.length} file{selectedFiles.length !== 1 ? 's' : ''}. Each note will download automatically as it completes.
+                  This will upload and process {selectedFiles.filter(sf => sf.included).length} file{selectedFiles.filter(sf => sf.included).length !== 1 ? 's' : ''}
+                  {batchNoteType !== 'auto' && ` as ${BATCH_NOTE_TYPES.find(n => n.value === batchNoteType)?.label}`}.
+                  Each note will download automatically as it completes.
                 </p>
                 <div className="mt-3 flex gap-2">
                   <Button onClick={handleStartBatch} className="bg-green-600 hover:bg-green-700">Confirm</Button>
@@ -458,6 +524,15 @@ export const BatchProcessing: React.FC = () => {
               <table className="w-full text-sm" role="table" aria-label="Files to process">
                 <thead>
                   <tr className="border-b border-gray-200 dark:border-gray-700">
+                    <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">
+                      <input
+                        type="checkbox"
+                        aria-label="Include all files"
+                        checked={selectedFiles.length > 0 && selectedFiles.every(sf => sf.included)}
+                        ref={el => { if (el) el.indeterminate = selectedFiles.some(sf => sf.included) && selectedFiles.some(sf => !sf.included) }}
+                        onChange={(e) => setAllIncluded(e.target.checked)}
+                      />
+                    </th>
                     <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">#</th>
                     <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Filename</th>
                     <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Size</th>
@@ -466,21 +541,40 @@ export const BatchProcessing: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {selectedFiles.map((sf, idx) => (
-                    <tr key={sf.name} className="border-b border-gray-100 dark:border-gray-800">
+                  {selectedFiles.map((sf, idx) => {
+                    // Effective note type = batch override when set, else per-file detection.
+                    const effType = batchNoteType !== 'auto' ? batchNoteType : sf.noteType
+                    const typeLabel = effType === 'cystoscopy' ? 'Cystoscopy'
+                      : effType === 'urology_consult' ? 'Consult' : 'Clinic'
+                    const typeClass = effType === 'cystoscopy'
+                      ? 'bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-300'
+                      : effType === 'urology_consult'
+                      ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300'
+                      : 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300'
+                    return (
+                    <tr key={sf.name} className={`border-b border-gray-100 dark:border-gray-800 ${sf.included ? '' : 'opacity-40'}`}>
+                      <td className="py-2 px-3">
+                        <input
+                          type="checkbox"
+                          aria-label={`Include ${sf.name}`}
+                          checked={sf.included}
+                          onChange={() => toggleFileIncluded(sf.name)}
+                        />
+                      </td>
                       <td className="py-2 px-3 text-gray-500">{idx + 1}</td>
                       <td className="py-2 px-3 font-mono text-gray-900 dark:text-white">
                         <span className="flex items-center gap-2"><FiFileText className="w-4 h-4 text-gray-400" aria-hidden="true" />{sf.name}</span>
                       </td>
                       <td className="py-2 px-3 text-gray-600 dark:text-gray-400">{formatBytes(sf.size)}</td>
                       <td className="py-2 px-3">
-                        <span className={`inline-flex px-2 py-0.5 rounded text-xs font-medium ${sf.noteType === 'urology_consult' ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300' : 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300'}`}>
-                          {sf.noteType === 'urology_consult' ? 'Consult' : 'Clinic'}
+                        <span className={`inline-flex px-2 py-0.5 rounded text-xs font-medium ${typeClass}`}>
+                          {typeLabel}
                         </span>
                       </td>
                       <td className="py-2 px-3 font-mono text-gray-500 dark:text-gray-400 text-xs">{sf.outputName}</td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
               </table>
             </div>

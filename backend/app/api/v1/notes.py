@@ -1731,6 +1731,7 @@ def _sse_event(event_type: str, data: dict) -> str:
 async def batch_upload_and_process(
     files: list[UploadFile] = File(..., description="Clinical .txt files to batch process"),
     visit_date: Optional[str] = Form(None, description="Visit date (YYYY-MM-DD) for IPSS and age calculation"),
+    note_type_override: Optional[str] = Form(None, description="Force a note type for ALL files (e.g. 'cystoscopy'); 'auto'/empty = detect from filename"),
     http_request: Request = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
@@ -1903,8 +1904,11 @@ async def batch_upload_and_process(
                 end_patient_session()
 
         try:
+            _ov = (note_type_override or "").strip().lower()
             for idx, filename in enumerate(saved_files):
-                note_type = detect_note_type(filename)
+                # Explicit override (from the batch note-type dropdown) wins over
+                # filename-based auto-detection.
+                note_type = _ov if _ov and _ov != "auto" else detect_note_type(filename)
                 output_name = Path(filename).stem + ".vaucda"
                 file_path = Path(batch_temp_dir) / filename
 
