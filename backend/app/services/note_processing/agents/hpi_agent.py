@@ -282,6 +282,29 @@ def _strip_nonurologic_sentences(hpi: str) -> str:
     return result if result else hpi
 
 
+def reflow_hpi(hpi: str) -> str:
+    """Collapse a choppy one-sentence-per-line HPI into flowing prose.
+
+    Pure whitespace / line-break normalization — NO content is added, removed,
+    or reworded, so accuracy is untouched; only readability improves. The LLM
+    sometimes renders each skeleton beat on its own line ("He was diagnosed...\\n
+    He completed...\\n..."); this joins those into a connected paragraph and
+    keeps the closing "Today's visit ..." sentence as its own short paragraph.
+    """
+    if not hpi or not hpi.strip():
+        return hpi
+    body = hpi.strip()
+    label = ""
+    m = re.match(r"^(HPI:\s*)", body, re.IGNORECASE)
+    if m:
+        label, body = m.group(1), body[m.end():]
+    body = re.sub(r"\s*\n+\s*", " ", body)      # all internal breaks -> spaces
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    # 2-paragraph shape: put the closing visit-reason sentence on its own line.
+    body = re.sub(r"\s+(Today'?s visit\b)", r"\n\n\1", body, count=1)
+    return label + body
+
+
 def _dedupe_hpi_sentences(hpi: str) -> str:
     """Remove sentence-level redundancy that survives the LLM prompt.
 
@@ -1349,8 +1372,11 @@ def synthesize_hpi(
             "  1. Walk skeleton sections 1-7 IN ORDER. Do not reorder them\n"
             "     and do not skip a section that has content.\n"
             "  2. Every TREATMENT HISTORY bullet must appear in the prose,\n"
-            "     with its date and verb. A RESTARTED event MUST be\n"
-            "     rendered as a restart — never as 'continued' or\n"
+            "     with its date and verb, but COMBINE the bullets into flowing\n"
+            "     compound sentences (chain them with commas/semicolons in\n"
+            "     chronological order) — do NOT write one short sentence per\n"
+            "     bullet and do NOT start each with 'He'. A RESTARTED event\n"
+            "     MUST be rendered as a restart — never as 'continued' or\n"
             "     'completed' or 'finished'. A DECLINED event MUST be\n"
             "     rendered as a decline — never as 'received'.\n"
             "  3. Every entry in CURRENT REGIMEN must be acknowledged in\n"
@@ -1365,9 +1391,11 @@ def synthesize_hpi(
             "     findings, or clinical decisions that are not in the\n"
             "     skeleton. If you would otherwise need to do so, omit\n"
             "     the claim.\n"
-            "  7. Output 1-2 paragraphs of fluent narrative prose. No\n"
-            "     bullets, no meta-commentary. Start directly with the\n"
-            "     INTRO sentence.\n"
+            "  7. Output 1-2 paragraphs of CONTINUOUS, connected narrative\n"
+            "     prose (compound sentences that chain related events). Do\n"
+            "     NOT place each fact on its own line, do NOT begin multiple\n"
+            "     consecutive sentences with 'He', no bullets, no\n"
+            "     meta-commentary. Start directly with the INTRO sentence.\n"
         )
 
     # Use LLM to synthesize comprehensive HPI
@@ -1375,21 +1403,30 @@ def synthesize_hpi(
 Create a current, comprehensive UROLOGY HPI that synthesizes all available urologic information from the source notes into a cohesive narrative for TODAY'S visit.
 
 HPI STRUCTURE & STYLE (write for a clinician to read quickly — non-negotiable):
-- Write flowing NARRATIVE PROSE in complete sentences. Do NOT produce a
-  bulleted or dash-separated list, and NEVER write "He completed X on DATE - X
-  completed" or repeat a treatment phrase. State each fact exactly ONCE.
-- OPEN (first 1-2 sentences) with the diagnosis and STAGE: the cancer, its
-  date of diagnosis, the grade (Gleason/Grade Group for prostate, Fuhrman for
-  renal, WHO grade for bladder), and BOTH the clinical and pathologic stage
-  when available (e.g. "cT2N0M0, pT3aN0"). Do not bury the stage later.
-- Then give the treatment history ONCE, in CHRONOLOGICAL order (earliest to
-  most recent). For a definitive treatment, report its COMPLETION (e.g.
-  "completed external-beam radiation therapy in April 2023"); do NOT also list
-  a separate initiation date for that same course, and never state an
-  initiation AFTER its completion.
+- Write flowing, connected NARRATIVE PROSE — the SAME readable style as a good
+  Assessment paragraph. Do NOT write a staccato list of short sentences that
+  each begin with "He" ("He was diagnosed... He completed... He is
+  currently..."), do NOT put each fact on its own line, and do NOT produce
+  bullets or "X on DATE - X completed". State each fact exactly ONCE.
+- CHAIN the diagnosis and treatment course into ONE OR TWO compound sentences
+  using commas and semicolons, in CHRONOLOGICAL order. Example of the required
+  style: "Mr. Foster is an 82-year-old man with prostate adenocarcinoma
+  diagnosed in 2000 (Gleason 4+3, cT2N0M0/pT3aN0), treated with radical
+  prostatectomy that year, with biochemical recurrence in 2021 managed by
+  external-beam radiation completed in November 2021, and androgen-deprivation
+  therapy plus a second radiation course initiated in July 2024 for metastatic
+  disease." Combine treatments that share a date or episode into a single
+  clause rather than a separate sentence each.
+- OPEN with that diagnosis-and-stage sentence: the cancer, date of diagnosis,
+  grade (Gleason/Grade Group for prostate, Fuhrman for renal, WHO grade for
+  bladder), and BOTH clinical and pathologic stage when available. Do not bury
+  the stage later.
+- For a definitive treatment report its COMPLETION; do NOT also list a separate
+  initiation date for that same course, and never state an initiation AFTER its
+  completion.
 - Then the PSA trajectory (lead with the current value), then today's visit
-  reason and interval status. Be concise and precise — no repetition, no
-  restating the same treatment, date, or value twice.
+  reason and interval status — as continuous prose, not a list. Be concise and
+  precise, with no repetition.
 
 {clinical_context}
 {authoritative_directive}

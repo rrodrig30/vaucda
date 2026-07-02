@@ -1040,6 +1040,11 @@ def build_urology_note(
         if _hpi_dropped:
             print(f"      ✂ HPI fact-guard dropped {len(_hpi_dropped)} "
                   f"contradicting sentence(s): {[s[:80] for s in _hpi_dropped]}")
+    # Readability: collapse a choppy one-sentence-per-line HPI into flowing
+    # prose (whitespace-only — does not change any clinical content).
+    if hpi:
+        from .agents.hpi_agent import reflow_hpi
+        hpi = reflow_hpi(hpi)
     ipss = results.get('ipss', '')
     dhx = results.get('dhx', '')
     pmh = results.get('pmh', '')
