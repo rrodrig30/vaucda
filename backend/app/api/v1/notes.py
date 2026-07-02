@@ -478,6 +478,7 @@ async def generate_initial_note(
             task_config=stage1_config,
             source_format=_src_fmt,
             patient_facts=_shared_facts,
+            note_type=request.note_type,
         )
 
         logger.info(f"Agent-based note builder complete: {len(preliminary_note)} chars generated")
@@ -882,6 +883,7 @@ async def generate_express_note(
             task_config=stage1_config,
             source_format=_src_fmt,
             patient_facts=_shared_facts,
+            note_type=request.note_type,
         )
         logger.info(
             f"Express: preliminary note ready ({len(preliminary_note)} chars)"
@@ -1119,6 +1121,7 @@ async def generate_express_note_stream(
                 task_config=stage1_config,
                 source_format=_src_fmt,
                 patient_facts=_shared_facts,
+                note_type=note_type,
             )
             t_stage1 = _time.time() - t0
 
@@ -1825,6 +1828,7 @@ async def batch_upload_and_process(
                 clinical_text=clinical_input,
                 task_config=stage1_config,
                 source_format=_src_fmt,
+                note_type=note_type,
             )
 
         async def stage2_func(preliminary_note, clinical_input, note_type):
@@ -2079,6 +2083,7 @@ async def batch_process_folder(
                 clinical_text=clinical_input,
                 task_config=stage1_config,
                 source_format=_src_fmt,
+                note_type=note_type,
             )
 
         # Define Stage 2 processing function
@@ -2320,6 +2325,7 @@ async def batch_process_folder_stream(
             clinical_text=clinical_input,
             task_config=stage1_config,
             source_format=_src_fmt,
+            note_type=note_type,
         )
 
     async def stage2_func(

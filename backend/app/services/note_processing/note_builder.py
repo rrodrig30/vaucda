@@ -201,6 +201,7 @@ def build_urology_note(
     task_config: Optional["LLMTaskConfig"] = None,
     source_format: str = "cprs",
     patient_facts: Optional["PatientStatusFacts"] = None,
+    note_type: str = "clinic_note",
 ) -> str:
     """
     Build a comprehensive urology clinic note from a clinical document.
@@ -226,6 +227,19 @@ def build_urology_note(
     # Set the task config for all agents to use via thread-local storage
     # This ensures all synthesize_with_llm calls use the user's configured model
     set_current_task_config(task_config)
+
+    # Cystoscopy is a PROCEDURE note with its own fixed template (Male/Female
+    # branch, anticipated Findings/Assessment/Plan/Disposition) — build it in a
+    # single pass instead of the clinic Stage-1/Stage-2 pipeline. Stage 2
+    # (build_stage2_note) passes this note through unchanged for note_type
+    # 'cystoscopy'.
+    if (note_type or "").lower().replace(" ", "_") in (
+            "cystoscopy", "cysto", "cystoscopy_note"):
+        from .cystoscopy_builder import build_cystoscopy_note
+        return build_cystoscopy_note(
+            clinical_text, task_config=task_config,
+            source_format=source_format, patient_facts=patient_facts,
+        )
 
     # Source-format normalization. Applied at the very top so every
     # extractor / agent downstream sees CPRS-canonical section layout.

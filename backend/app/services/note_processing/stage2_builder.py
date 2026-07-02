@@ -334,6 +334,16 @@ def build_stage2_note(
     """
     # Use task_config model if provided, otherwise use model parameter
     effective_model = task_config.model if task_config else model
+
+    # Cystoscopy notes are built complete in Stage 1 (see build_cystoscopy_note):
+    # the procedure narrative + anticipated Findings/Assessment/Plan/Disposition
+    # are already generated per-patient. Stage 2 has nothing to add — pass the
+    # note through unchanged.
+    if (note_type or "").lower().replace(" ", "_") in (
+            "cystoscopy", "cysto", "cystoscopy_note"):
+        print("\n[Stage 2] Cystoscopy note — already complete from Stage 1; passthrough.")
+        return stage1_note
+
     print("\n" + "="*80)
     print("STAGE 2: COMPLETING CLINICAL NOTE (POST-VISIT)")
     print("="*80)

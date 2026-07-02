@@ -83,7 +83,7 @@ export interface User {
 // Note Generation Types
 export interface NoteGenerationRequest {
   clinical_input: string
-  note_type: 'clinic_note' | 'consult' | 'preop' | 'postop'
+  note_type: 'clinic_note' | 'consult' | 'preop' | 'postop' | 'cystoscopy'
   template_id?: string
   selected_modules?: string[]
   llm_config: LLMConfig
@@ -513,7 +513,7 @@ export interface CalculatorSuggestion {
 // Stage 1: Initial Note Request
 export interface InitialNoteRequest {
   clinical_input: string
-  note_type?: 'urology_clinic' | 'urology_consult'
+  note_type?: 'urology_clinic' | 'urology_consult' | 'cystoscopy'
   patient_name?: string
   ssn_last4?: string
   visit_date?: string  // MM/DD/YYYY - used for IPSS date and accurate age calculation

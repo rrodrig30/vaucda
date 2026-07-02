@@ -18,6 +18,18 @@ NC='\033[0m' # No Color
 BACKEND_PID_FILE=".backend.pid"
 FRONTEND_PID_FILE=".frontend.pid"
 
+# FULL implementation: run the backend in the L1-capable venv (Python 3.11 with
+# torch + transformers + peft + bitsandbytes AND the full server deps) so the L1
+# narrative extractor runs in-process. Falls back to the classic py3.9 venv only
+# if .venv-l1 is absent (L1 then degrades gracefully to the deterministic path).
+if [ -x "backend/.venv-l1/bin/python" ]; then
+    BACKEND_VENV=".venv-l1"
+    RUN_FULL_L1=true
+else
+    BACKEND_VENV="venv"
+    RUN_FULL_L1=false
+fi
+
 # Default ports (will be overridden from .env if available)
 DEFAULT_BACKEND_PORT=8027
 DEFAULT_FRONTEND_PORT=3005
@@ -157,16 +169,23 @@ echo -e "${YELLOW}[4/7] Checking Dependencies${NC}"
 
 # Backend dependencies
 cd backend
-if [ ! -d "venv" ]; then
-    echo -e "${YELLOW}⚠ Python virtual environment not found. Creating...${NC}"
-    python3 -m venv venv
-    echo -e "${GREEN}✓ Virtual environment created${NC}"
+if [ "$RUN_FULL_L1" = true ]; then
+    echo -e "${GREEN}✓ FULL mode: using L1 venv (.venv-l1)${NC}"
+else
+    if [ ! -d "venv" ]; then
+        echo -e "${YELLOW}⚠ Python virtual environment not found. Creating...${NC}"
+        python3 -m venv venv
+        echo -e "${GREEN}✓ Virtual environment created${NC}"
+    fi
+    echo -e "${YELLOW}⚠ .venv-l1 not found — starting WITHOUT the L1 extractor${NC}"
+    echo -e "${YELLOW}  (deterministic multi-cancer + fact-guard still active). To enable${NC}"
+    echo -e "${YELLOW}  FULL/L1, build backend/.venv-l1 per scripts/l1/README.md.${NC}"
 fi
 
-echo -e "${BLUE}  Activating virtual environment...${NC}"
-source venv/bin/activate
+echo -e "${BLUE}  Activating virtual environment ($BACKEND_VENV)...${NC}"
+source "$BACKEND_VENV/bin/activate"
 
-# Check if requirements installed
+# Check core deps are present
 if ! python -c "import fastapi" 2>/dev/null; then
     echo -e "${YELLOW}⚠ Installing Python dependencies (this may take a few minutes)...${NC}"
     pip install --upgrade pip
@@ -174,6 +193,16 @@ if ! python -c "import fastapi" 2>/dev/null; then
     echo -e "${GREEN}✓ Python dependencies installed${NC}"
 else
     echo -e "${GREEN}✓ Python dependencies already installed${NC}"
+fi
+
+# FULL mode: verify the L1 ML stack is importable
+if [ "$RUN_FULL_L1" = true ]; then
+    if python -c "import torch, transformers, peft, bitsandbytes" 2>/dev/null; then
+        echo -e "${GREEN}✓ L1 ML stack present (torch/transformers/peft/bitsandbytes)${NC}"
+    else
+        echo -e "${YELLOW}⚠ .venv-l1 is missing the L1 ML stack; L1 will degrade to deterministic${NC}"
+        RUN_FULL_L1=false
+    fi
 fi
 
 cd ..
@@ -198,7 +227,7 @@ echo ""
 echo -e "${YELLOW}[5/7] Initializing Database${NC}"
 
 cd backend
-source venv/bin/activate
+source "$BACKEND_VENV/bin/activate"
 
 # Check if SQLite database exists
 if [ ! -f "data/vaucda.db" ]; then
@@ -261,7 +290,7 @@ if [ "$SKIP_BACKEND" = true ]; then
     echo -e "${GREEN}✓ Backend already running — skipping${NC}"
 else
     cd backend
-    source venv/bin/activate
+    source "$BACKEND_VENV/bin/activate"
 
     # Create logs directory
     mkdir -p logs
@@ -282,17 +311,47 @@ else
         fi
     fi
 
+    # The app mounts a static/ directory at import time — ensure it exists.
+    mkdir -p static
+
+    # FULL/L1 runtime env: turn the L1 narrative extractor on and make the gated
+    # medgemma base model reachable. HF_TOKEN is read from the repo .env (root or
+    # backend). --reload is disabled in FULL mode so the resident 27B model isn't
+    # reloaded on every file-watch event.
+    RELOAD_FLAG="--reload"
+    if [ "$RUN_FULL_L1" = true ]; then
+        export VAUCDA_L1=1
+        export VAUCDA_L1_MAX_NEW="${VAUCDA_L1_MAX_NEW:-2048}"
+        export TOKENIZERS_PARALLELISM=false
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+        if [ -z "$HF_TOKEN" ]; then
+            for envf in ../.env .env; do
+                if [ -f "$envf" ]; then
+                    _tok=$(grep -E '^HF_TOKEN=' "$envf" | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+                    [ -n "$_tok" ] && export HF_TOKEN="$_tok" && break
+                fi
+            done
+        fi
+        if [ -n "$HF_TOKEN" ]; then
+            echo -e "${GREEN}✓ FULL/L1 enabled (VAUCDA_L1=1, HF_TOKEN loaded)${NC}"
+        else
+            echo -e "${YELLOW}⚠ VAUCDA_L1=1 but HF_TOKEN not found in .env — L1 will degrade to deterministic${NC}"
+        fi
+        RELOAD_FLAG=""
+        echo -e "${YELLOW}  (FULL mode: --reload disabled so the 27B model stays resident)${NC}"
+    fi
+
     # Start backend in background
     # CRITICAL: Exclude data directory from reload watching to prevent restarts during file uploads
     if [ "$USE_HTTPS" = "true" ]; then
         echo -e "${BLUE}  Starting FastAPI server on https://0.0.0.0:${BACKEND_PORT}...${NC}"
-        nohup uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} --reload \
+        nohup uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} $RELOAD_FLAG \
           --reload-exclude 'data/*' --reload-exclude 'logs/*' --reload-exclude '*.db' \
           --ssl-keyfile ../ssl/key.pem \
           --ssl-certfile ../ssl/cert.pem > logs/backend.log 2>&1 &
     else
         echo -e "${BLUE}  Starting FastAPI server on http://0.0.0.0:${BACKEND_PORT}...${NC}"
-        nohup uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} --reload \
+        nohup uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} $RELOAD_FLAG \
           --reload-exclude 'data/*' --reload-exclude 'logs/*' --reload-exclude '*.db' > logs/backend.log 2>&1 &
     fi
     BACKEND_PID=$!
