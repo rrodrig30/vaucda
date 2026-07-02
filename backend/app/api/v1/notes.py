@@ -462,11 +462,22 @@ async def generate_initial_note(
             clinical_input_with_date = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
 
         _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        # Compute the authoritative PatientStatusFacts ONCE (multi-cancer ground
+        # truth + optional L1 enrichment) and feed it to Stage 1 so the CC/HPI
+        # agents anchor on the correct primary. Stage 2 (generate-final) derives
+        # the same facts from the same clinical input.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts, clinical_input_with_date, _src_fmt,
+        )
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
             clinical_text=clinical_input_with_date,
             task_config=stage1_config,
             source_format=_src_fmt,
+            patient_facts=_shared_facts,
         )
 
         logger.info(f"Agent-based note builder complete: {len(preliminary_note)} chars generated")
@@ -714,6 +725,21 @@ async def generate_final_note(
         # When implemented, this will contain real-time provider-patient conversation
         ambient_transcript = None
 
+        # Compute the authoritative PatientStatusFacts from the SAME raw clinical
+        # input Stage 1 used (multi-cancer ground truth + optional L1), so the
+        # Assessment/Plan ground on those facts instead of re-deriving a divergent
+        # picture from the rendered Stage 1 note.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        _final_input = request.clinical_input
+        if request.visit_date:
+            _final_input = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts, _final_input, _src_fmt,
+        )
+
         # Build Stage 2 note with task-specific LLM config
         # Pass non_gu_notes for cross-specialty urologic content extraction
         complete_note = build_stage2_note(
@@ -726,7 +752,8 @@ async def generate_final_note(
             task_config=stage2_config,
             note_type=request.note_type,
             patient_name=request.patient_name,
-            ssn_last4=request.ssn_last4
+            ssn_last4=request.ssn_last4,
+            patient_facts=_shared_facts,
         )
 
         logger.info("Stage 2 agent-based note generation complete")
@@ -1078,11 +1105,20 @@ async def generate_express_note_stream(
                 )
 
             _src_fmt = await _get_user_source_format(current_user.user_id, db)
+            # Authoritative PatientStatusFacts computed ONCE (multi-cancer ground
+            # truth + optional L1), shared by Stage 1 and Stage 2 below.
+            from app.services.note_processing.note_builder import (
+                build_authoritative_patient_facts,
+            )
+            _shared_facts = await asyncio.to_thread(
+                build_authoritative_patient_facts, clinical_input_with_date, _src_fmt,
+            )
             preliminary_note = await asyncio.to_thread(
                 build_urology_note,
                 clinical_text=clinical_input_with_date,
                 task_config=stage1_config,
                 source_format=_src_fmt,
+                patient_facts=_shared_facts,
             )
             t_stage1 = _time.time() - t0
 
@@ -1192,6 +1228,7 @@ async def generate_express_note_stream(
                 note_type=note_type,
                 patient_name=patient_name_v,
                 ssn_last4=ssn_last4_v,
+                patient_facts=_shared_facts,
             )
             t_stage2 = _time.time() - t1
             yield _sse("stage2_complete", {
@@ -1512,6 +1549,21 @@ async def generate_stage2_agent(
         # When implemented, this will contain real-time provider-patient conversation
         ambient_transcript = None
 
+        # Compute the authoritative PatientStatusFacts from the SAME raw clinical
+        # input Stage 1 used (multi-cancer ground truth + optional L1), so the
+        # Assessment/Plan ground on those facts instead of re-deriving a divergent
+        # picture from the rendered Stage 1 note.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        _final_input = request.clinical_input
+        if request.visit_date:
+            _final_input = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts, _final_input, _src_fmt,
+        )
+
         # Build Stage 2 note with task-specific LLM config
         # Pass non_gu_notes for cross-specialty urologic content extraction
         complete_note = build_stage2_note(
@@ -1524,7 +1576,8 @@ async def generate_stage2_agent(
             task_config=stage2_config,
             note_type=request.note_type,
             patient_name=request.patient_name,
-            ssn_last4=request.ssn_last4
+            ssn_last4=request.ssn_last4,
+            patient_facts=_shared_facts,
         )
 
         logger.info("Stage 2 agent-based note generation complete")
