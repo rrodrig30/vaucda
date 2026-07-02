@@ -1374,6 +1374,23 @@ def synthesize_hpi(
     instructions = f"""
 Create a current, comprehensive UROLOGY HPI that synthesizes all available urologic information from the source notes into a cohesive narrative for TODAY'S visit.
 
+HPI STRUCTURE & STYLE (write for a clinician to read quickly — non-negotiable):
+- Write flowing NARRATIVE PROSE in complete sentences. Do NOT produce a
+  bulleted or dash-separated list, and NEVER write "He completed X on DATE - X
+  completed" or repeat a treatment phrase. State each fact exactly ONCE.
+- OPEN (first 1-2 sentences) with the diagnosis and STAGE: the cancer, its
+  date of diagnosis, the grade (Gleason/Grade Group for prostate, Fuhrman for
+  renal, WHO grade for bladder), and BOTH the clinical and pathologic stage
+  when available (e.g. "cT2N0M0, pT3aN0"). Do not bury the stage later.
+- Then give the treatment history ONCE, in CHRONOLOGICAL order (earliest to
+  most recent). For a definitive treatment, report its COMPLETION (e.g.
+  "completed external-beam radiation therapy in April 2023"); do NOT also list
+  a separate initiation date for that same course, and never state an
+  initiation AFTER its completion.
+- Then the PSA trajectory (lead with the current value), then today's visit
+  reason and interval status. Be concise and precise — no repetition, no
+  restating the same treatment, date, or value twice.
+
 {clinical_context}
 {authoritative_directive}
 {skeleton_directive}

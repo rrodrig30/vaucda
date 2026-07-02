@@ -102,6 +102,91 @@ def _parse_llm_sections(raw: str) -> dict:
     return out
 
 
+_MONTHS_RE = (r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*")
+
+
+def _parse_year(s: str) -> Optional[int]:
+    m = re.search(r"\b(19|20)\d{2}\b", s)
+    return int(m.group(0)) if m else None
+
+
+def _filter_imaging_recent(imaging: str, ref_year: int, years: int = 2) -> str:
+    """Keep only imaging study blocks dated within `years` of ref_year. Each
+    block starts with a 'STUDY (m/d/yyyy):' header; blocks without a parseable
+    recent date are dropped. Cysto notes only show the last 2 years of imaging."""
+    if not imaging or not ref_year:
+        return imaging
+    # Split into blocks at each study header line ("... (date):").
+    blocks = re.split(r"(?m)(?=^[A-Z][A-Z0-9,/&\-\. ]+\([\d/]+\):)", imaging)
+    kept = []
+    for b in blocks:
+        if not b.strip():
+            continue
+        hdr = b.split("\n", 1)[0]
+        dm = re.search(r"\((\d{1,2})/(\d{1,2})/(\d{2,4})\)", hdr)
+        yr = None
+        if dm:
+            yr = int(dm.group(3))
+            yr = yr + 2000 if yr < 100 else yr
+        else:
+            yr = _parse_year(hdr)
+        if yr is not None and (ref_year - yr) <= years:
+            kept.append(b.strip())
+    return "\n".join(kept).strip()
+
+
+def _turbt_history(patient_facts, text: str):
+    """Return prior TURBTs as (date_display, finding), oldest -> most recent
+    last. Prefers the deterministic clinical timeline; falls back to a text
+    scan of sentences mentioning TURBT."""
+    rows = {}
+    events = getattr(patient_facts, "clinical_timeline", None) or []
+    for e in events:
+        blob = f"{getattr(e, 'modality', '')} {getattr(e, 'detail', '')} {getattr(e, 'source_quote', '')}"
+        if re.search(r"\bTURBT\b|transurethral\s+resection", blob, re.IGNORECASE):
+            key = getattr(e, "date_key", "") or getattr(e, "date_display", "")
+            rows[key] = (getattr(e, "date_display", "") or "(undated)",
+                         (getattr(e, "detail", "") or getattr(e, "modality", "")).strip())
+    if not rows:
+        for sent in re.split(r"(?<=[.\n])\s+", text):
+            if not re.search(r"\bTURBT\b|transurethral\s+resection", sent, re.IGNORECASE):
+                continue
+            dm = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", sent) or \
+                re.search(rf"{_MONTHS_RE}\.?\s+\d{{4}}", sent)
+            disp = dm.group(0) if dm else "(undated)"
+            rows[disp] = (disp, re.sub(r"\s+", " ", sent).strip()[:160])
+    return [rows[k] for k in sorted(rows.keys())]
+
+
+def _surveillance_table() -> str:
+    """A 45-char-wide ASCII table of the routine post-treatment surveillance
+    follow-up timeline (NMIBC-style: cystoscopy + cytology + upper-tract
+    imaging at risk-adapted intervals). Every line is exactly 45 chars."""
+    W = 45
+    C1, C2 = 16, 26  # 1 + 16 + 1 + 26 + 1 = 45
+    def row(a, b):
+        return "|" + f" {a:<{C1 - 1}}" + "|" + f" {b:<{C2 - 1}}" + "|"
+    bar = "+" + "-" * (C1) + "+" + "-" * (C2) + "+"
+    title = "|" + "ROUTINE SURVEILLANCE TIMELINE".center(W - 2) + "|"
+    lines = [
+        "+" + "-" * (W - 2) + "+",
+        title,
+        bar,
+        row("Interval", "Studies"),
+        bar,
+        row("3 months", "Cystoscopy + cytology"),
+        row("6 months", "Cystoscopy + cytology"),
+        row("9 months", "Cystoscopy + cytology"),
+        row("12 months", "Cysto + cytology + CT"),
+        row("18 months", "Cystoscopy + cytology"),
+        row("24 months", "Cysto + cytology + CT"),
+        row("Then q6 mo", "Cystoscopy + cytology"),
+        row("Yearly", "Upper-tract imaging"),
+        bar,
+    ]
+    return "\n".join(lines)
+
+
 def build_cystoscopy_note(
     clinical_text: str,
     task_config: Optional["object"] = None,
@@ -118,11 +203,25 @@ def build_cystoscopy_note(
 
     header = _extract_header(clinical_text)  # header lives in the raw banner
     sex = (getattr(patient_facts, "patient_sex", "") or detect_patient_sex(text) or "").lower()
+    # Cysto notes: only show radiology from the last 2 years.
+    ref_year = _parse_year(header.get("date", "") or "") or _parse_year(clinical_text[:4000])
+    from datetime import date as _date
+    if not ref_year:
+        try:
+            ref_year = _date.today().year
+        except Exception:
+            ref_year = None
     imaging = (extract_imaging(text) or "").strip()
+    if ref_year:
+        imaging = _filter_imaging_recent(imaging, ref_year, years=2)
     try:
         labs = (extract_labs(text, header.get("date", "")) or "").strip()
     except Exception:
         labs = ""
+
+    # Prior TURBTs (dates + findings), oldest first / most recent last.
+    turbts = _turbt_history(patient_facts, text)
+    turbt_ctx = "\n".join(f"- {d}: {finding}" for d, finding in turbts) if turbts else "(none documented)"
 
     # Known GU diagnoses give the LLM the indication anchor (bladder tumor,
     # hematuria workup, renal mass, etc.).
@@ -135,7 +234,8 @@ def build_cystoscopy_note(
     ctx = (
         f"PATIENT SEX: {sex or 'unknown'}\n"
         f"KNOWN UROLOGIC DIAGNOSES: {dx_summary}\n"
-        f"RELEVANT IMAGING:\n{imaging or '(none on file)'}\n\n"
+        f"PRIOR TURBTs (oldest first, most recent last):\n{turbt_ctx}\n\n"
+        f"RELEVANT IMAGING (last 2 years):\n{imaging or '(none on file)'}\n\n"
         f"RELEVANT LABS:\n{labs or '(none on file)'}\n"
     )
     prompt = (
@@ -145,8 +245,9 @@ def build_cystoscopy_note(
         "INDICATION: a one-line indication for the cystoscopy (the reason it is "
         "being performed for THIS patient).\n"
         "FINDINGS: the anticipated cystoscopic findings of the urethra and "
-        "bladder based on the indication and imaging (name a specific lesion/"
-        "location if the imaging flagged one; otherwise state no new lesions).\n"
+        "bladder based on the indication, imaging, and PRIOR TURBT findings "
+        "(name a specific lesion/location if flagged; otherwise state no new "
+        "lesions; note the resection site of the most recent TURBT if any).\n"
         "ASSESSMENT: a brief clinical impression.\n"
         "PLAN: the next steps (biopsy, fulguration, surveillance interval, "
         "imaging, referrals) appropriate to the findings.\n"
@@ -184,11 +285,24 @@ def build_cystoscopy_note(
         "Relevant Labs for this Visit:",
         (labs or "None available for this visit."),
         "",
+    ]
+
+    # Prior TURBT history — oldest first, most recent presented last.
+    if turbts:
+        lines.append("Prior TURBT History (most recent last):")
+        for d, finding in turbts:
+            lines.append(f"  - {d}: {finding}")
+        lines.append("")
+
+    lines += [
         f"Narrative: {narrative}",
         "",
         f"Assessment: {sections['ASSESSMENT']}",
         "",
         f"Plan: {sections['PLAN']}",
+        "",
+        "Surveillance Schedule (routine post-treatment follow-up):",
+        _surveillance_table(),
         "",
         "Complications: None.",
         f"Disposition: {sections['DISPOSITION'] or 'Patient tolerated the procedure well and was discharged in stable condition.'}",

@@ -77,6 +77,18 @@ async function writeFileToOutputSubfolder(
   await writable.close()
 }
 
+// Write directly into a user-chosen output directory (no 'output/' subfolder).
+async function writeFileToDir(
+  dirHandle: any,
+  filename: string,
+  content: string,
+): Promise<void> {
+  const fileHandle = await dirHandle.getFileHandle(filename, { create: true })
+  const writable = await fileHandle.createWritable()
+  await writable.write(content)
+  await writable.close()
+}
+
 export const BatchProcessing: React.FC = () => {
   const [selectedFiles, setSelectedFiles] = useState<SelectedFile[]>([])
   const [selectionError, setSelectionError] = useState<string | null>(null)
@@ -93,6 +105,24 @@ export const BatchProcessing: React.FC = () => {
   const [dirHandle, setDirHandle] = useState<any>(null)
   const [folderName, setFolderName] = useState<string | null>(null)
   const [folderSaveError, setFolderSaveError] = useState<string | null>(null)
+  // Optional user-chosen destination for the generated files. When set,
+  // completed notes are written directly here instead of <input>/output/.
+  const [outputDirHandle, setOutputDirHandle] = useState<any>(null)
+  const [outputFolderName, setOutputFolderName] = useState<string | null>(null)
+
+  // Let the user pick a specific folder to save the generated .vaucda files to.
+  const handlePickOutputFolder = async () => {
+    try {
+      const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' })
+      setOutputDirHandle(handle)
+      setOutputFolderName(handle.name)
+      setFolderSaveError(null)
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        setFolderSaveError(`Could not open output folder: ${err?.message || String(err)}`)
+      }
+    }
+  }
 
   const [visitDate, setVisitDate] = useState('')
 
@@ -255,8 +285,16 @@ export const BatchProcessing: React.FC = () => {
           // (Chrome/Edge File System Access path). Otherwise the user
           // re-downloads via the per-row button in the results table.
           let saved = false
-          if (dirHandle && data.note_content) {
-            writeFileToOutputSubfolder(dirHandle, data.output_filename, data.note_content)
+          // Prefer the user-chosen output folder (write directly); otherwise
+          // fall back to <input folder>/output/. If neither, the per-row
+          // download button is used.
+          const writer = outputDirHandle && data.note_content
+            ? writeFileToDir(outputDirHandle, data.output_filename, data.note_content)
+            : (dirHandle && data.note_content
+              ? writeFileToOutputSubfolder(dirHandle, data.output_filename, data.note_content)
+              : null)
+          if (writer) {
+            writer
               .then(() => {
                 setCompletedFiles(prev => prev.map(cf =>
                   cf.outputFilename === data.output_filename
@@ -264,7 +302,7 @@ export const BatchProcessing: React.FC = () => {
               })
               .catch(err => {
                 setFolderSaveError(
-                  `Auto-save of ${data.output_filename} to <folder>/output/ failed: `
+                  `Auto-save of ${data.output_filename} failed: `
                   + `${err?.message || String(err)}`,
                 )
               })
@@ -446,6 +484,12 @@ export const BatchProcessing: React.FC = () => {
                 ))}
               </select>
             </div>
+            {hasFSAccess && (
+              <Button variant="outline" onClick={handlePickOutputFolder} disabled={isProcessing} className="flex items-center gap-2" aria-label="Choose output folder for saved notes">
+                <FiFolder className="w-4 h-4" aria-hidden="true" />
+                {outputFolderName ? `Output: ${outputFolderName}` : 'Choose Output Folder...'}
+              </Button>
+            )}
             <div>
               <label htmlFor="batch-visit-date" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Visit Date</label>
               <input
@@ -461,7 +505,11 @@ export const BatchProcessing: React.FC = () => {
             {selectedFiles.length > 0 && (
               <span className="text-sm text-gray-600 dark:text-gray-400">
                 {selectedFiles.length} .txt file{selectedFiles.length !== 1 ? 's' : ''} selected
-                {folderName && (
+                {outputFolderName ? (
+                  <span className="ml-2 text-green-700 dark:text-green-400">
+                    · save to <span className="font-mono">{outputFolderName}/</span>
+                  </span>
+                ) : folderName && (
                   <span className="ml-2 text-green-700 dark:text-green-400">
                     · auto-save to <span className="font-mono">{folderName}/output/</span>
                   </span>

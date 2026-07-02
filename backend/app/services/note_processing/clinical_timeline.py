@@ -1318,6 +1318,22 @@ def detect_current_active_treatments(raw_text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # Rendering for the prompt
 # ---------------------------------------------------------------------------
+_TX_FILLER_RE = re.compile(
+    r"\b(completed?|start(?:ed)?|initiat(?:ed|e)|underwent|received|ongoing|"
+    r"discontinued|therapy|treatment|course|for|prostate|cancer|adenocarcinoma|"
+    r"of|the|a|an|on|to|with|status|post|s/?p)\b", re.IGNORECASE)
+
+
+def _detail_is_redundant(detail: str, modality: str) -> bool:
+    """True when ``detail`` conveys nothing beyond ``modality`` + status words
+    (so appending it would just duplicate the treatment phrase)."""
+    def core(s: str) -> set:
+        s = _TX_FILLER_RE.sub(" ", (s or "").lower())
+        return set(re.sub(r"[^a-z0-9]+", " ", s).split())
+    dw, mw = core(detail), core(modality)
+    return not dw or dw <= mw
+
+
 def format_timeline_for_prompt(events: List[TimelineEvent], limit: int = 30) -> str:
     """Render the timeline as a dated bullet list for inclusion in the
     GROUND TRUTH prompt block. Sorted oldest -> newest so the narrative
@@ -1327,6 +1343,15 @@ def format_timeline_for_prompt(events: List[TimelineEvent], limit: int = 30) -> 
     lines: List[str] = []
     # Show up to `limit` events. If overflow, summarize.
     show = events[-limit:] if len(events) > limit else events
+    # A definitive treatment that has a COMPLETED event does not also need its
+    # STARTED event — the two read as a redundant "initiated ... completed", and
+    # an undated START sorts AFTER the completion ("initiated after completed").
+    # Keep the completion; drop the same-modality START.
+    _completed_mods = {(e.modality or "").strip().lower()
+                       for e in show if e.event_type == "TREATMENT_COMPLETED"}
+    show = [e for e in show if not (
+        e.event_type == "TREATMENT_STARTED"
+        and (e.modality or "").strip().lower() in _completed_mods)]
     for e in show:
         date_disp = e.date_display or "(undated)"
         type_lbl = e.event_type.replace("_", " ").title()
@@ -1335,7 +1360,14 @@ def format_timeline_for_prompt(events: List[TimelineEvent], limit: int = 30) -> 
         parts = [f"[{date_disp}]", type_lbl]
         if modality:
             parts.append(f"- {modality}")
-        if detail and detail.lower() != modality.lower():
+        # For TREATMENT_* events the detail is the raw matched phrase (e.g.
+        # "radiation therapy completed"), which just repeats the type + modality
+        # and makes the HPI render "completed radiation therapy on DATE -
+        # radiation therapy completed". Only append detail when it ADDS
+        # information (diagnosis/pathology/procedure/imaging findings) and isn't
+        # a rewording of the modality + status.
+        if detail and not e.event_type.startswith("TREATMENT") \
+                and not _detail_is_redundant(detail, modality):
             parts.append(f": {detail}")
         lines.append("  " + " ".join(parts))
     if len(events) > limit:
