@@ -152,10 +152,19 @@ def _derive_cc_from_context(
 
 
 def _apply_terminology(cc_text: str) -> str:
-    """Standardize 'consult' → 'follow-up' and drop 'New patient' prefix."""
+    """Standardize 'consult' → 'follow-up', drop 'New patient', strip a stale
+    leading age phrase."""
     cc_text = re.sub(r'\bConsult\s+for\b', 'Follow-up for', cc_text, flags=re.IGNORECASE)
     cc_text = re.sub(r'\bconsult\b', 'follow-up', cc_text, flags=re.IGNORECASE)
     cc_text = re.sub(r'^\s*New\s+patient\s+', '', cc_text, flags=re.IGNORECASE)
+    # A CC should not restate the patient's age — the banner and HPI own it, and
+    # a source-note age is frequently stale (the CREWS 62-vs-63 mismatch). Strip
+    # a leading "<N>-year-old male/female" phrase and re-capitalize.
+    stripped = re.sub(
+        r'^\s*(?:an?\s+)?\d{1,3}[\s-]year[\s-]old\s+(?:male|female|man|woman)\s+',
+        '', cc_text, flags=re.IGNORECASE)
+    if stripped != cc_text and stripped:
+        cc_text = stripped[0].upper() + stripped[1:]
     return cc_text.strip()
 
 
@@ -765,6 +774,69 @@ def _treatment_naive_cc_from_pmh(document_pmh: str) -> Optional[str]:
     return None
 
 
+_GU_ORGAN_WORD = {
+    "renal": "renal mass", "bladder": "bladder tumor",
+    "upper_tract": "upper-tract urothelial tumor", "testicular": "testicular mass",
+    "penile": "penile lesion", "adrenal": "adrenal mass",
+}
+
+
+_INJECTION_CC_RE = re.compile(
+    r"^\s*(?:eligard|lupron|leuprolide|zoladex|goserelin|degarelix|firmagon|"
+    r"trelstar|triptorelin|orgovyx|relugolix)\b[^,.\n]*\binjection\b", re.IGNORECASE)
+_PHASE_WORD = {
+    "METASTATIC_CASTRATION_RESISTANT": "metastatic castration-resistant ",
+    "METASTATIC_HORMONE_SENSITIVE": "metastatic hormone-sensitive ",
+    "BIOCHEMICAL_RECURRENCE": "biochemically recurrent ",
+}
+
+
+def _reframe_injection_cc(cc: str, current_phase: Optional[str]) -> str:
+    """A bare depot-injection CC ('Eligard injection for prostate cancer') is
+    technically the visit reason but clinically thin. Reframe it to name the
+    disease state + therapy, keeping the scheduled injection."""
+    if not cc:
+        return cc
+    m = _INJECTION_CC_RE.search(cc)
+    if not m:
+        return cc
+    drug = m.group(0).split()[0]
+    drug = drug[0].upper() + drug[1:].lower()
+    phase_word = _PHASE_WORD.get(current_phase or "", "")
+    return (f"Follow-up of {phase_word}prostate cancer on androgen deprivation "
+            f"therapy for scheduled {drug} injection")
+
+
+def _cc_from_gu_diagnoses(diags: Optional[List]) -> str:
+    """Build a CC anchored on non-prostate GU diagnoses (renal / bladder / ...).
+
+    Returns "" when there is no actionable non-prostate diagnosis (so the
+    existing prostate-oriented CC logic runs unchanged). A confirmed cancer is
+    named by its diagnosis; an indeterminate mass is framed as 'of uncertain
+    significance' (never 'benign'); a resolved benign finding is not the CC.
+    """
+    if not diags:
+        return ""
+    parts: List[str] = []
+    for d in diags:
+        cat = getattr(d, "category", "")
+        if cat == "benign":
+            continue  # a resolved benign finding is not the visit's primary CC
+        if cat == "cancer":
+            phrase = getattr(d, "name", "") or _GU_ORGAN_WORD.get(getattr(d, "organ", ""), "")
+        else:  # indeterminate
+            organ = getattr(d, "organ", "")
+            phrase = f"{_GU_ORGAN_WORD.get(organ, organ)} of uncertain significance"
+        status = getattr(d, "status", "")
+        if status:
+            phrase += f" ({status})"
+        if phrase:
+            parts.append(phrase)
+    if not parts:
+        return ""
+    return "Follow-up of " + " and ".join(parts)
+
+
 def synthesize_cc(
     gu_notes: List[Dict[str, str]],
     non_gu_notes: List[Dict[str, str]],
@@ -776,6 +848,9 @@ def synthesize_cc(
     current_phase: Optional[str] = None,
     current_active_treatments: Optional[List[str]] = None,
     clinical_timeline: Optional[List] = None,
+    other_gu_diagnoses: Optional[List] = None,
+    patient_sex: Optional[str] = None,
+    prostate_cancer_status: Optional[str] = None,
 ) -> str:
     """Synthesize a urology Chief Complaint.
 
@@ -814,6 +889,21 @@ def synthesize_cc(
         Non-empty urologic CC string. Never "" — falls back to
         "Urology follow-up" as the final safety net.
     """
+    # 0-pre. Non-prostate GU primary anchor (runs BEFORE the prostate anchor).
+    # Renal masses and bladder tumors are frequently the PRIMARY reason for the
+    # visit; without a structured signal the CC defaults to a prostate/PSA or
+    # PMH-derived complaint (e.g. "erectile dysfunction" for a bladder-tumor
+    # patient, or a prostate narrative for a female renal-mass patient).
+    gu_cc = _cc_from_gu_diagnoses(other_gu_diagnoses)
+    if gu_cc:
+        # Dual-primary patients (prostate cancer + renal/bladder) should read
+        # both problems; append a concise prostate clause when applicable.
+        # A female patient can never have prostate cancer — no prostate clause.
+        if ((patient_sex or "").lower() != "female"
+                and (prostate_cancer_status or "").upper() in ("PRESENT", "TREATED")):
+            gu_cc += "; prostate cancer follow-up"
+        return _apply_terminology(gu_cc)
+
     # 0. Primary-cancer anchor (runs FIRST — outranks phase classifier).
     # When source unambiguously shows a urologic cancer AND >=1 of the
     # patient's own GU note CCs explicitly names that cancer, that CC
@@ -830,7 +920,7 @@ def synthesize_cc(
         clinical_document,
     )
     if anchored_cc:
-        return _apply_terminology(anchored_cc)
+        return _apply_terminology(_reframe_injection_cc(anchored_cc, current_phase))
 
     # Phase-driven CC short-circuit. When the deterministic phase
     # classifier has a high-confidence verdict (mCRPC, mHSPC, salvage,
@@ -979,6 +1069,10 @@ CRITICAL: Provide ONLY the concise chief complaint. NO meta-commentary, NO expla
         cc = _derive_cc_from_context(
             document_pmh, document_pathology, document_psa,
         )
+
+    # Bare depot-injection CCs get named-disease framing before the
+    # post-treatment reframe.
+    cc = _reframe_injection_cc(cc, current_phase)
 
     # 6. Post-treatment reframe. No-op when treatment isn't completed,
     # the CC has no stale markers, or PSA data is insufficient. When

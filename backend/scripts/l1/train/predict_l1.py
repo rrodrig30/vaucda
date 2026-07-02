@@ -53,21 +53,31 @@ def main():
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.adapter)
+    # Left-pad for decoder-only batched generation (generated tokens align at the
+    # end, so one prompt-length slice decodes every row in the batch).
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                              bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_use_double_quant=True)
     base = AutoModelForCausalLM.from_pretrained(
         args.base, quantization_config=bnb, torch_dtype=torch.bfloat16,
-        device_map="auto", attn_implementation="eager")
+        device_map="auto", attn_implementation="sdpa")
     model = PeftModel.from_pretrained(base, args.adapter)
     model.eval()
+    # Stop on <end_of_turn> as well as eos so short JSON doesn't run to max_new.
+    eot = tok.convert_tokens_to_ids("<end_of_turn>")
+    eos_ids = [i for i in {tok.eos_token_id, eot} if i is not None and i >= 0]
 
     seg_dir = Path(args.gold_dir) / "segments"
     out = Path(args.out_dir) / "labels"
     out.mkdir(parents=True, exist_ok=True)
     sids = sorted(p.stem for p in seg_dir.glob("*.txt") if not p.name.endswith(".pathology.txt"))
 
-    ok = fail = 0
+    # Build every prompt up front, record token length for length-sorted batching.
+    MAXLEN = 8192
+    items = []
     for sid in sids:
         seg = (seg_dir / f"{sid}.txt").read_text(errors="ignore")
         pth = seg_dir / f"{sid}.pathology.txt"
@@ -76,25 +86,56 @@ def main():
                 + "\n\n=== SURGICAL PATHOLOGY ===\n" + path)
         prompt = tok.apply_chat_template([{"role": "user", "content": user}],
                                          tokenize=False, add_generation_prompt=True)
-        ids = tok(prompt, return_tensors="pt", truncation=True, max_length=8192).to(model.device)
+        n = min(len(tok(prompt, add_special_tokens=False).input_ids), MAXLEN)
+        items.append({"sid": sid, "seg": seg, "path": path, "prompt": prompt, "n": n})
+
+    # Sort short->long, then greedily pack batches under a KV-cache token budget:
+    # batch_size * (padded_prompt_len + max_new) <= BUDGET. Short segments batch
+    # heavily; the few long ones batch small — bounds peak memory either way.
+    # Budget on a realistic generation estimate, not worst-case max_new: actual
+    # JSON outputs are ~hundreds of tokens, and gemma3's sliding-window KV (1024
+    # on 5/6 layers) keeps cache small even if a row runs to max_new.
+    items.sort(key=lambda it: it["n"])
+    BUDGET, GEN_EST = 50000, 1024
+    batches, cur, cur_max = [], [], 0
+    for it in items:
+        nmax = max(cur_max, it["n"])
+        if cur and ((len(cur) + 1) * (nmax + GEN_EST) > BUDGET or len(cur) >= 24):
+            batches.append(cur)
+            cur, cur_max = [], 0
+        cur.append(it)
+        cur_max = max(cur_max, it["n"])
+    if cur:
+        batches.append(cur)
+
+    ok = fail = done = 0
+    for bi, batch in enumerate(batches):
+        enc = tok([it["prompt"] for it in batch], return_tensors="pt", padding=True,
+                  truncation=True, max_length=MAXLEN).to(model.device)
         with torch.no_grad():
-            gen = model.generate(**ids, max_new_tokens=args.max_new, do_sample=False,
-                                 pad_token_id=tok.pad_token_id or tok.eos_token_id)
-        text = tok.decode(gen[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
-        draft, err = parse_hpi_json(text)
-        if not draft:
-            fail += 1
-            draft = {"primary_context": "urologic", "diagnoses": [],
-                     "treatment_events": [], "procedures": [], "imaging": [], "metastases": []}
-        else:
-            ok += 1
-        rec = {"segment_id": sid,
-               "primary_context": draft.get("primary_context", "urologic")}
-        hs = [("segment", seg), ("pathology", path)]
-        for k in _REC:
-            rec[k] = [resolve(dict(r), hs) for r in (draft.get(k) or [])]
-        (out / f"{sid}.json").write_text(json.dumps(rec, indent=1))
-    print(f"predicted {len(sids)} segments ({ok} parsed, {fail} fell back) -> {out}")
+            gen = model.generate(**enc, max_new_tokens=args.max_new, do_sample=False,
+                                  eos_token_id=eos_ids,
+                                  pad_token_id=tok.pad_token_id or tok.eos_token_id)
+        plen = enc["input_ids"].shape[1]
+        for row, it in zip(gen, batch):
+            text = tok.decode(row[plen:], skip_special_tokens=True)
+            draft, err = parse_hpi_json(text)
+            if not draft:
+                fail += 1
+                draft = {"primary_context": "urologic", "diagnoses": [],
+                         "treatment_events": [], "procedures": [], "imaging": [], "metastases": []}
+            else:
+                ok += 1
+            rec = {"segment_id": it["sid"],
+                   "primary_context": draft.get("primary_context", "urologic")}
+            hs = [("segment", it["seg"]), ("pathology", it["path"])]
+            for k in _REC:
+                rec[k] = [resolve(dict(r), hs) for r in (draft.get(k) or [])]
+            (out / f"{it['sid']}.json").write_text(json.dumps(rec, indent=1))
+        done += len(batch)
+        print(f"  batch {bi+1}/{len(batches)} (bs={len(batch)}, len<={batch[-1]['n']}) "
+              f"-> {done}/{len(items)} done", flush=True)
+    print(f"predicted {len(items)} segments ({ok} parsed, {fail} fell back) -> {out}")
     print(f"score:  python scripts/l1/score.py {args.gold_dir} {args.out_dir}")
 
 

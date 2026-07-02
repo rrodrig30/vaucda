@@ -116,6 +116,13 @@ def main():
 
     for i, fp in enumerate(files, 1):
         out_fp = out_dir / fp.name
+        # Resume support (VAUCDA_BATCH_RESUME=1): skip patients already done so a
+        # run interrupted by a shared-GPU OOM can be re-invoked to finish the rest.
+        import os as _os
+        if (_os.getenv("VAUCDA_BATCH_RESUME", "0") in ("1", "true", "on")
+                and out_fp.exists() and out_fp.stat().st_size > 500):
+            print(f"[{i}/{len(files)}] SKIP {fp.name} (already done)", flush=True)
+            continue
         t0 = time.time()
         try:
             text = fp.read_text(encoding="utf-8", errors="ignore")

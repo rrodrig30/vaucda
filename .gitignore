@@ -92,3 +92,17 @@ reports_and_summaries/
 VERIFICATION_*.txt
 FILES_MODIFIED.txt
 CHANGES_SUMMARY.txt
+"L1 gold review.html"
+
+# L1 / ML environments, model adapters, corpora, and generated test notes
+backend/.venv-l1/
+backend/venv/
+tests/l1_model/
+tests/l1_gold/
+tests/l1_gold_regex/
+tests/l1_train/
+backend/tests/l1_train/
+tests/**/output_new/
+tests/**/output_l1/
+tests/**/output_l1off/
+tests/**/output_l1_prefix/

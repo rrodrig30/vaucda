@@ -1316,6 +1316,19 @@ def synthesize_hpi(
             "'Phoenix criteria', 'nadir+2', 'salvage', or 'post-treatment'.\n"
             "Rising PSA in such a patient is a workup question for new\n"
             "disease, not recurrence of treated disease.\n"
+            "\n"
+            "MULTI-CANCER: PROSTATE_CANCER_STATUS is organ-specific — ABSENT\n"
+            "does NOT mean the patient is cancer-free. If an\n"
+            "OTHER_UROLOGIC_DIAGNOSES block is present, those renal / bladder /\n"
+            "other non-prostate diagnoses are frequently the PRIMARY reason for\n"
+            "the visit: CENTER the HPI on them (the mass/tumor, its size and\n"
+            "trajectory, imaging, biopsy/pathology status, and management) and\n"
+            "do NOT default to a prostate/PSA narrative. An 'indeterminate'\n"
+            "mass is NEITHER cancer NOR benign — call it a mass/lesion of\n"
+            "uncertain significance; NEVER call an unbiopsied mass 'benign'.\n"
+            "If PATIENT_SEX is female, prostate cancer, PSA screening,\n"
+            "prostatectomy and ADT are anatomically IMPOSSIBLE — never write\n"
+            "any prostate-cancer narrative for her.\n"
         )
 
     # PHASE 2 directive: when a deterministic skeleton was provided, the

@@ -22,9 +22,11 @@ Defaults are tuned for a single 96 GB H100 (QLoRA 4-bit, 27B).
 """
 import argparse
 import json
+import os
 import random
 
 import torch
+from dotenv import load_dotenv
 from datasets import Dataset
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig)
@@ -64,6 +66,9 @@ def main():
                     help="silver slice held out for eval-loss (the GOLD is the real metric)")
     args = ap.parse_args()
 
+    # Pick up HF_TOKEN (gated medgemma) from the repo .env without exporting it.
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env"))
+
     tiers = set(args.include_tiers.split(","))
     ds = load_examples(args.data, tiers, args.oversample_high)
     split = ds.train_test_split(test_size=args.dev_frac, seed=13)
@@ -72,6 +77,13 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    # medgemma's stock chat template has no {% generation %} mask block, so
+    # assistant_only_loss would compute loss on ZERO tokens. Swap in a
+    # render-identical template that wraps assistant turns in generation tags
+    # (verified byte-identical render + correct mask in scripts/l1/train).
+    _tpl = os.path.join(os.path.dirname(__file__), "gemma_genmask.jinja")
+    with open(_tpl) as fh:
+        tok.chat_template = fh.read()
 
     bnb = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4",
@@ -79,7 +91,10 @@ def main():
     )
     model = AutoModelForCausalLM.from_pretrained(
         args.model, quantization_config=bnb, torch_dtype=torch.bfloat16,
-        attn_implementation="eager", device_map="auto",
+        # SDPA (not eager): eager materializes the full [heads x seq x seq]
+        # attention matrix (~8 GiB at 8k seq) and OOMs. Gemma3 dropped attn
+        # softcapping, so SDPA is correct and memory-efficient here.
+        attn_implementation="sdpa", device_map="auto",
     )
     model = prepare_model_for_kbit_training(model)
     model.config.use_cache = False
@@ -103,6 +118,11 @@ def main():
         max_length=args.max_seq_len,
         packing=False,                      # one example per sequence (varied lengths)
         assistant_only_loss=True,           # completion-only: loss on the JSON, not the prompt
+        # Gemma3's 256k-vocab LM head makes full-seq logits the peak-memory cost
+        # (OOMs at 8k seq on a shared GPU). chunked_nll computes CE in 256-token
+        # chunks -> logits buffer is chunk*vocab, not seq*vocab. lm_head is NOT a
+        # LoRA target here, so this path is supported.
+        loss_type="chunked_nll",
         logging_steps=10, save_strategy="epoch", eval_strategy="epoch",
         report_to="none", optim="paged_adamw_8bit",
     )

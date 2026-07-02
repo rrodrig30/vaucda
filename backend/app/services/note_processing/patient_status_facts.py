@@ -39,6 +39,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from .gu_diagnoses import GUDiagnosis, detect_gu_diagnoses, detect_patient_sex
+
 logger = logging.getLogger(__name__)
 
 
@@ -757,6 +759,18 @@ class PatientStatusFacts:
     biopsy, TURBT, DEXA, etc.). Surfaced separately because these were
     frequently missed by synthesis agents despite being decision-driving."""
 
+    patient_sex: str = ""
+    """'female' | 'male' | '' from demographics. Guards against
+    anatomically-impossible narratives (prostate cancer in a female patient)."""
+
+    other_gu_diagnoses: List[GUDiagnosis] = field(default_factory=list)
+    """Non-prostate GU diagnoses (renal / bladder / upper-tract / testicular /
+    penile / adrenal), each with organ + category (cancer / indeterminate /
+    benign) + grade + status. Everything else in this layer models ONLY
+    prostate cancer; without this the CC/HPI/Assessment/Plan agents have no
+    structured anchor for a renal-mass or bladder-tumor primary and default to
+    a prostate/PSA narrative (or hallucinate prostate cancer)."""
+
     treatment_active_status: Dict[str, str] = field(default_factory=dict)
     """Per-category current-status verdict for the HPI agent. Categories:
     'adt' (DISCONTINUED | ACTIVE), 'radiation'/'prostatectomy'/'focal'
@@ -910,6 +924,13 @@ def extract_patient_status_facts(
         active_meds = detect_current_active_treatments(raw_for_timeline)
         proc_findings = extract_procedure_findings(raw_for_timeline)
 
+    # Multi-cancer ground truth: patient sex + non-prostate GU diagnoses. The
+    # rest of this function is prostate-only; these give the CC/HPI/Assessment/
+    # Plan agents a structured anchor for a renal-mass / bladder-tumor primary.
+    detect_src = raw_for_timeline or stage1_note or ""
+    patient_sex = detect_patient_sex(detect_src)
+    other_gu = detect_gu_diagnoses(detect_src)
+
     return PatientStatusFacts(
         cancer_status=status,
         cancer_evidence=cancer_evidence,
@@ -920,6 +941,8 @@ def extract_patient_status_facts(
         biopsy_all_negative=biopsy_all_negative,
         asap_present=asap,
         inconsistencies=inconsistencies,
+        patient_sex=patient_sex,
+        other_gu_diagnoses=other_gu,
         treatment_active_status=treatment_active,
         clinical_timeline=timeline,
         current_phase=current_phase,
@@ -1056,8 +1079,44 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
         "Treat the following as fact. If your generated text contradicts",
         "any line below, your answer is wrong and will be rejected.",
         "",
-        f"PROSTATE_CANCER_STATUS: {facts.cancer_status}",
     ]
+
+    if facts.patient_sex:
+        lines.append(f"PATIENT_SEX: {facts.patient_sex}")
+        if facts.patient_sex == "female":
+            lines.append(
+                "  -> Prostate cancer, PSA screening, prostatectomy and ADT are "
+                "ANATOMICALLY IMPOSSIBLE in a female patient. Never write any "
+                "prostate-cancer narrative, and read PROSTATE_CANCER_STATUS below "
+                "as not-applicable."
+            )
+        lines.append("")
+
+    # Non-prostate GU diagnoses are frequently the PRIMARY reason for the visit
+    # (renal mass, bladder tumor). List them FIRST so the CC and HPI anchor to
+    # the correct organ instead of defaulting to a prostate/PSA narrative.
+    if facts.other_gu_diagnoses:
+        lines.append(
+            "OTHER_UROLOGIC_DIAGNOSES (non-prostate — often the PRIMARY problem):"
+        )
+        for d in facts.other_gu_diagnoses:
+            bits = [f"{d.organ}: {d.name}", f"[{d.category}]"]
+            if d.grade:
+                bits.append(f"grade {d.grade}")
+            if d.status:
+                bits.append(d.status)
+            lines.append("  - " + " ".join(bits))
+        lines.append(
+            "  -> Center the CC and HPI on these when present. An 'indeterminate' "
+            "mass is NEITHER cancer NOR benign — frame it as a mass/lesion of "
+            "uncertain significance (NEVER call an unbiopsied mass 'benign'). The "
+            "prostate status below is a SEPARATE, organ-specific finding: "
+            "PROSTATE_CANCER_STATUS: ABSENT does NOT mean the patient is "
+            "cancer-free."
+        )
+        lines.append("")
+
+    lines.append(f"PROSTATE_CANCER_STATUS: {facts.cancer_status}")
     if facts.cancer_evidence:
         lines.append("  Evidence found:")
         for ev in facts.cancer_evidence[:5]:

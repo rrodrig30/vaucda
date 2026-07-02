@@ -81,3 +81,43 @@ per-fix signal.
 - **Next (Milestone 3):** LoRA fine-tune medgemma-27b on `l1_sft.jsonl`
   (weight by confidence tier), scored against the frozen gold with `score.py`;
   then M4 shadow-integration behind `VAUCDA_L1=1`.
+
+- **Milestone 3 COMPLETE:** LoRA fine-tune of medgemma-27b on `l1_sft.jsonl`
+  (`train/`). Adapters at `tests/l1_model/medgemma27b-l1-lora` (8192 seq, the
+  promoted one) and `…-10k` (10240 seq). Gold scorecard (vs regex baseline):
+  diagnoses R 0.15→0.67, treatment-event R 0.07→0.56, diagnosis-date 9%→90%.
+  Grade-by-system (regex 0.91) and the procedure/imaging split are NOT promoted
+  (regex ≥ L1 there). 8192 ≈ 10240 — long-context did not justify itself.
+
+- **Milestone 4 COMPLETE — wired behind `VAUCDA_L1=1`:**
+  `app/services/note_processing/l1/` (`runtime.py` = lazy 4-bit model singleton
+  + per-segment inference using the byte-identical training prompt/parser;
+  `enrich.py` = grounded, additive, monotonic merge into `PatientStatusFacts`).
+  Hook: `build_authoritative_patient_facts` (the single shared-facts source for
+  Stage 1 + Stage 2). Default OFF → pipeline is byte-for-byte the deterministic
+  path. Merge promotes only diagnoses / treatment_events / diagnosis_date
+  (where L1 beat regex on gold); every L1 record must ground to a verbatim
+  source quote (hallucination net); status only upgrades away from UNCERTAIN;
+  grade/procedures/imaging stay deterministic.
+
+  **Enabling it:**
+  ```bash
+  # 1. the backend runtime needs the ML deps (the app venv normally lacks them):
+  pip install torch --index-url https://download.pytorch.org/whl/cu124
+  pip install transformers peft bitsandbytes accelerate python-dotenv
+  # 2. flags (HF_TOKEN must be in .env for the gated base model):
+  export VAUCDA_L1=1                 # turn the extractor on
+  export VAUCDA_L1_ADAPTER=.../tests/l1_model/medgemma27b-l1-lora   # optional (default)
+  export VAUCDA_L1_STRICT=1          # optional: raise instead of degrade-to-deterministic
+  ```
+  Input must be VistA format (the router segments VistA `SPN` narrative, matching
+  the corpus); CPRS-native input is a safe no-op. If the ML deps or model are
+  missing while the flag is on, enrichment logs and degrades to the deterministic
+  facts (unless `VAUCDA_L1_STRICT=1`), so it can never take down note generation.
+  Validated end-to-end on a real mCRPC patient: recovered the full narrative
+  treatment trajectory (RP→IMRT→leuprolide→…→Lu-177→gamma-knife) the regex layer
+  missed, flipping cancer_status→TREATED and treatment_naive→False.
+
+  **Recommended next step before production:** run the 100-patient note-quality
+  eval with `VAUCDA_L1=1` to measure the downstream note impact (the gold eval
+  measures extraction, not rendered-note quality).
