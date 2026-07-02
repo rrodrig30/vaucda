@@ -539,6 +539,20 @@ def build_stage2_note(
     )
     print(f"      Assessment: {len(assessment) if assessment else 0} chars")
 
+    # Deterministic fact guard on the GENERATED assessment. The sanitizer runs
+    # on the input CONTEXT above, but the LLM can still emit a contradicting
+    # sentence (a prostate-cancer diagnosis for an ABSENT / female patient, a
+    # treatment assertion for a treatment-naive patient). Strip those here;
+    # negated ("no evidence of prostate cancer") and workup ("mpMRI to evaluate")
+    # mentions are preserved by the sanitizer's negation guard. Runs BEFORE the
+    # Plan so the Plan is generated congruent with the cleaned Assessment.
+    if patient_facts is not None and assessment:
+        assessment, _asmt_dropped = sanitize_context_against_facts(assessment, patient_facts)
+        if _asmt_dropped:
+            logger.info("Assessment fact-guard dropped %d sentence(s): %s",
+                        len(_asmt_dropped), _asmt_dropped)
+            print(f"      Fact-guard: dropped {len(_asmt_dropped)} contradicting sentence(s) from Assessment")
+
     # Step 3: Verify Assessment
     # CRITICAL: Use session-isolated verifier to prevent cross-patient data contamination
     print("\n[3/6] Verifying Assessment against source data...")
@@ -590,6 +604,14 @@ def build_stage2_note(
         assessment_text=assessment,
     )
     print(f"      Plan: {len(plan) if plan else 0} chars")
+
+    # Same deterministic fact guard on the generated Plan.
+    if patient_facts is not None and plan:
+        plan, _plan_dropped = sanitize_context_against_facts(plan, patient_facts)
+        if _plan_dropped:
+            logger.info("Plan fact-guard dropped %d sentence(s): %s",
+                        len(_plan_dropped), _plan_dropped)
+            print(f"      Fact-guard: dropped {len(_plan_dropped)} contradicting sentence(s) from Plan")
 
     # Step 5: Verify Plan
     print("\n[5/6] Verifying Plan against source data...")

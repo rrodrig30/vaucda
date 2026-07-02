@@ -1016,6 +1016,16 @@ def build_urology_note(
     # Extract results to named variables
     cc = results.get('cc', '')
     hpi = results.get('hpi', '')
+    # Deterministic fact guard on the generated HPI output (symmetry with the
+    # Stage 2 Assessment/Plan guard): strip positive prostate-cancer / treatment
+    # assertions that contradict the ground truth for an ABSENT / female /
+    # treatment-naive patient. Negated ("no prostate cancer") and workup
+    # ("mpMRI to evaluate rising PSA") mentions are preserved.
+    if hpi and _hpi_pf is not None:
+        hpi, _hpi_dropped = sanitize_context_against_facts(hpi, _hpi_pf)
+        if _hpi_dropped:
+            print(f"      ✂ HPI fact-guard dropped {len(_hpi_dropped)} "
+                  f"contradicting sentence(s): {[s[:80] for s in _hpi_dropped]}")
     ipss = results.get('ipss', '')
     dhx = results.get('dhx', '')
     pmh = results.get('pmh', '')

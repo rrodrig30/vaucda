@@ -978,12 +978,30 @@ _CANCER_STATE_RE = re.compile(
     r"salvage\s+(?:therapy|treatment|radiation|EBRT|prostatectomy|chemo)|"
     r"post[\s\-]?treatment\s+(?:surveillance|recurrence|PSA|status)|"
     r"recurrent\s+(?:prostate\s+)?(?:cancer|disease)|"
-    r"diagnosis\s+of\s+prostate\s+(?:cancer|adenocarcinoma)|"
+    r"diagnos(?:is\s+of|ed\s+with)\s+prostate\s+(?:cancer|adenocarcinoma)|"
     r"history\s+of\s+prostate\s+(?:cancer|adenocarcinoma)|"
+    r"(?:treated|managed)\s+for\s+prostate\s+(?:cancer|adenocarcinoma)|"
+    r"known\s+prostate\s+(?:cancer|adenocarcinoma)|"
     r"completed\s+definitive\s+(?:focal\s+therapy|radiation|treatment|brachytherapy)|"
     r"after\s+(?:definitive\s+)?(?:focal\s+therapy|focal\s+ablation|"
     r"radiation|radiation\s+therapy|EBRT|brachytherapy|HIFU|TULSA|"
     r"prostatectomy|radical\s+prostatectomy)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Prostate-specific vocabulary that is anatomically impossible in a female
+# patient. Bare "prostate cancer" is included here (unlike the male ABSENT
+# guard, which requires an assertion form) because a female can have NO
+# prostate context at all — any un-negated mention is an error.
+_FEMALE_IMPOSSIBLE_RE = re.compile(
+    r"\b(?:"
+    r"prostate\s+(?:cancer|adenocarcinoma|carcinoma)|"
+    r"prostatectomy|"
+    r"PSA\s+(?:screening|surveillance|kinetics|velocity|doubling)|"
+    r"(?:elevated|rising)\s+PSA|"
+    r"androgen[\s\-]+deprivation|\bADT\b|"
+    r"Gleason|Grade\s+Group"
     r")\b",
     re.IGNORECASE,
 )
@@ -1040,6 +1058,14 @@ def sanitize_context_against_facts(
             # recurrence detected").
             if m and not _preceded_by_negation(sentence, m.start()):
                 drop_reason = "cancer-state vocabulary (no cancer evidence)"
+
+        # Prostate cancer / PSA screening / prostatectomy / ADT are anatomically
+        # impossible in a female patient — strip any un-negated positive mention
+        # (a "no prostate cancer" negation is preserved by the guard).
+        if not drop_reason and (facts.patient_sex or "").lower() == "female":
+            fm = _FEMALE_IMPOSSIBLE_RE.search(sentence)
+            if fm and not _preceded_by_negation(sentence, fm.start()):
+                drop_reason = "prostate-specific assertion in a female patient"
 
         if not drop_reason and not facts.phoenix_applicable:
             # Phoenix without radiation is always wrong, even for cancer-present
