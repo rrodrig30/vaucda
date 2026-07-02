@@ -958,6 +958,107 @@ def extract_patient_status_facts(
 # Conditional phrasings ("considering focal therapy", "patient declined
 # focal therapy", "if focal therapy is offered") do NOT match because they
 # lack a completion verb.
+# --- Treatment-fact cleaning (dedup + non-urologic / ED exclusion) ----------
+_NONURO_CANCER_RE = re.compile(
+    r"\blymphoma\b|\bMALT\b|gastric|\blung\b|colon|colorect|breast|pancrea|"
+    r"hepatocell|esophag|melanoma|leukemia|glioma|head\s+and\s+neck|"
+    r"non[\s-]?small[\s-]?cell|small[\s-]?cell|sarcoma|thyroid", re.IGNORECASE)
+_URO_TX_ANCHOR_RE = re.compile(
+    r"prostat|\bPSA\b|\bRRP\b|\bRALP\b|\bRARP\b|\bRP\b|bladder|renal|kidney|"
+    r"nephr|urotheli|\bTURBT\b|\bADT\b|androgen|leuprolide|Lupron|Eligard|"
+    r"degarelix|abiraterone|enzalutamide|apalutamide|darolutamide|brachy|"
+    r"Lutetium|Pluvicto|cystectomy|penectomy|orchiectomy", re.IGNORECASE)
+_ED_TX_RE = re.compile(
+    r"\bEDEX\b|alprostadil|\bICI\b|intracavernosal|penile\s+inject|\bTrimix\b|"
+    r"sildenafil|tadalafil|vardenafil|Viagra|Cialis|Levitra|vacuum\s+erection|"
+    r"penile\s+(?:implant|prosthesis)", re.IGNORECASE)
+
+
+def _canon_tx_modality(m: str) -> str:
+    """Collapse treatment-modality synonyms to a canonical key so duplicates
+    (e.g. 'radiation therapy' vs 'radiation', 'RRP' vs 'radical retropubic
+    prostatectomy') merge."""
+    s = (m or "").lower()
+    if any(k in s for k in ("prostatectomy", "rrp", "ralp", "rarp", "\brp\b")):
+        return "prostatectomy"
+    if any(k in s for k in ("radiation", "ebrt", "imrt", "sbrt", "igrt", "xrt",
+                            "brachy", "seed implant", "radiotherap")):
+        return "radiation"
+    if any(k in s for k in ("adt", "androgen", "leuprolide", "lupron", "eligard",
+                            "goserelin", "zoladex", "degarelix", "firmagon", "orgovyx")):
+        return "ADT"
+    if any(k in s for k in ("abiraterone", "enzalutamide", "apalutamide",
+                            "darolutamide", "arsi")):
+        return "ARSI"
+    if any(k in s for k in ("docetaxel", "cabazitaxel", "chemo")):
+        return "chemotherapy"
+    if any(k in s for k in ("lutetium", "pluvicto", "radioligand", "radium")):
+        return "radioligand"
+    if any(k in s for k in ("focal", "hifu", "tulsa", "cryo")):
+        return "focal"
+    return s.strip()
+
+
+def clean_treatment_facts(facts: "PatientStatusFacts") -> "PatientStatusFacts":
+    """Dedup and de-noise the treatment facts before they reach the CC/HPI/
+    Assessment/Plan agents:
+
+      - drop treatments whose context is a NON-UROLOGIC cancer (e.g. radiation
+        for gastric MALT lymphoma) unless a urologic anchor is present;
+      - drop erectile-dysfunction treatments (ICI / EDEX / alprostadil) from the
+        cancer-treatment list;
+      - collapse duplicate / re-worded events by canonical modality (so
+        "radiation therapy" + "radiation" and the dozen "s/p RRP" phrasings
+        become one each).
+    """
+    def _drop(blob: str) -> bool:
+        if _ED_TX_RE.search(blob):
+            return True
+        if _NONURO_CANCER_RE.search(blob) and not _URO_TX_ANCHOR_RE.search(blob):
+            return True
+        return False
+
+    # Clinical timeline: keep non-treatment events untouched; clean treatments.
+    kept, seen = [], {}
+    for e in facts.clinical_timeline:
+        if not e.event_type.startswith("TREATMENT"):
+            kept.append(e)
+            continue
+        blob = f"{e.modality} {e.detail} {getattr(e, 'source_quote', '')}"
+        if _drop(blob):
+            continue
+        canon = _canon_tx_modality(e.modality) or (e.modality or "")
+        e.modality = canon
+        key = (canon, e.event_type)
+        if key in seen:
+            prev = seen[key]
+            if (e.date_key or "9999") < (prev.date_key or "9999"):
+                kept[kept.index(prev)] = e
+                seen[key] = e
+            continue
+        seen[key] = e
+        kept.append(e)
+    facts.clinical_timeline = kept
+
+    # confirmed_urologic_treatments: drop non-uro/ED, then keep ONE cleanest
+    # representative per canonical modality (prefer no non-urologic-cancer term,
+    # then the shortest phrasing — so 'Gastric MALT lymphoma' text doesn't
+    # survive as the prostatectomy line).
+    def _score(s: str):
+        return (1 if _NONURO_CANCER_RE.search(s) else 0, len(s))
+    by_canon: Dict[str, str] = {}
+    for t in facts.confirmed_urologic_treatments:
+        if _drop(t):
+            continue
+        canon = _canon_tx_modality(t)
+        cur = by_canon.get(canon)
+        if cur is None or _score(t) < _score(cur):
+            by_canon[canon] = t
+    facts.confirmed_urologic_treatments = list(by_canon.values())
+    facts.treatment_naive = len(by_canon) == 0
+    return facts
+
+
 _TREATMENT_ASSERTION_RE = re.compile(
     r"(?:" + _COMPLETION_VERB_PATTERN + r")"
     r"(?:\s+\S+){0,8}?"

@@ -193,6 +193,11 @@ def build_authoritative_patient_facts(
     # Single hook point so Stage 1 and Stage 2 share the identical enriched object.
     from .l1 import enrich_patient_facts_with_l1
     facts = enrich_patient_facts_with_l1(facts, clinical_text)
+    # Dedup + de-noise treatment facts (canonical-modality dedup, drop
+    # non-urologic-cancer treatments e.g. gastric-MALT-lymphoma radiation, drop
+    # ED treatments) so the HPI doesn't repeat or conflate them.
+    from .patient_status_facts import clean_treatment_facts
+    facts = clean_treatment_facts(facts)
     return facts
 
 
