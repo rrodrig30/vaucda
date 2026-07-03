@@ -288,10 +288,20 @@ def _strip_nonurologic_sentences(hpi: str) -> str:
 # "completed radical prostatectomy in 2000 - Radical retropubic prostatectomy
 # performed in 2000". The clause after the dash merely restates a treatment
 # already named in the sentence, so removing it drops no clinical fact.
+#
+# The detail runs only to the next CLAUSE boundary, not the sentence end, so a
+# chained sentence ("... prostatectomy in 2000 - radical retropubic
+# prostatectomy, radiation on Nov 5 2021 - ..., ADT ...") loses only each dash
+# clause and keeps every real treatment. A clause boundary is a comma NOT
+# followed by a 4-digit year (so it doesn't split "November 5, 2021"), or a
+# period / newline / end of string.
 _DASH_TX_RE = re.compile(
-    r"\s+[-–]\s+[^.\n]*?\b(prostatectomy|radiation|IMRT|EBRT|SBRT|"
-    r"brachytherapy|ADT|androgen\s+deprivation|leuprolide|TURBT|therapy|"
-    r"ablation|surveillance|biopsies|cystoscopy)\b[^.\n]*?(?=[.\n]|$)",
+    r"\s+[-–]\s+[^.\n]*?\b(prostatectomy|radiation|radiotherapy|IMRT|EBRT|SBRT|"
+    r"brachytherapy|ADT|androgen|leuprolide|lupron|eligard|degarelix|"
+    r"bicalutamide|orchiectomy|TURBT|resection|cystectomy|nephrectomy|"
+    r"therapy|ablation|surveillance|biops(?:y|ies)|cystoscopy|tumou?r|"
+    r"Gleason)\b[^.\n]*?"
+    r"(?=\s*,(?!\s*\d{4})|[.\n]|$)",
     re.IGNORECASE,
 )
 
