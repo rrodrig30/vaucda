@@ -282,14 +282,97 @@ def _strip_nonurologic_sentences(hpi: str) -> str:
     return result if result else hpi
 
 
+# --- deterministic HPI readability post-processors (accuracy-preserving) ---
+
+# Redundant dash-appended treatment elaborations the LLM sometimes emits, e.g.
+# "completed radical prostatectomy in 2000 - Radical retropubic prostatectomy
+# performed in 2000". The clause after the dash merely restates a treatment
+# already named in the sentence, so removing it drops no clinical fact.
+_DASH_TX_RE = re.compile(
+    r"\s+[-–]\s+[^.\n]*?\b(prostatectomy|radiation|IMRT|EBRT|SBRT|"
+    r"brachytherapy|ADT|androgen\s+deprivation|leuprolide|TURBT|therapy|"
+    r"ablation|surveillance|biopsies|cystoscopy)\b[^.\n]*?(?=[.\n]|$)",
+    re.IGNORECASE,
+)
+
+# Leading verb phrases that mark a history "beat" the LLM renders as its own
+# staccato "He ..." sentence. A run of these is chained into one flowing
+# sentence; a verb repeated consecutively is stated once (e.g. six TURBTs).
+_HE_RUN_RE = re.compile(
+    r"^He\s+(was\s+diagnosed|completed|underwent|is\s+currently\s+undergoing|"
+    r"has\s+been\s+managed\s+with|has\s+been|received|initiated|started|"
+    r"is\s+s/p|is\s+status\s+post)\b",
+    re.IGNORECASE,
+)
+_HE_VERBS = [
+    "is currently undergoing", "was diagnosed with", "has been managed with",
+    "completed", "underwent", "received", "has been", "initiated", "started",
+]
+
+
+def _strip_dash_elaborations(text: str) -> str:
+    return _DASH_TX_RE.sub("", text)
+
+
+def _split_lead_verb(clause: str):
+    for v in _HE_VERBS:
+        m = re.match(rf"({re.escape(v)})\s+(.*)", clause, re.IGNORECASE)
+        if m:
+            return m.group(1), m.group(2)
+    return None, clause
+
+
+def _merge_he_history_run(text: str) -> str:
+    """Chain a run of consecutive "He <verb> ..." history sentences into one.
+
+    Drops only the repeated leading "He" (and a leading verb when it repeats
+    back-to-back) — every date, modality and clinical detail is preserved, so
+    the transform improves flow without altering facts.
+    """
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    out: list = []
+    run: list = []
+
+    def flush():
+        if not run:
+            return
+        if len(run) == 1:
+            out.append(run[0])
+            run.clear()
+            return
+        bodies = [re.sub(r"^He\s+", "", s.rstrip("."), flags=re.IGNORECASE)
+                  for s in run]
+        clauses: list = []
+        prev = None
+        for b in bodies:
+            v, rest = _split_lead_verb(b)
+            clauses.append(rest if (v and prev and v.lower() == prev.lower())
+                           else b)
+            prev = v
+        joined = ((", ".join(clauses[:-1]) + ", and " + clauses[-1])
+                  if len(clauses) > 1 else clauses[0])
+        out.append("He " + joined + ".")
+        run.clear()
+
+    for s in sents:
+        if _HE_RUN_RE.match(s):
+            run.append(s)
+        else:
+            flush()
+            out.append(s)
+    flush()
+    return " ".join(out)
+
+
 def reflow_hpi(hpi: str) -> str:
     """Collapse a choppy one-sentence-per-line HPI into flowing prose.
 
-    Pure whitespace / line-break normalization — NO content is added, removed,
-    or reworded, so accuracy is untouched; only readability improves. The LLM
-    sometimes renders each skeleton beat on its own line ("He was diagnosed...\\n
-    He completed...\\n..."); this joins those into a connected paragraph and
-    keeps the closing "Today's visit ..." sentence as its own short paragraph.
+    Readability normalization that preserves every clinical fact (dates,
+    modalities, values): joins one-sentence-per-line beats into a connected
+    paragraph, strips the LLM's redundant dash-appended treatment restatements,
+    chains a run of staccato "He ..." history sentences into one flowing
+    sentence, and keeps the closing "Today's visit ..." line as its own short
+    paragraph.
     """
     if not hpi or not hpi.strip():
         return hpi
@@ -299,6 +382,9 @@ def reflow_hpi(hpi: str) -> str:
     if m:
         label, body = m.group(1), body[m.end():]
     body = re.sub(r"\s*\n+\s*", " ", body)      # all internal breaks -> spaces
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    body = _strip_dash_elaborations(body)
+    body = _merge_he_history_run(body)
     body = re.sub(r"[ \t]{2,}", " ", body).strip()
     # 2-paragraph shape: put the closing visit-reason sentence on its own line.
     body = re.sub(r"\s+(Today'?s visit\b)", r"\n\n\1", body, count=1)
