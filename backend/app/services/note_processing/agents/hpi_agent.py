@@ -296,7 +296,7 @@ def _strip_nonurologic_sentences(hpi: str) -> str:
 # followed by a 4-digit year (so it doesn't split "November 5, 2021"), or a
 # period / newline / end of string.
 _DASH_TX_RE = re.compile(
-    r"\s+[-–]\s+[^.\n]*?\b(prostatectomy|radiation|radiotherapy|IMRT|EBRT|SBRT|"
+    r"\s+[-‐-―]\s+[^.\n]*?\b(prostatectomy|radiation|radiotherapy|IMRT|EBRT|SBRT|"
     r"brachytherapy|ADT|androgen|leuprolide|lupron|eligard|degarelix|"
     r"bicalutamide|orchiectomy|TURBT|resection|cystectomy|nephrectomy|"
     r"therapy|ablation|surveillance|biops(?:y|ies)|cystoscopy|tumou?r|"
