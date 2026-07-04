@@ -120,16 +120,33 @@ def _ground_truth_block(gt: GroundTruth) -> str:
         f"BANNER: name={gt.name!r}, age={gt.age}, sex={gt.sex!r}, visit_date={gt.visit_date!r}",
         "",
     ]
-    # PRIMARY UROLOGIC DIAGNOSES — the authoritative diagnosis anchor. For a
-    # non-prostate primary (renal mass, bladder tumor, etc.) this is what the
-    # HPI must be built around; without it the HPI collapses to a prostate
-    # frame or an empty stub.
+    # GU diagnoses beyond prostate cancer (renal mass, bladder tumor, adrenal
+    # nodule, cyst, etc.). Whether these are the PRIMARY anchor or merely
+    # SECONDARY/incidental depends on whether the patient has confirmed
+    # prostate cancer: for a prostate-cancer patient an incidental renal cyst
+    # must NOT hijack the HPI framing (the FOSTER regression); for a
+    # non-cancer patient the renal mass IS the primary problem (ASHFORD).
+    _has_pca = (gt.cancer_status or "").upper() in {
+        "PRESENT", "TREATED", "METASTATIC", "RECURRENT", "NED",
+        "REMISSION", "ACTIVE",
+    }
     if getattr(gt, "other_gu_diagnoses", None):
-        lines.append(
-            "PRIMARY UROLOGIC DIAGNOSES (authoritative — set prior_diagnosis."
-            "primary_dx and frame the entire HPI around the diagnosis below; "
-            "each is confirmed by the cited evidence):"
-        )
+        if _has_pca:
+            lines.append(
+                "SECONDARY / INCIDENTAL UROLOGIC FINDINGS (the PRIMARY "
+                "diagnosis is the prostate cancer described elsewhere in this "
+                "ground truth — these are pertinent secondary problems only. "
+                "Do NOT set prior_diagnosis.primary_dx to one of these and do "
+                "NOT frame the visit around them; mention them as secondary "
+                "issues if relevant):"
+            )
+        else:
+            lines.append(
+                "PRIMARY UROLOGIC DIAGNOSES (authoritative — set "
+                "prior_diagnosis.primary_dx and frame the entire HPI around "
+                "the diagnosis below; each is confirmed by the cited "
+                "evidence):"
+            )
         for d in gt.other_gu_diagnoses:
             organ = getattr(d, "organ", "") or ""
             category = getattr(d, "category", "") or ""
@@ -387,10 +404,12 @@ def build_hpi_json_prompt(
         "  12. Fill prior_diagnosis whenever the patient has a known "
         "urologic diagnosis (prostate cancer, RCC, bladder cancer, BPH, "
         "stones, etc.) — not just for cancer. The renderer uses this "
-        "to anchor the HPI's clinical framing. When PRIMARY UROLOGIC "
-        "DIAGNOSES are listed in the ground truth, set "
-        "prior_diagnosis.primary_dx to that diagnosis and build the HPI "
-        "around it (e.g. a right renal mass under active surveillance).",
+        "to anchor the HPI's clinical framing. When the ground truth lists "
+        "PRIMARY UROLOGIC DIAGNOSES, set prior_diagnosis.primary_dx to that "
+        "diagnosis and build the HPI around it (e.g. a right renal mass "
+        "under active surveillance). But when the list is labeled SECONDARY "
+        "/ INCIDENTAL, keep the prostate cancer as the primary_dx and treat "
+        "those findings as secondary problems only.",
         "  13. TEMPLATE: When a PRIOR HPI is provided, use it as your "
         "starting template — preserve its accurate clinical history, "
         "presenting story, and interval structure, then update it for "
