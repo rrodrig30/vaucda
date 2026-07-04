@@ -312,14 +312,38 @@ def render_current_regimen(regimen: Optional[List[Dict]], sex: str) -> str:
             f"{', '.join(head)}, and {tail}.")
 
 
+# A redundant interval lead-in the LLM prefixes onto the summary, e.g.
+# "since the visit on 2026-01-12," / "since the last urology visit,". The
+# renderer supplies its own "Since the prior urology visit on DATE," so this
+# is stripped to avoid doubling.
+_INTERVAL_LEADIN_RE = re.compile(
+    r"^since\s+(?:the\s+)?(?:prior\s+|last\s+)?(?:urology\s+)?visit"
+    r"(?:\s+on\s+[^,]+)?,?\s*",
+    re.IGNORECASE,
+)
+# ISO dates that occasionally leak into free-text summary/denies fields.
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
 def render_interval_status(interval: Optional[Dict], sex: str) -> str:
     """'Since last visit on DATE, ... Patient denies X, Y, Z.'"""
     if not interval:
         return ""
     p = _pron(sex)
     parts: List[str] = []
+    last_d = interval.get("last_visit_date")
     if interval.get("summary"):
-        parts.append(interval["summary"].rstrip("."))
+        s = interval["summary"].rstrip(".")
+        # When we supply our own "Since the prior visit on DATE," lead-in
+        # below, strip a redundant one the LLM prefixed onto the summary
+        # (avoids "Since the prior urology visit on Jan 12, 2026, since the
+        # visit on 2026-01-12, ...").
+        if last_d:
+            s = _INTERVAL_LEADIN_RE.sub("", s).strip()
+        # Humanize any leaked ISO dates (2026-01-12 -> January 12, 2026).
+        s = _ISO_DATE_RE.sub(lambda m: _format_date(m.group(0)), s)
+        if s:
+            parts.append(s)
     if interval.get("denies"):
         denies = interval["denies"]
         if len(denies) == 1:
@@ -333,10 +357,15 @@ def render_interval_status(interval: Optional[Dict], sex: str) -> str:
     if not parts:
         return ""
     # Anchor to last visit date if provided
-    last_d = interval.get("last_visit_date")
     if last_d:
         joined = ". ".join(parts) + "."
-        return f"Since the prior urology visit on {_format_date(last_d)}, {joined.lower()[0]}{joined[1:]}"
+        # Lowercase the first letter so it flows after "..., " — but NOT when
+        # the first word is an acronym (PSA, CT, MRI) or the summary would be
+        # mangled ("pSA has risen").
+        first_word = joined.split(" ", 1)[0]
+        if not (len(first_word) >= 2 and first_word[:2].isupper()):
+            joined = joined[0].lower() + joined[1:]
+        return f"Since the prior urology visit on {_format_date(last_d)}, {joined}"
     return ". ".join(parts) + "."
 
 
