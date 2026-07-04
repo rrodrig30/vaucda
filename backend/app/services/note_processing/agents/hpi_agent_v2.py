@@ -147,6 +147,46 @@ def _extract_psa_entries(psa_text: str) -> List[PSAEntry]:
     return out
 
 
+def _recent_psa_cluster(entries: List[PSAEntry], gap_months: int = 24,
+                        min_recent: int = 3) -> List[PSAEntry]:
+    """Trim a mixed-era PSA series to its most-recent contiguous cluster.
+
+    A record may carry two PSA eras separated by a multi-year gap — e.g. an
+    old sub-1.0 baseline (2000-2022) plus a current 4-5 ng/mL curve
+    (2024-2026), as in ASHFORD. Only the recent era is relevant to today's
+    HPI trajectory; leaving the old era in lets the LLM cite a stale value as
+    'current' (a 0.9 that matches an old 0.86/0.94 within tolerance). Cut at
+    the first gap larger than ``gap_months`` once at least ``min_recent``
+    recent entries are kept.
+
+    Conservative by design: entries are newest-first, it never trims below
+    min_recent, and ordinary surveillance cadence (≤~12-month gaps) is
+    untouched. The full PSA curve still renders in the note's PSA section —
+    this only scopes what the HPI trajectory may reference.
+    """
+    if len(entries) <= min_recent:
+        return entries
+    from datetime import datetime as _d
+
+    def _pd(s: str):
+        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+            try:
+                return _d.strptime(s, fmt)
+            except (ValueError, TypeError):
+                continue
+        return None
+
+    kept = [entries[0]]
+    for prev, cur in zip(entries, entries[1:]):
+        dp, dc = _pd(prev.date), _pd(cur.date)
+        if dp and dc:
+            months = (dp.year - dc.year) * 12 + (dp.month - dc.month)
+            if months > gap_months and len(kept) >= min_recent:
+                break
+        kept.append(cur)
+    return kept
+
+
 def _extract_gleason_grade_groups(pathology_text: str) -> tuple:
     """Pull all Gleason / Grade Group values from pathology text."""
     gleasons = set()
@@ -324,7 +364,7 @@ def build_ground_truth(
         age=int(patient_age) if patient_age else 0,
         sex=patient_sex.lower() if patient_sex else "",
         visit_date=visit_date,
-        psa_entries=_extract_psa_entries(psa_data),
+        psa_entries=_recent_psa_cluster(_extract_psa_entries(psa_data)),
         confirmed_treatment_modalities=confirmed,
         treatment_naive=treatment_naive,
         treatment_timeline=treatment_timeline,

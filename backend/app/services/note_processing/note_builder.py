@@ -202,6 +202,26 @@ def build_authoritative_patient_facts(
     return facts
 
 
+_PSA_TEMPLATE_SCRUB_RE = re.compile(
+    r'(PSA[^.\n]{0,70}?)(<?\d+\.\d+(?:\s*[-–to]+\s*\d+\.\d+)?)',
+    re.IGNORECASE,
+)
+
+
+def _scrub_psa_values(text: str) -> str:
+    """Neutralize explicit PSA numbers in prior-note template text.
+
+    The prior HPI/Plan is fed to the HPI as a NARRATIVE template, but a prior
+    note may carry stale or erroneous PSA numbers ("Elevated PSA 4.3-5.1")
+    that conflict with the authoritative PSA CURVE (ASHFORD: labs are all
+    <1.0). Redact the numbers so the LLM cannot copy them from the template —
+    the PSA CURVE block is the single source for PSA values.
+    """
+    if not text:
+        return text
+    return _PSA_TEMPLATE_SCRUB_RE.sub(r"\1[see PSA CURVE]", text)
+
+
 # Section headers that terminate a prior-note HPI / Assessment-Plan capture.
 _PRIOR_HPI_STOP_RE = re.compile(
     r"^(?:HPI:|IPSS:?|DIETARY|PAST\s+(?:MEDICAL|SURGICAL)|SOCIAL\b|FAMILY\b|"
@@ -252,7 +272,9 @@ def _extract_prior_hpi_and_plan(clinical_document: str) -> tuple:
     ap = _PRIOR_AP_RE.search(best_after)
     if ap:
         prior_plan = best_after[ap.start():ap.start() + 1400].strip()
-    return best_hpi[:2200], prior_plan
+    # Redact PSA numbers so a stale/erroneous prior-note PSA can't override the
+    # authoritative PSA CURVE block when the LLM adapts this template.
+    return _scrub_psa_values(best_hpi[:2200]), _scrub_psa_values(prior_plan)
 
 
 def build_urology_note(
@@ -305,6 +327,10 @@ def build_urology_note(
     # Pass-through for "cprs"; rewrites VistA section headers / tables
     # for "vista". Failures fall back to the original text so the
     # pipeline never blocks on a normalizer bug.
+    # Keep the pre-normalization text: the vista->cprs normalizer strips the
+    # structured "PSA TOTAL ... ng/mL" lab labels, which are needed to apply
+    # the lab-reports-win PSA precedence (see PSA extraction below).
+    _raw_clinical_text = clinical_text
     try:
         from .source_normalizers import normalize_to_cprs
         normalized = normalize_to_cprs(clinical_text, source_format)
@@ -399,6 +425,19 @@ def build_urology_note(
     document_pathology = extract_pathology(clinical_document)
     document_imaging = extract_imaging(clinical_document)
     document_psa = extract_psa(clinical_document)
+    # Lab-reports-win PSA precedence (clinical review decision): the raw
+    # source's structured "PSA TOTAL ... ng/mL <ref-range>" results are the
+    # authoritative lab system of record, but the vista->cprs normalizer
+    # strips the "PSA TOTAL" label — so extract_psa on the normalized document
+    # can't apply the precedence and may surface a spurious "PSA Curve:" block
+    # (ASHFORD: a 4.3-5.1 curve backed by no actual lab result). Re-extract
+    # from the RAW text whenever it carries structured lab reports; extract_psa
+    # then returns lab values only and overrides the normalized curve.
+    if _raw_clinical_text and re.search(r'PSA\s+TOTAL', _raw_clinical_text,
+                                        re.IGNORECASE):
+        _raw_psa = extract_psa(_raw_clinical_text)
+        if _raw_psa:
+            document_psa = _raw_psa
     document_labs = extract_labs(clinical_document, visit_date=_visit_date)
     document_stone_labs = extract_stone_labs(clinical_document)
     document_calcium = extract_calcium_series(clinical_document)

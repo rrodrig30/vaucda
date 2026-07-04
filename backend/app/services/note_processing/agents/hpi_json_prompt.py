@@ -418,7 +418,9 @@ def build_hpi_json_prompt(
         "HPI MUST be re-confirmed against the authoritative ground truth: "
         "correct or drop any diagnosis the facts do not support (a prior "
         "note that speculated 'possible metastatic disease' does NOT make "
-        "it a confirmed diagnosis).",
+        "it a confirmed diagnosis). Also do NOT copy PSA numbers from the "
+        "prior HPI/plan — every PSA value comes ONLY from the PSA CURVE "
+        "block above (a prior note's PSA may be stale or erroneous).",
         "  14. CONTINUITY: When a PRIOR ASSESSMENT/PLAN is provided, "
         "reflect its active plan — pending studies (e.g. 'pending renal "
         "MRI'), surveillance interval, and deferred workup — in "
