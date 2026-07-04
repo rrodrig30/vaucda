@@ -58,6 +58,7 @@ from datetime import date, datetime
 from typing import List, Optional, Tuple
 
 from .patient_status_facts import (
+    _HEDGING_RE,
     _PROSTATE_CONTEXT_RE,
     _in_prostate_context,
     _preceded_by_negation,
@@ -236,6 +237,21 @@ _PROCEDURE_VOCAB = (
 )
 
 
+# Qualifiers that FOLLOW a staging phrase and mark it unconfirmed /
+# speculative, e.g. "metastatic disease, though this has not been
+# confirmed", "... has not been confirmed", "... is unlikely",
+# "... versus ablation", "... cannot be excluded".
+_TRAILING_HEDGE_RE = re.compile(
+    r"\b(?:"
+    r"(?:has\s+)?not\s+(?:been\s+)?(?:confirmed|established|proven)|"
+    r"unconfirmed|unlikely|cannot\s+be\s+(?:excluded|confirmed|ruled)|"
+    r"remains?\s+(?:to\s+be\s+|un)?(?:confirmed|determined)|"
+    r"is\s+(?:possible|suspected|uncertain)|versus\b|vs\.?\b|"
+    r"if\s+there\s+is\s+evidence"
+    r")",
+    re.IGNORECASE,
+)
+
 # Staging / progression decision vocabulary
 _STAGING_PATTERNS = (
     (r"\bmCRPC\b|metastatic\s+castration[\s\-]?resistant\s+prostate\s+cancer|"
@@ -243,7 +259,13 @@ _STAGING_PATTERNS = (
      "metastatic castration-resistant prostate cancer (mCRPC)"),
     (r"\bmHSPC\b|metastatic\s+hormone[\s\-]?sensitive\s+prostate\s+cancer",
      "metastatic hormone-sensitive prostate cancer (mHSPC)"),
-    (r"\bmetastatic\s+(?:prostate\s+)?(?:cancer|adenocarcinoma|disease)\b",
+    # NOTE: an explicit "prostate" anchor is REQUIRED. Bare "metastatic
+    # disease" in a renal/skeletal workup ("concern for possible metastatic
+    # disease") must NOT be specialized into "metastatic prostate cancer"
+    # (see ASHFORD: renal-mass patient with no prostate cancer). Confirmed
+    # prostate cases that say only "metastatic disease" are still covered
+    # via cancer_status downstream.
+    (r"\bmetastatic\s+prostate\s+(?:cancer|adenocarcinoma|disease)\b",
      "metastatic prostate cancer"),
     (r"biochemical\s+recurrence|biochemical\s+failure|biochemical\s+relapse",
      "biochemical recurrence"),
@@ -871,6 +893,16 @@ def _extract_staging_events(raw_text: str) -> List[TimelineEvent]:
     for pat, display in _STAGING_PATTERNS:
         for m in re.finditer(pat, raw_text, re.IGNORECASE):
             if _preceded_by_negation(raw_text, m.start()):
+                continue
+            # Hedged / speculative staging ("possible metastatic prostate
+            # cancer", "concern for biochemical recurrence", "evaluate for
+            # ...") is NOT a confirmed staging decision. Check a wide window
+            # on BOTH sides — the qualifier can trail ("... metastatic
+            # disease, though not confirmed" / "... versus ablation").
+            _lo = max(0, m.start() - 90)
+            _hi = min(len(raw_text), m.end() + 90)
+            if _HEDGING_RE.search(raw_text[_lo:m.start()]) or \
+                    _TRAILING_HEDGE_RE.search(raw_text[m.end():_hi]):
                 continue
             d = _date_in_window(raw_text, m.start(), 100)
             date_key = d[0] if d else ""

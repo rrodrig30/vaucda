@@ -924,6 +924,27 @@ def extract_patient_status_facts(
         active_meds = detect_current_active_treatments(raw_for_timeline)
         proc_findings = extract_procedure_findings(raw_for_timeline)
 
+        # Authoritative reconciliation: cancer_status is the single source of
+        # truth for whether this patient HAS prostate cancer. When it is
+        # ABSENT (no confirmed diagnosis), any prostate-cancer DIAGNOSIS or
+        # prostate STAGING_DECISION event that a regex scraped from the raw
+        # text is spurious — it would make the HPI assert "diagnosed with
+        # metastatic prostate cancer" while the Assessment (which reads
+        # cancer_status) correctly hedges. Drop them so the HPI can't
+        # contradict the ground truth. (Non-prostate events — renal-mass
+        # surveillance, biopsies, procedures — are preserved.)
+        if status == "ABSENT" and timeline:
+            _pca_re = re.compile(
+                r"prostate\s+(?:cancer|adenocarcinoma)|"
+                r"metastatic\s+prostate|mCRPC|mHSPC|"
+                r"biochemical\s+(?:recurrence|failure|relapse)|"
+                r"castrat", re.IGNORECASE)
+            timeline = [
+                e for e in timeline
+                if not (e.event_type in ("DIAGNOSIS", "STAGING_DECISION")
+                        and _pca_re.search(f"{e.modality} {e.detail}"))
+            ]
+
     # Multi-cancer ground truth: patient sex + non-prostate GU diagnoses. The
     # rest of this function is prostate-only; these give the CC/HPI/Assessment/
     # Plan agents a structured anchor for a renal-mass / bladder-tumor primary.
