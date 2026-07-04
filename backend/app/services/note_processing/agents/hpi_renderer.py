@@ -317,8 +317,12 @@ def render_current_regimen(regimen: Optional[List[Dict]], sex: str) -> str:
 # renderer supplies its own "Since the prior urology visit on DATE," so this
 # is stripped to avoid doubling.
 _INTERVAL_LEADIN_RE = re.compile(
-    r"^since\s+(?:the\s+)?(?:prior\s+|last\s+)?(?:urology\s+)?visit"
-    r"(?:\s+on\s+[^,]+)?,?\s*",
+    # Matches both "since the visit on 2026-01-12," and "since the
+    # January 12, 2026 visit," (date before OR after "visit"). Bounded to a
+    # short span ending at "visit" and REQUIRING the trailing comma, so it
+    # only strips the redundant lead-in clause — never a legitimate
+    # "...follow-up visit was uneventful" mid-summary.
+    r"^since\b[^.\n]{0,40}?\bvisit\b(?:\s+on\s+[^,.\n]{0,25})?\s*,\s*",
     re.IGNORECASE,
 )
 # ISO dates that occasionally leak into free-text summary/denies fields.
