@@ -17,6 +17,7 @@ Performance optimizations:
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -199,6 +200,59 @@ def build_authoritative_patient_facts(
     from .patient_status_facts import clean_treatment_facts
     facts = clean_treatment_facts(facts)
     return facts
+
+
+# Section headers that terminate a prior-note HPI / Assessment-Plan capture.
+_PRIOR_HPI_STOP_RE = re.compile(
+    r"^(?:HPI:|IPSS:?|DIETARY|PAST\s+(?:MEDICAL|SURGICAL)|SOCIAL\b|FAMILY\b|"
+    r"SEXUAL\b|MEDICATIONS?:|ALLERGIES|PSA\s+Curve|====|-----|Signed\s+by|"
+    r"Cosigned\s+by|Standard\s+Title|Local\s+Title|ROS:|PE:|PHYSICAL\s+EXAM|"
+    r"Physical\s+Exam|Vital\s+signs|Labs\s+and\s+Imaging|Interval\s+history|"
+    r"IMPRESSION:|Medical\s+Problems:|Medication\s+List:|CC:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PRIOR_AP_RE = re.compile(
+    r"^(?:ASSESSMENT(?:\s+AND\s+PLAN)?:?|Assessment\s+and\s+Plan:?|"
+    r"A\s*/\s*P:?|PLAN:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_prior_hpi_and_plan(clinical_document: str) -> tuple:
+    """Return (prior_hpi, prior_plan) from the most complete prior clinic note.
+
+    The v2 HPI uses the prior HPI as a TEMPLATE to adapt (see hpi_json_prompt
+    rule 13). We pick the longest prior "HPI:" block as the template (a good
+    completeness proxy regardless of note ordering) and the Assessment/Plan
+    that follows it within the same note. Returns ("", "") when no usable
+    prior HPI is present (e.g. a brand-new patient), so the pipeline simply
+    falls back to building the HPI from structured facts.
+    """
+    if not clinical_document:
+        return "", ""
+    hpi_starts = [m.start() for m in re.finditer(r"^HPI:", clinical_document,
+                                                  re.MULTILINE)]
+    if not hpi_starts:
+        return "", ""
+    best_hpi, best_after = "", ""
+    for i, start in enumerate(hpi_starts):
+        body_start = clinical_document.find(":", start) + 1
+        nxt = _PRIOR_HPI_STOP_RE.search(clinical_document, body_start)
+        end = nxt.start() if nxt else min(len(clinical_document), body_start + 2200)
+        block = clinical_document[body_start:end].strip()
+        if len(block) > len(best_hpi):
+            best_hpi = block
+            # Capture the note-remainder after this HPI (up to the next HPI)
+            # so we can locate the matching Assessment/Plan.
+            note_end = (hpi_starts[i + 1] if i + 1 < len(hpi_starts)
+                        else len(clinical_document))
+            best_after = clinical_document[end:note_end]
+    # Locate the Assessment/Plan that follows the chosen HPI in its own note.
+    prior_plan = ""
+    ap = _PRIOR_AP_RE.search(best_after)
+    if ap:
+        prior_plan = best_after[ap.start():ap.start() + 1400].strip()
+    return best_hpi[:2200], prior_plan
 
 
 def build_urology_note(
@@ -860,6 +914,8 @@ def build_urology_note(
                 return _synth(prompt=prompt, temperature=0.0,
                               task_config=_v2_task_config)
 
+            _prior_hpi_text, _prior_plan_text = _extract_prior_hpi_and_plan(
+                clinical_document or "")
             gt = build_ground_truth(
                 patient_name=_patient_name_val or "",
                 patient_age=int(_patient_age_val) if str(_patient_age_val or "").isdigit() else 0,
@@ -882,6 +938,14 @@ def build_urology_note(
                 confirmed_urologic_treatments=(_hpi_pf.confirmed_urologic_treatments if _hpi_pf else []),
                 cancer_status=(_hpi_pf.cancer_status if _hpi_pf else ""),
                 narrative_text=(clinical_document or ""),
+                # Multi-cancer anchor + prior-note template (see hpi_json_prompt
+                # rules 12-14): the non-prostate GU primary (renal mass, bladder
+                # tumor) and the most-recent prior HPI/Plan, so the HPI is built
+                # around the real diagnosis and continues the established story
+                # rather than collapsing to a prostate-only / empty stub.
+                other_gu_diagnoses=(_hpi_pf.other_gu_diagnoses if _hpi_pf else []),
+                prior_hpi=_prior_hpi_text,
+                prior_plan=_prior_plan_text,
             )
             result = generate_hpi_v2(gt, _llm_call, max_retries=2,
                                      v1_fallback_text=v1_text)

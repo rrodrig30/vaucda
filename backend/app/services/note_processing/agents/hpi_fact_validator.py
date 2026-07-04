@@ -93,6 +93,21 @@ class GroundTruth:
     # Imaging text
     imaging_text: str = ""
 
+    # Multi-cancer / non-prostate GU primary diagnoses (renal mass, bladder
+    # tumor, etc.) from patient_status_facts.other_gu_diagnoses. Each item is
+    # a GUDiagnosis-like object with .organ, .category, .name, .grade,
+    # .status, .evidence. These anchor the HPI for a non-prostate primary so
+    # it does not collapse to a prostate-only (or empty) narrative.
+    other_gu_diagnoses: List[Any] = field(default_factory=list)
+
+    # Prior clinic-note narrative used as a TEMPLATE to adapt for today's
+    # visit. prior_hpi is the most-recent prior HPI prose; prior_plan is its
+    # Assessment/Plan. The LLM updates the prior HPI for the current encounter
+    # and confirms every diagnosis against the ground truth above, rather than
+    # regenerating from scratch and losing the established history.
+    prior_hpi: str = ""
+    prior_plan: str = ""
+
 
 # ---------------------------------------------------------------------------
 # Fact validation error

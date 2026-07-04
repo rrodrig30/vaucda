@@ -236,6 +236,9 @@ def build_ground_truth(
     confirmed_urologic_treatments: Optional[List[str]] = None,
     cancer_status: str = "",
     narrative_text: str = "",
+    other_gu_diagnoses: Optional[List] = None,
+    prior_hpi: str = "",
+    prior_plan: str = "",
 ) -> GroundTruth:
     """Build a GroundTruth from existing-extractor outputs.
 
@@ -328,6 +331,9 @@ def build_ground_truth(
         current_active_treatments=list(current_active_treatments or []),
         cancer_status=cancer_status or "",
         narrative_text=narrative_text or "",
+        other_gu_diagnoses=list(other_gu_diagnoses or []),
+        prior_hpi=prior_hpi or "",
+        prior_plan=prior_plan or "",
         pathology_text=pathology_text or "",
         gleason_scores=gleasons,
         grade_groups=ggs,
