@@ -400,7 +400,11 @@ def build_hpi_json_prompt(
         "prior urology visit. Include a 1-2-sentence summary of the "
         "interval (symptoms, treatment continuation, any changes) "
         "anchored to the last visit date, and a 'denies' list of "
-        "pertinent negatives the source documents.",
+        "pertinent negatives the source documents. Do NOT begin the summary "
+        "with 'Since the last visit'/'since the DATE visit'/'since the "
+        "evaluation' — the renderer already prepends that anchor; start the "
+        "summary directly with the interval content (e.g. 'the patient "
+        "reports ...').",
         "  12. Fill prior_diagnosis whenever the patient has a known "
         "urologic diagnosis (prostate cancer, RCC, bladder cancer, BPH, "
         "stones, etc.) — not just for cancer. The renderer uses this "
