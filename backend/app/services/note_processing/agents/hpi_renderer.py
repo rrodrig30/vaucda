@@ -178,6 +178,16 @@ def render_prior_diagnosis(dx: Optional[Dict], sex: str) -> str:
     return " ".join(parts) + "."
 
 
+# A narrative_note that restates the treatment (verb-first) rather than adding
+# new context — dropped so it doesn't echo the main clause.
+_RESTATEMENT_NOTE_RE = re.compile(
+    r"^(?:completed?|complete|started|starting|initiated?|began|underwent|"
+    r"received|declined?|ongoing|continuing|most\s+recent|performed|"
+    r"status\s+post|s/p|treated\s+with)\b",
+    re.IGNORECASE,
+)
+
+
 def render_treatment_history(events: Optional[List[Dict]], sex: str) -> str:
     """Chronological list of treatment events. One sentence per event."""
     if not events:
@@ -218,9 +228,14 @@ def render_treatment_history(events: Optional[List[Dict]], sex: str) -> str:
         else:
             sentence = (f"{p['sub'].capitalize()} {status_verb} "
                         f"{modality_label}{date_part}.")
-        # Append optional narrative note
-        if evt.get("narrative_note"):
-            sentence = sentence.rstrip(".") + f" — {evt['narrative_note']}."
+        # Append optional narrative note — but only when it adds NEW context,
+        # not when it merely restates the treatment already in the sentence
+        # ("completed ADT in July 2023" on a completed-ADT event, "most recent
+        # TURBT on 05/12/2026"). A restatement starts with a status/treatment
+        # verb; a genuine note starts with for/with/at/due-to/etc.
+        note = evt.get("narrative_note")
+        if note and not _RESTATEMENT_NOTE_RE.match(note.strip()):
+            sentence = sentence.rstrip(".") + f" — {note}."
         sentences.append(sentence)
     return " ".join(sentences)
 
@@ -258,12 +273,18 @@ def render_psa_trajectory(psa: Optional[Dict]) -> str:
         prior_d = _format_date(psa.get("prior_date"))
         sentence = (f"PSA {direction_verb} from {prior_v} ng/mL "
                     f"({prior_d}) to {current_v} ng/mL ({current_d}).")
-    # Optional peak context
-    if (psa.get("peak_value") is not None
-            and psa.get("peak_value") != current_v
-            and psa.get("peak_value") != psa.get("prior_value")):
+    # Optional peak context — only when the peak is meaningfully HIGHER than
+    # the values already stated. A peak equal to (or below) current/prior is
+    # redundant noise ("stable at 0.19 ... Peak 0.19"); the LLM sometimes
+    # picks such a peak, so require strictly greater.
+    peak_v = psa.get("peak_value")
+    prior_v = psa.get("prior_value")
+    if (peak_v is not None
+            and isinstance(peak_v, (int, float))
+            and peak_v > current_v
+            and (prior_v is None or peak_v > prior_v)):
         peak_d = _format_date(psa.get("peak_date"))
-        sentence += f" Peak {psa['peak_value']} ng/mL ({peak_d})."
+        sentence += f" Peak {peak_v} ng/mL ({peak_d})."
     return sentence
 
 

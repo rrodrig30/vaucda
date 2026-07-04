@@ -343,6 +343,16 @@ def _validate_treatment_history(events: List[Dict], gt: GroundTruth,
                     f"PSH/pathology/PMH",
                     found=modality, expected=sorted(gt.confirmed_treatment_modalities),
                 ))
+        # A treatment that is a CONFIRMED given modality cannot also be
+        # "declined" — declined means it was NOT administered. Catches an LLM
+        # status flip ("He declined ADT" for a patient who received ADT).
+        if status == "declined" and modality in gt.confirmed_treatment_modalities:
+            errors.append(FactValidationError(
+                f"{path}.status", "TREATMENT_DECLINED_BUT_GIVEN",
+                f"'{modality}' is a confirmed administered treatment — status "
+                f"must be completed/ongoing, not 'declined'",
+                found=status, expected="completed",
+            ))
 
 
 def _modality_mentioned_in_text(modality: str, text_lc: str) -> bool:
