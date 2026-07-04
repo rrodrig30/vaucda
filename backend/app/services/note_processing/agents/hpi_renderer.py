@@ -331,6 +331,11 @@ _INTERVAL_LEADIN_RE = re.compile(
 # ISO dates that occasionally leak into free-text summary/denies fields.
 _ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
+# A word echoed across "for"/"of" ("evaluation for evaluation", "management
+# of management") — collapse to a single occurrence. Same word both sides so
+# distinct phrases ("side of head") are untouched.
+_WORD_ECHO_RE = re.compile(r"\b(\w+)\s+(?:for|of)\s+\1\b", re.IGNORECASE)
+
 
 def render_interval_status(interval: Optional[Dict], sex: str) -> str:
     """'Since last visit on DATE, ... Patient denies X, Y, Z.'"""
@@ -436,4 +441,10 @@ def render_full_hpi(draft: Dict) -> str:
     # carry a stray "by urology" if the LLM emitted it in a free-string
     # field like visit_reason / today_reason / narrative_note.
     from .history_cleaners import strip_urology_referral_framing
-    return strip_urology_referral_framing(text)
+    text = strip_urology_referral_framing(text)
+    # Collapse a word echoed across a preposition, e.g. "urology consultation
+    # for evaluation of ..." becomes "urologic evaluation for evaluation of ..."
+    # after the referral scrub — reduce "evaluation for evaluation" to a single
+    # "evaluation". Same word on both sides only, so distinct phrases are safe.
+    text = _WORD_ECHO_RE.sub(r"\1", text)
+    return text
