@@ -79,7 +79,8 @@ def generate_one(text: str, s1, s2) -> str:
     clinical_input = f"VISIT DATE: {_detect_visit_date(text)}\n\n{text}"
     # Phase 1: compute the authoritative facts ONCE and pass to both stages
     # so Stage 2's Assessment grounds on the same facts as the HPI.
-    facts = build_authoritative_patient_facts(clinical_input, SOURCE_FORMAT)
+    facts = build_authoritative_patient_facts(clinical_input, SOURCE_FORMAT,
+                                              llm_task_config=s1)
     stage1 = build_urology_note(
         clinical_text=clinical_input, task_config=s1,
         source_format=SOURCE_FORMAT, patient_facts=facts,

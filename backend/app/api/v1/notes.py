@@ -471,6 +471,7 @@ async def generate_initial_note(
         )
         _shared_facts = await asyncio.to_thread(
             build_authoritative_patient_facts, clinical_input_with_date, _src_fmt,
+            stage1_config,  # holistic GU diagnosis pass uses this LLM
         )
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
@@ -739,6 +740,7 @@ async def generate_final_note(
             _final_input = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
         _shared_facts = await asyncio.to_thread(
             build_authoritative_patient_facts, _final_input, _src_fmt,
+            stage2_config,  # holistic GU diagnosis pass uses this LLM
         )
 
         # Build Stage 2 note with task-specific LLM config
@@ -876,6 +878,7 @@ async def generate_express_note(
             build_authoritative_patient_facts,
             clinical_input_with_date,
             _src_fmt,
+            stage1_config,  # holistic GU diagnosis pass uses this LLM
         )
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
@@ -1114,6 +1117,7 @@ async def generate_express_note_stream(
             )
             _shared_facts = await asyncio.to_thread(
                 build_authoritative_patient_facts, clinical_input_with_date, _src_fmt,
+            stage1_config,  # holistic GU diagnosis pass uses this LLM
             )
             preliminary_note = await asyncio.to_thread(
                 build_urology_note,
@@ -1565,6 +1569,7 @@ async def generate_stage2_agent(
             _final_input = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
         _shared_facts = await asyncio.to_thread(
             build_authoritative_patient_facts, _final_input, _src_fmt,
+            stage2_config,  # holistic GU diagnosis pass uses this LLM
         )
 
         # Build Stage 2 note with task-specific LLM config

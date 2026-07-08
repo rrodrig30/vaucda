@@ -163,6 +163,7 @@ documenting the encounter.
 def build_authoritative_patient_facts(
     clinical_text: str,
     source_format: str = "cprs",
+    llm_task_config: Optional[Any] = None,
 ):
     """Compute the SINGLE authoritative ``PatientStatusFacts`` from the raw
     clinical document, the same way Stage 1's HPI defense layer does.
@@ -194,6 +195,25 @@ def build_authoritative_patient_facts(
     # Single hook point so Stage 1 and Stage 2 share the identical enriched object.
     from .l1 import enrich_patient_facts_with_l1
     facts = enrich_patient_facts_with_l1(facts, clinical_text)
+    # Option B — holistic GU diagnosis pass. Reads the whole chart + prior HPI
+    # with the LLM and returns the true GU problem list (any organ), replacing
+    # the organ-limited/misfiring regex anchor. Establishes the DIAGNOSIS anchor
+    # only; numbers/dates stay verified downstream. Safe no-op when no task
+    # config is provided or VAUCDA_HOLISTIC_DX=0.
+    if llm_task_config is not None:
+        try:
+            from .agents.holistic_diagnosis import enrich_facts_with_holistic_diagnoses
+            _prior_hpi, _prior_plan = _extract_prior_hpi_and_plan(clinical_text)
+            _holistic_ctx = (
+                "PRIOR HPI (clinician-authored summary):\n" + _prior_hpi + "\n\n"
+                "PROBLEM LIST / PMH:\n" + _pmh + "\n\n"
+                "PAST SURGICAL HISTORY:\n" + _psh + "\n\n"
+                "PATHOLOGY:\n" + _path[:2500]
+            )
+            facts = enrich_facts_with_holistic_diagnoses(
+                facts, _holistic_ctx, llm_task_config=llm_task_config)
+        except Exception as _e:
+            logger.warning(f"Holistic diagnosis pass skipped: {_e}")
     # Dedup + de-noise treatment facts (canonical-modality dedup, drop
     # non-urologic-cancer treatments e.g. gastric-MALT-lymphoma radiation, drop
     # ED treatments) so the HPI doesn't repeat or conflate them.
