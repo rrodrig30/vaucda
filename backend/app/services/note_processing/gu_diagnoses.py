@@ -76,7 +76,14 @@ _CANCER = [
      r"(?:ureter|renal\s+pelvis)\w*\s+urothelial", "upper-tract urothelial carcinoma"),
     ("testicular", r"\b(seminoma|non[\s-]?seminoma|germ\s+cell\s+tumou?r|testicular\s+cancer)\b",
      "testicular germ-cell tumor"),
-    ("penile", r"penile\s+(?:squamous\s+cell\s+)?carcinoma|squamous\s+cell\s+carcinoma\s+of\s+the\s+penis",
+    # Match all the ways a penile primary is written: "penile carcinoma/cancer",
+    # "squamous cell carcinoma of (the) penis", "SCCa of the penis", "carcinoma
+    # of penis", "cancer of the penis". The old pattern required "of THE penis"
+    # and missed the chart's "Squamous cell carcinoma of penis" (CASTANEDA).
+    ("penile",
+     r"penile\s+(?:squamous\s+cell\s+)?(?:carcinoma|cancer)"
+     r"|(?:squamous\s+cell\s+|verrucous\s+)?(?:carcinoma|cancer|SCCa?)\s+of\s+"
+     r"(?:the\s+)?penis",
      "penile carcinoma"),
     ("adrenal", r"adrenocortical\s+carcinoma|adrenal\s+(?:cortical\s+)?carcinoma", "adrenal carcinoma"),
 ]
@@ -91,9 +98,17 @@ _INDETERMINATE = [
 ]
 _BENIGN = [
     ("renal", r"angiomyolipoma|\bAML\b|simple\s+(?:renal\s+)?cyst|Bosniak\s+(?:I|II|1|2)\b", "benign renal lesion"),
+    # A "no evidence of malignancy" line only means BENIGN BLADDER when it is
+    # actually about the bladder — otherwise a generic negative (e.g. "0/18
+    # lymph nodes; no evidence of malignancy" in a penile-cancer chart) wrongly
+    # manufactures a bladder diagnosis that then hijacks the HPI anchor
+    # (CASTANEDA). Require a bladder / cystoscopy / urine-cytology anchor.
     ("bladder", r"benign\s+(?:bladder|urothelium|TURBT)|"
-     r"(?:TURBT|biopsy)\s+(?:pathology\s+)?(?:showed|revealed|with)\s+benign|"
-     r"no\s+(?:evidence\s+of\s+)?(?:malignancy|carcinoma|tumou?r)\b", "benign bladder pathology"),
+     r"(?:TURBT|(?:bladder|cold[\s-]cup)\s+biopsy)\s+(?:pathology\s+)?"
+     r"(?:showed|revealed|with)\s+benign|"
+     r"(?:bladder|urothelium|cystoscop\w+|TURBT|urine\s+cytolog\w+|"
+     r"bladder\s+wash)[^.\n]{0,40}?no\s+(?:evidence\s+of\s+)?"
+     r"(?:malignancy|carcinoma|tumou?r)\b", "benign bladder pathology"),
 ]
 
 # A malignancy term is only category=cancer when PATHOLOGY-CONFIRMED nearby. In a
