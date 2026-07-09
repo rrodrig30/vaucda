@@ -45,25 +45,52 @@ _PATH_LINE = re.compile(
     re.IGNORECASE)
 
 
-def build_pathology_context(chart: str, max_chars: int = 14000) -> str:
-    """Grep pathology-bearing regions (line + neighbors) from the whole chart."""
+# The actual DIAGNOSIS lines (grade / histology / stage) — never truncate these
+# out. A chart can have hundreds of generic "biopsy"/"specimen"/"pathology"
+# keyword lines that fill the budget before the real report (FRAGA).
+_PATH_FINDING_LINE = re.compile(
+    r"gleason|grade\s+group|adenocarcinoma|urothelial\s+carcinoma|"
+    r"transitional\s+cell|renal\s+cell\s+carcinoma|\bRCC\b|clear[\s-]cell|"
+    r"chromophobe|squamous\s+cell\s+carcinoma|\bseminoma\b|germ\s+cell|"
+    r"sarcomatoid|Fuhrman|ISUP|\bp?[cp]?T[0-4][a-d]?\b|myelolipoma",
+    re.IGNORECASE)
+
+
+def build_pathology_context(chart: str, max_chars: int = 22000) -> str:
+    """Pathology-bearing regions (line + neighbors) from the whole chart.
+
+    Two-pass so the real report is never truncated out: FINDING lines (grade /
+    histology / stage) are included first with wider context, then the broader
+    pathology-keyword lines fill the remaining budget."""
     if not chart:
         return ""
     lines = chart.splitlines()
-    keep = set()
-    for i, ln in enumerate(lines):
-        if _PATH_LINE.search(ln):
-            for j in range(max(0, i - 2), min(len(lines), i + 4)):
-                keep.add(j)
-    if not keep:
+
+    def _blocks(regex, before, after):
+        keep = set()
+        for i, ln in enumerate(lines):
+            if regex.search(ln):
+                for j in range(max(0, i - before), min(len(lines), i + after)):
+                    keep.add(j)
+        return keep
+
+    finding = _blocks(_PATH_FINDING_LINE, 3, 6)   # priority: real diagnoses
+    broad = _blocks(_PATH_LINE, 2, 4) - finding    # context: everything else
+    if not finding and not broad:
         return ""
-    out, prev = [], -2
-    for i in sorted(keep):
-        if i != prev + 1:
-            out.append("...")
-        out.append(lines[i])
-        prev = i
-    ctx = "\n".join(out)
+
+    def _render(idxs):
+        out, prev = [], -2
+        for i in sorted(idxs):
+            if i != prev + 1:
+                out.append("...")
+            out.append(lines[i])
+            prev = i
+        return "\n".join(out)
+
+    ctx = _render(finding)
+    if len(ctx) < max_chars and broad:
+        ctx += "\n...\n" + _render(broad)
     return ctx[:max_chars]
 
 

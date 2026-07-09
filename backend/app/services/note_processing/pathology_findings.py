@@ -39,12 +39,17 @@ _HISTOLOGY = {
     "clear-cell": r"clear[\s-]cell",
     "papillary": r"papillary\s+(?:renal|carcinoma)",
     "chromophobe": r"chromophobe",
-    "squamous-cell-carcinoma": r"squamous\s+cell\s+carcinoma|\bSCCa?\b",
+    # Penile/GU SCC only — exclude dermatologic "squamous cell carcinoma of
+    # skin" (a common PMH item, not urologic pathology) and the bare "SCC"
+    # abbreviation (too ambiguous). "SCCa" is the penile-cancer form.
+    "squamous-cell-carcinoma": r"squamous\s+cell\s+carcinoma(?![^.\n]{0,20}skin)|\bSCCa\b",
     "seminoma": r"\bseminoma\b",
     "germ-cell": r"germ\s+cell\s+tumou?r|non[\s-]?seminoma|embryonal|yolk\s+sac|teratoma|choriocarcinoma",
     "sarcomatoid": r"sarcomatoid",
     "small-cell": r"small[\s-]cell\s+carcinoma|neuroendocrine",
-    "myelolipoma": r"myelolipoma",
+    # NOTE: benign entities (myelolipoma, adenoma) are intentionally NOT counted
+    # as findings the note must report — they are benign incidentals, not cancer
+    # pathology, and the composer correctly omits them.
 }
 
 # --- key descriptors ---
