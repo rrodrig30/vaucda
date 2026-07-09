@@ -89,6 +89,7 @@ _NONASSERT_RE = re.compile(
     r"no\s+evidence\s+of|no\s+patholog\w*|without\s+patholog\w*|"
     r"treatment[-\s]naive\s+(?:for|of)|screening\s+for|surveillance\s+for|"
     r"work[-\s]?up\s+for|risk\s+of|concern(?:ing)?\s+for|suspicion\s+for|"
+    r"absence\s+of|free\s+of|clear\s+of|no\s+history\s+of|remission|"
     r"family\s+history|father|mother|brother|sister|paternal|maternal|fhx|"
     r"aggressive|definitive|whether\s+to|benefit\s+of)\b")
 # Words that make an organ mention benign / uncertain rather than a cancer.
@@ -97,15 +98,27 @@ _BENIGN_CTX_RE = re.compile(
     r"indeterminate|hypertroph\w+|BPH)\b", re.IGNORECASE)
 
 
-def _is_asserted(text_lc: str, idx: int, window: int = 60) -> bool:
-    """True if a mention at ``idx`` is a positive current assertion (not
-    negated, hedged/workup, or family history)."""
-    seg = text_lc[max(0, idx - window):idx]
-    return not _NONASSERT_RE.search(seg)
+# Context AFTER the phrase that also makes it a non-assertion, e.g. "prostate
+# cancer screening / surveillance / workup / monitoring / risk".
+_TRAILING_NONASSERT_RE = re.compile(
+    r"^\W*(screening|surveillance|work[-\s]?up|monitoring|risk|prevention|"
+    r"prophylaxis|guideline)\b")
+
+
+def _is_asserted(text_lc: str, start: int, end: Optional[int] = None,
+                 window: int = 60) -> bool:
+    """True if a mention spanning [start, end) is a positive current assertion —
+    not negated / hedged / family-history (checked BEFORE it) and not a
+    screening/surveillance framing (checked AFTER it)."""
+    if _NONASSERT_RE.search(text_lc[max(0, start - window):start]):
+        return False
+    if end is not None and _TRAILING_NONASSERT_RE.search(text_lc[end:end + 25]):
+        return False
+    return True
 
 
 def _has_negation_before(text_lc: str, idx: int, window: int = 60) -> bool:
-    return not _is_asserted(text_lc, idx, window)
+    return not _is_asserted(text_lc, idx, window=window)
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +173,7 @@ def score_no_false_diagnosis(note: str, gold: Dict) -> Metric:
         # "gallbladder cancer"; only count positive current assertions.
         pat = r"(?<![a-z])" + re.escape(phrase.lower())
         for m in re.finditer(pat, note_lc):
-            if _is_asserted(note_lc, m.start()):
+            if _is_asserted(note_lc, m.start(), m.end()):
                 hits.append(phrase)
                 break
     ok = not hits
@@ -193,7 +206,7 @@ def score_no_cross_cancer(note: str, gold: Dict) -> Metric:
                 span = note_lc[max(0, m.start() - 30):m.end() + 10]
                 if _BENIGN_CTX_RE.search(span):
                     continue  # "adrenal adenoma", "renal cyst", etc.
-                if _is_asserted(note_lc, m.start()):
+                if _is_asserted(note_lc, m.start(), m.end()):
                     leaks.append(f"{organ}:{t}")
                     found = True
                     break
@@ -220,10 +233,15 @@ def score_psa_grounded(note: str, gold: Dict, source_psa_values: List[float]) ->
             continue
         # Skip thresholds / reference ranges / conditionals ("if PSA > 20",
         # "PSA above 10", ">20 ng/mL") — those aren't the patient's value.
-        near = note_lc[max(0, m.start() - 20):m.start()]
+        near = note_lc[max(0, m.start() - 30):m.start()]
+        # NB: only suppress genuine threshold / delta / conditional contexts —
+        # NOT "PSA remains stable at 8.52" (a real cited value). "if PSA remains
+        # 10" is still caught by the \bif\b clause.
         if re.search(r"[<>≥≤]|greater\s+than|less\s+than|above|below|"
                      r"exceed\w*|threshold|reference|\bif\b|at\s+least|"
-                     r"over\s+|under\s+", near):
+                     r"over\s+|under\s+|increase\s+of|rise\s+of|"
+                     r"increases?\s+by|rises?\s+by|\bby\s+|increment|change\s+of",
+                     near):
             continue
         try:
             cited.append(float(m.group(1)))
