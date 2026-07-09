@@ -563,6 +563,23 @@ def build_stage2_note(
                         len(_asmt_dropped), _asmt_dropped)
             print(f"      Fact-guard: dropped {len(_asmt_dropped)} contradicting sentence(s) from Assessment")
 
+    # Finalize: strip hallucinated scanner/metadata garbage + completeness-repair
+    # so every documented cancer the patient has is addressed (compose -> ledger
+    # -> repair). Safe no-op without facts / on error.
+    if assessment:
+        try:
+            from .agents.assessment_composer import finalize_assessment
+            from .llm_helper import synthesize_with_llm
+
+            def _asmt_repair_call(_p: str) -> str:
+                return synthesize_with_llm(prompt=_p, temperature=0.0,
+                                           task_config=task_config, max_tokens=900)
+
+            assessment = finalize_assessment(
+                assessment, stage1_note, patient_facts, _asmt_repair_call)
+        except Exception as _ae:  # noqa: BLE001
+            logger.warning(f"Assessment finalize skipped: {_ae}")
+
     # Step 3: Verify Assessment
     # CRITICAL: Use session-isolated verifier to prevent cross-patient data contamination
     print("\n[3/6] Verifying Assessment against source data...")
