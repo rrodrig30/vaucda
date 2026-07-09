@@ -101,6 +101,14 @@ _INDETERMINATE = [
 _ADRENAL_BENIGN_CTX = re.compile(
     r"myelolipoma|adenoma|washout|lipid[\s-]poor|<\s*10\s*HU|"
     r"\bbenign\b|\bstable\b", re.IGNORECASE)
+# Pathognomonic-benign adrenal terms — safe to trust DOCUMENT-WIDE (there is
+# normally a single adrenal lesion, and these terms never describe a malignancy).
+# Catches the case where the radiology characterization ("myelolipoma favored")
+# is in a different paragraph than the "adrenal mass" problem-list phrase, so the
+# narrow ±90-char guard would miss it (MOLINA).
+_ADRENAL_BENIGN_STRONG = re.compile(
+    r"myelolipoma|washout|<\s*10\s*HU|lipid[\s-]poor|adrenal\s+adenoma",
+    re.IGNORECASE)
 
 _BENIGN = [
     ("renal", r"angiomyolipoma|\bAML\b|simple\s+(?:renal\s+)?cyst|Bosniak\s+(?:I|II|1|2)\b", "benign renal lesion"),
@@ -125,13 +133,26 @@ _CONFIRM = re.compile(
     r"biopsy|biopsy[\s-]proven|patholog|\bpath\b|proven|confirmed|"
     r"consistent\s+with|positive\s+for|resected|nephrectomy\s+specimen|"
     r"(?:showed|revealed|demonstrated)\s+[^.\n]{0,40}(?:carcinoma|malignan)|"
+    # Definitive local therapy already COMPLETED (s/p) proves a tissue diagnosis:
+    # you do not remove a kidney or ablate a renal tumor for an unconfirmed mass.
+    # Keyed on s/p so a merely PLANNED / "consideration of" nephrectomy (KIND)
+    # does NOT confirm — only a completed resection/ablation (FLORES) does.
+    # "Nx" is the surgical abbreviation for nephrectomy here (Partial/Radical Nx);
+    # bare "Nx" is avoided because it is also the TNM node stage.
+    r"s/?p\s+(?:partial\s+|radical\s+)?nephrectomy|(?:partial|radical)\s+nx\b|"
+    r"s/?p\s+(?:microwave\s+|cryo\s*|radiofrequency\s+|RF\s+|thermal\s+)?ablation|"
+    # An ESTABLISHED prior diagnosis (history/known of RCC / urothelial ca /
+    # bladder cancer) is itself confirmation — it is not "of uncertain
+    # significance" anymore (FLORES: "Hx of Right RCC ...").
+    r"(?:hx|history|known)\s+of\s+(?:right\s+|left\s+|bilateral\s+)?"
+    r"(?:rcc\b|renal\s+cell|urothelial\s+carcinoma|bladder\s+cancer)|"
     r"Fuhrman|nuclear\s+grade|grade\s+group|WHO\s+grade|"
     # carcinoma-in-situ and explicit TNM staging are, by definition, a
     # pathology-confirmed malignancy.
     r"carcinoma\s+in\s+situ|\bCIS\b|\bTis\b|\bpT[0-4]|\bcT[0-4]", re.IGNORECASE)
 _HEDGE = re.compile(
-    r"possible|probable|suspicious\s+for|concerning\s+for|could\s+be|"
-    r"cannot\s+(?:exclude|rule\s+out)|rule\s+out|\br/o\b|differential|"
+    r"possible|probable|suspicious\s+for|concerning\s+for|worrisome(?:\s+for)?|"
+    r"could\s+be|cannot\s+(?:exclude|rule\s+out)|rule\s+out|\br/o\b|differential|"
     r"\bversus\b|\bvs\.?\b|option|counsel|\brisk\s+of\b|presumed|favou?r|"
     r"if\s+(?:it\s+)?(?:is|proves)", re.IGNORECASE)
 
@@ -196,8 +217,9 @@ def detect_gu_diagnoses(text: str) -> List[GUDiagnosis]:
             # as a myelolipoma / adenoma / washout / <10 HU / benign / stable is
             # BENIGN, not "of uncertain significance" — so it does not lead the
             # CC over the patient's actual cancer (CHATMAN/MOLINA/CRAWFORD).
-            if organ == "adrenal" and _ADRENAL_BENIGN_CTX.search(
-                    text[max(0, m.start() - 60):m.end() + 90]):
+            if organ == "adrenal" and (
+                    _ADRENAL_BENIGN_CTX.search(text[max(0, m.start() - 60):m.end() + 90])
+                    or _ADRENAL_BENIGN_STRONG.search(text)):
                 consider("adrenal", "benign", "benign adrenal lesion",
                          _clean(m.group(0)))
                 continue
