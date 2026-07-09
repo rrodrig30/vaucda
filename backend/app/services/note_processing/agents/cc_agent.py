@@ -894,11 +894,26 @@ def synthesize_cc(
     # visit; without a structured signal the CC defaults to a prostate/PSA or
     # PMH-derived complaint (e.g. "erectile dysfunction" for a bladder-tumor
     # patient, or a prostate narrative for a female renal-mass patient).
-    gu_cc = _cc_from_gu_diagnoses(other_gu_diagnoses)
+    _cc_diags = other_gu_diagnoses or []
+    _has_active_cancer = (
+        ((patient_sex or "").lower() != "female"
+         and (prostate_cancer_status or "").upper() in ("PRESENT", "TREATED"))
+        or any(getattr(d, "category", "") == "cancer" for d in _cc_diags))
+    if _has_active_cancer:
+        # When the patient has an active cancer, THAT cancer is the chief
+        # complaint. A non-prostate INDETERMINATE/benign incidental (an adrenal
+        # nodule of uncertain significance, a small renal finding) must not lead
+        # or clutter the CC — keep only non-prostate CANCERS as co-primaries.
+        # The incidental still appears in the HPI / problem list. This stops
+        # "adrenal mass of uncertain significance" from hijacking a cancer
+        # patient's CC (CHATMAN/CRAWFORD).
+        _cc_diags = [d for d in _cc_diags
+                     if getattr(d, "category", "") == "cancer"]
+    gu_cc = _cc_from_gu_diagnoses(_cc_diags)
     if gu_cc:
-        # Dual-primary patients (prostate cancer + renal/bladder) should read
-        # both problems; append a concise prostate clause when applicable.
-        # A female patient can never have prostate cancer — no prostate clause.
+        # Dual-primary patients (prostate cancer + renal/bladder cancer) should
+        # read both; append a concise prostate clause when applicable. A female
+        # patient can never have prostate cancer — no prostate clause.
         if ((patient_sex or "").lower() != "female"
                 and (prostate_cancer_status or "").upper() in ("PRESENT", "TREATED")):
             gu_cc += "; prostate cancer follow-up"

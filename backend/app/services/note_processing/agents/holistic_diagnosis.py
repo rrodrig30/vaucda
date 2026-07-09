@@ -75,9 +75,19 @@ RULES:
   PSA without a positive biopsy is NOT prostate cancer.
 - An unbiopsied or radiographically-uncertain lesion is "indeterminate", never
   "cancer" and never "benign".
-- Incidental benign findings (simple cyst, "no evidence of malignancy" on an
-  unrelated study, benign prostatic hypertrophy) are secondary at most and must
-  NEVER be listed as the primary problem when a cancer is present.
+- READ THE RADIOLOGY CHARACTERIZATION. An adrenal nodule the report describes as
+  a myelolipoma, a lipid-rich/lipid-poor adenoma, showing washout, <10 HU,
+  "benign", or stable over time is BENIGN and does NOT require follow-up if
+  biochemically inactive — classify it "benign"; do NOT call it "of uncertain
+  significance". The same for a simple renal cyst (Bosniak I/II) and a stable
+  old non-specific nodule.
+- Do NOT list a purely benign incidental finding (benign adrenal adenoma /
+  myelolipoma, simple cyst, old stable nodule) as a problem at all unless it is
+  the documented reason for THIS visit. Omit it entirely rather than inventing a
+  surveillance problem for it.
+- Incidental benign findings must NEVER be the primary problem when a cancer is
+  present. The PRIMARY problem is the active disease — the cancer or the
+  documented reason for the tumor-clinic follow-up. List it first.
 - Capture the actual organ. "Squamous cell carcinoma of penis" is organ
   "penile"; "urothelial carcinoma" is "bladder"; a renal mass is "renal".
 - Include definitive cancer surgery in key_treatments (e.g. glansectomy,
@@ -267,9 +277,14 @@ def enrich_facts_with_holistic_diagnoses(
     for d in (getattr(facts, "other_gu_diagnoses", None) or []):
         if d.organ in holistic_organs or d.organ == "prostate":
             continue
-        if d.category == "benign" and holistic_has_cancer:
-            continue
-        merged.append(d)
+        # LLM-forward: the holistic pass read the WHOLE chart (incl. radiology).
+        # Only re-inject a regex CANCER it may have missed (a safety net) — a
+        # regex indeterminate/benign the holistic deliberately omitted (a benign
+        # adrenal myelolipoma, an old non-specific nodule, a simple cyst) stays
+        # omitted, so it can't resurface as "of uncertain significance" and
+        # hijack the CC over the patient's actual cancer.
+        if d.category == "cancer":
+            merged.append(d)
     facts.other_gu_diagnoses = merged
     # Note: definitive-cancer surgery (glansectomy, ILND, etc.) is carried in
     # each diagnosis's ``status`` field, which the ground-truth block renders,

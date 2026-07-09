@@ -96,6 +96,12 @@ _INDETERMINATE = [
      r"papillary\s+(?:protrusion|frond)", "bladder tumor of uncertain significance"),
     ("adrenal", r"adrenal\s+(?:mass|nodule|adenoma\??)", "adrenal mass of uncertain significance"),
 ]
+# Radiology characterization that makes an adrenal lesion benign (no follow-up
+# needed if biochemically inactive).
+_ADRENAL_BENIGN_CTX = re.compile(
+    r"myelolipoma|adenoma|washout|lipid[\s-]poor|<\s*10\s*HU|"
+    r"\bbenign\b|\bstable\b", re.IGNORECASE)
+
 _BENIGN = [
     ("renal", r"angiomyolipoma|\bAML\b|simple\s+(?:renal\s+)?cyst|Bosniak\s+(?:I|II|1|2)\b", "benign renal lesion"),
     # A "no evidence of malignancy" line only means BENIGN BLADDER when it is
@@ -185,6 +191,15 @@ def detect_gu_diagnoses(text: str) -> List[GUDiagnosis]:
     for organ, pat, label in _INDETERMINATE:
         for m in re.finditer(pat, text, re.IGNORECASE):
             if _negated_or_family(text, m.start()):
+                continue
+            # Radiology-benign guard: an adrenal lesion the report characterizes
+            # as a myelolipoma / adenoma / washout / <10 HU / benign / stable is
+            # BENIGN, not "of uncertain significance" — so it does not lead the
+            # CC over the patient's actual cancer (CHATMAN/MOLINA/CRAWFORD).
+            if organ == "adrenal" and _ADRENAL_BENIGN_CTX.search(
+                    text[max(0, m.start() - 60):m.end() + 90]):
+                consider("adrenal", "benign", "benign adrenal lesion",
+                         _clean(m.group(0)))
                 continue
             consider(organ, "indeterminate", label, _clean(m.group(0)))
             break
