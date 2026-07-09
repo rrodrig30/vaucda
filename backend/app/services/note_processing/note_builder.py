@@ -1097,7 +1097,29 @@ def build_urology_note(
 
     # Capture document_pathology in closure
     _doc_path = document_pathology
-    synthesis_tasks['pathology'] = lambda: synthesize_pathology(_doc_path, gu_notes)
+
+    def _pathology_task():
+        # LLM-forward Pathology composer: reads the WHOLE chart (not the regex
+        # slice) and runs a completeness-repair loop against the organ-agnostic
+        # finding ledger, so no documented finding is dropped and every cancer's
+        # pathology (prostate Gleason, renal grade, penile SCC, ...) is covered.
+        # Falls back to the regex synthesizer on any miss / when disabled.
+        try:
+            from .agents.pathology_composer import compose_pathology
+            from .llm_helper import synthesize_with_llm
+
+            def _call(p: str) -> str:
+                return synthesize_with_llm(prompt=p, temperature=0.0,
+                                           task_config=None, max_tokens=1800)
+
+            composed = compose_pathology(clinical_document, _call)
+            if composed:
+                return composed
+        except Exception as _pe:  # noqa: BLE001
+            logger.warning(f"Pathology composer error (using regex synth): {_pe}")
+        return synthesize_pathology(_doc_path, gu_notes)
+
+    synthesis_tasks['pathology'] = _pathology_task
 
     synthesis_tasks['testosterone'] = lambda: synthesize_testosterone(gu_notes)
 
