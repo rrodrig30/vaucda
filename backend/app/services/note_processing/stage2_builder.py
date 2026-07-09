@@ -640,6 +640,15 @@ def build_stage2_note(
                         len(_plan_dropped), _plan_dropped)
             print(f"      Fact-guard: dropped {len(_plan_dropped)} contradicting sentence(s) from Plan")
 
+    # Strip hallucinated scanner/CPT-metadata plan bullets (congruent with the
+    # Assessment garbage strip).
+    if plan:
+        try:
+            from .agents.assessment_composer import strip_garbage_lines
+            plan = strip_garbage_lines(plan)
+        except Exception:  # noqa: BLE001
+            pass
+
     # Step 5: Verify Plan
     print("\n[5/6] Verifying Plan against source data...")
     plan_verification = verifier.verify_generated_text(

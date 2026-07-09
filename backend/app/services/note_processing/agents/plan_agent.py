@@ -308,6 +308,19 @@ PROBLEM SELECTION RULES:
 - Do NOT create problems for conditions the patient does NOT have
 - Do NOT add hypothetical problems ("if the patient had X, we would...")
 - If a condition is not mentioned in the patient's history, do NOT include it as a problem
+- BENIGN INCIDENTALS (MANDATORY): a finding the radiology characterizes as
+  BENIGN — adrenal myelolipoma, lipid-rich / washout adrenal adenoma, simple
+  (Bosniak I/II) renal cyst — needs NO routine imaging follow-up if it is
+  biochemically inactive. Do NOT create a surveillance PROBLEM for it, and do
+  NOT recommend repeat/dedicated imaging, surveillance, CT/MRI, or hormonal
+  work-up for it. If it is named at all, state it is benign and needs no further
+  follow-up. NEVER title a problem "adrenal mass of uncertain significance" for a
+  radiology-benign lesion.
+- CONGRUENCE: do NOT order a workup (routine PSA screening, biopsy, mpMRI,
+  imaging surveillance) that the Assessment did not endorse — honor the AGE /
+  LIFE-EXPECTANCY guardrail (elderly / limited-life-expectancy patients).
+- NO TECHNICAL METADATA in plan items: never include phantom size, kVp/mAs,
+  reconstruction params, CPT/procedure codes, or raw reference-range numbers.
 
 TASK:
 Using THIS PATIENT'S specific history, labs, imaging, medications, surgical history, and other findings from the Stage 1 note above, create urology-focused plans addressing each of the patient's active problems.

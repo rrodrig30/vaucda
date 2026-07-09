@@ -24,11 +24,31 @@ logger = logging.getLogger(__name__)
 
 LLMCallable = Callable[[str], str]
 
-# Scanner / technical / coding artifacts that must never appear in the prose.
+# Scanner-DUMP artifacts: their presence means the WHOLE sentence/line is
+# machine metadata and should be dropped entirely (e.g. MOLINA's "...based on the
+# 32 cm diameter phantom is 1616").
+_SCANNER_DUMP = re.compile(
+    r"\bphantom\b|diameter\s+phantom|\bkVp\b|\bmAs\b|reconstruction\s+kernel|"
+    r"SEE\s+NOTE\s+\d|\bslice\s+thickness\b|\bDLP\b|\bCTDIvol\b|mGy-?cm",
+    re.IGNORECASE)
+# Inline coding tokens that ride ALONG legitimate clinical prose — scrub just the
+# token, keep the sentence (e.g. STARKS's "cystoscopy ... (CPT 52000) was
+# normal; no repeat cystoscopy unless ..." must survive).
+_INLINE_META = re.compile(
+    r"\s*[\(\[]?\b(?:CPT|code)\s+\d{4,5}[\)\]]?", re.IGNORECASE)
+# Back-compat: any garbage at all (used by external callers / audits).
 _GARBAGE = re.compile(
     r"\bphantom\b|diameter\s+phantom|\bkVp\b|\bmAs\b|reconstruction\s+kernel|"
-    r"\bcode\s+5\d{4}\b|\bCPT\s+\d{5}\b|SEE\s+NOTE\s+\d|\bslice\s+thickness\b|"
+    r"\bcode\s+5\d{4}\b|\bCPT\s+\d{4,5}\b|SEE\s+NOTE\s+\d|\bslice\s+thickness\b|"
     r"\bDLP\b|\bCTDIvol\b", re.IGNORECASE)
+
+
+def _scrub_inline(text: str) -> str:
+    """Excise inline coding tokens (CPT/code NNNNN) without losing the prose."""
+    out = _INLINE_META.sub("", text)
+    # tidy orphaned empty parens/space left behind
+    out = re.sub(r"\(\s*\)|\[\s*\]", "", out)
+    return re.sub(r"\s{2,}", " ", out).replace(" .", ".").replace(" ,", ",")
 
 _ORGAN_WORDS = {
     "prostate": ["prostate", "prostatic"],
@@ -42,13 +62,28 @@ _ORGAN_WORDS = {
 
 
 def strip_assessment_garbage(text: str) -> str:
-    """Drop sentences that contain scanner/technical-metadata artifacts."""
+    """Drop sentences that are scanner-metadata dumps; inline-scrub coding tokens
+    (CPT/code) from otherwise-clinical sentences so their prose survives."""
     if not text:
         return text
     sents = re.split(r"(?<=[.!?])\s+", text)
-    kept = [s for s in sents if not _GARBAGE.search(s)]
-    out = " ".join(kept).strip()
+    kept = [_scrub_inline(s) for s in sents if not _SCANNER_DUMP.search(s)]
+    out = " ".join(s for s in kept if s.strip()).strip()
     return re.sub(r"\s{2,}", " ", out)
+
+
+def strip_garbage_lines(text: str) -> str:
+    """For line/bullet-structured text (e.g. Plan): drop whole lines that are
+    scanner-metadata dumps, but inline-scrub coding tokens (CPT/code) from
+    legitimate clinical bullets so the instruction survives."""
+    if not text:
+        return text
+    out = []
+    for ln in text.splitlines():
+        if _SCANNER_DUMP.search(ln):
+            continue
+        out.append(_scrub_inline(ln))
+    return "\n".join(out)
 
 
 def required_cancer_organs(patient_facts: Any) -> Set[str]:
