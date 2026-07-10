@@ -984,7 +984,8 @@ def build_urology_note(
                                       task_config=None, max_tokens=1600)
 
                 _composed_hpi = compose_hpi(_hpi_pf, _doc_psa, _doc_path,
-                                            document_psh, _hpi_call, v1_text)
+                                            document_psh, clinical_document,
+                                            _hpi_call, v1_text)
                 if _composed_hpi:
                     return _composed_hpi
             except Exception as _hce:  # noqa: BLE001
