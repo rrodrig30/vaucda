@@ -128,7 +128,9 @@ Keep the DRAFT verbatim UNLESS one of these is true — then rewrite minimally:
 
 If NONE of the three apply, output the DRAFT EXACTLY as given — do NOT add
 symptoms or problems (e.g. incontinence, hematuria), do NOT expand or reword.
-PRESERVE all specificity and EXACT names in the draft (metastatic
+When you DO correct treatment framing, ADD/change only the framing — PRESERVE
+grounded detail already in the draft (do not drop "after radiation therapy" when
+adding an injection). Keep all specificity and EXACT names (metastatic
 hormone-sensitive / castration-resistant, biochemically recurrent, s/p
 brachytherapy, the exact ADT drug — do NOT substitute Lupron for Eligard).
 
@@ -155,7 +157,7 @@ def refine_cc(
 ) -> str:
     """Return a CC that is the deterministic seed, improved only where it
     contradicts the ledger/visit. Never returns something worse than the seed."""
-    if os.environ.get("VAUCDA_CC_COMPOSER", "0") != "1":
+    if os.environ.get("VAUCDA_CC_COMPOSER", "1") != "1":
         return seed_cc
     if not seed_cc or facts is None:
         return seed_cc
