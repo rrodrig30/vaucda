@@ -882,7 +882,7 @@ def build_urology_note(
         #     was completed AND the PSA trend confirms biochemical
         #     response. Without document_psh + clinical_document the
         #     reframe path can't see treatment history at all.
-        return synthesize_cc(
+        _seed_cc = synthesize_cc(
             gu_notes,
             non_gu_notes,
             document_pmh=_doc_pmh,
@@ -903,6 +903,24 @@ def build_urology_note(
             patient_sex=_hpi_pf.patient_sex if _hpi_pf else None,
             prostate_cancer_status=_hpi_pf.cancer_status if _hpi_pf else None,
         )
+        # LLM-forward CC REFINER (VAUCDA_CC_COMPOSER): keep the deterministic CC
+        # verbatim unless it contradicts the fact ledger / visit narrative (wrong
+        # treatment framing, benign-incidental-led, resected-cancer-called-
+        # uncertain). Fixes contradictory CCs (JELLSEY "scheduled Eligard
+        # injection") while preserving the cascade's specificity. Never returns
+        # anything worse than the seed; no-op when disabled.
+        try:
+            from .agents.cc_composer import refine_cc
+            from .llm_helper import synthesize_with_llm
+
+            def _cc_call(p: str) -> str:
+                return synthesize_with_llm(prompt=p, temperature=0.0,
+                                           task_config=None, max_tokens=220)
+
+            return refine_cc(_seed_cc, _hpi_pf, _clinical_doc_cc, _cc_call)
+        except Exception as _cce:  # noqa: BLE001
+            logger.warning(f"CC refiner error (using synthesize_cc): {_cce}")
+            return _seed_cc
 
     def _build_hpi():
         if _is_consult_val and _consult_hpi_val:
