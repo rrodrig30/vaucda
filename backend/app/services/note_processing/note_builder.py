@@ -967,10 +967,32 @@ def build_urology_note(
             hpi_skeleton=_hpi_skeleton_text,
         )
 
+        # ---- HPI LLM-forward composer (VAUCDA_HPI_COMPOSER) ----
+        # The LLM writes the HPI from the fact ledger + PSA/pathology/timeline
+        # with a deterministic grounding+completeness verify-repair loop, so a
+        # copied-forward phantom biopsy date (JELLSEY "biopsy 10/29/2025") cannot
+        # survive. Ordered BEFORE v2; v1_text is the universal fallback. Safe-
+        # degrade to v2/v1 on any miss / when disabled.
+        import os as _os
+        if _os.environ.get("VAUCDA_HPI_COMPOSER", "0") == "1":
+            try:
+                from .agents.hpi_composer import compose_hpi
+                from .llm_helper import synthesize_with_llm as _synth_hpi
+
+                def _hpi_call(p: str) -> str:
+                    return _synth_hpi(prompt=p, temperature=0.0,
+                                      task_config=None, max_tokens=1600)
+
+                _composed_hpi = compose_hpi(_hpi_pf, _doc_psa, _doc_path,
+                                            document_psh, _hpi_call, v1_text)
+                if _composed_hpi:
+                    return _composed_hpi
+            except Exception as _hce:  # noqa: BLE001
+                logger.warning(f"HPI composer error (using v2/v1): {_hce}")
+
         # ---- HPI v2 (constrained-JSON) path ----
         # Gated by VAUCDA_HPI_V2=1 env var. v2 has v1 text as its
         # fallback, so any v2 failure transparently degrades to v1.
-        import os as _os
         if _os.environ.get("VAUCDA_HPI_V2", "0") != "1":
             return v1_text
 
