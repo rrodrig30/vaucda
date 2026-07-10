@@ -171,6 +171,57 @@ _STATUS = {
     "upper_tract": re.compile(r"nephroureterectomy|ureteroscop", re.IGNORECASE),
 }
 
+# "Ablation" is organ-ambiguous (renal tumor ablation vs. saphenous-vein RFA vs.
+# cardiac ablation), so an ablation status is only pinned to a renal/organ dx
+# when it sits in that organ's context and NOT a competing vascular/cardiac one.
+# Nephrectomy / TURBT / active-surveillance are organ-specific enough to trust.
+_ORGAN_ANCHOR = {
+    "renal": re.compile(r"renal|kidney|nephr|interpolar|upper[\s-]?pole|"
+                        r"lower[\s-]?pole|the\s+mass|the\s+lesion|the\s+tumou?r",
+                        re.IGNORECASE),
+    "bladder": re.compile(r"bladder|urotheli|intravesical|cystoscop", re.IGNORECASE),
+    "upper_tract": re.compile(r"ureter|renal\s+pelvis|upper[\s-]tract", re.IGNORECASE),
+}
+_NONRENAL_ABLATION = re.compile(
+    r"saphenous|varicose|\bvein\b|venous|\bGSV\b|coronary|cardiac|atrial|"
+    r"pulmonary\s+vein|hepatic|\bliver\b|thyroid|endometrial|\bnerve\b|prostate",
+    re.IGNORECASE)
+# A definitive procedure named in a PLANNING context is a recommendation, not a
+# status that has happened (KIND / RIVERA: "consultation for ... nephrectomy").
+_PLANNED_CTX = re.compile(
+    r"recommend|consult|consideration\s+of|\bversus\b|\bvs\.?\b|plan(?:ned|s)?\s+for|"
+    r"refer(?:ral)?|option|candidate\s+for|would\s+be|discuss|consider(?:ing)?|"
+    # a comma-series of mutually-exclusive treatments (…, ablation, SBRT,
+    # surveillance as per NCCN) is a counseling menu, not a completed status
+    r"\bSBRT\b|as\s+per\s+NCCN|per\s+NCCN\s+guideline",
+    re.IGNORECASE)
+
+
+def _status_for(organ: str, text: str, sre: "re.Pattern") -> str:
+    """First status match that actually pertains to *organ* and has HAPPENED.
+
+    Organ-ambiguous statuses (ablation, active surveillance) must sit in the
+    organ's own context — so a saphenous-vein radiofrequency ablation or a
+    PROSTATE active-surveillance mention is not pinned to a renal mass
+    (GONZALES). A definitive local therapy (nephrectomy / ablation) counts only
+    when completed, not merely planned/recommended (KIND, RIVERA)."""
+    anchor = _ORGAN_ANCHOR.get(organ)
+    for sm in sre.finditer(text):
+        phrase = sm.group(0)
+        low = phrase.lower()
+        window = text[max(0, sm.start() - 70):sm.end() + 70]
+        if "ablation" in low and _NONRENAL_ABLATION.search(window):
+            continue
+        # organ-ambiguous: require the organ's own context nearby
+        if ("ablation" in low or "surveillance" in low) and anchor and not anchor.search(window):
+            continue
+        # definitive therapy only counts if done, not planned
+        if ("nephrectomy" in low or "ablation" in low) and "s/p" not in low \
+                and _PLANNED_CTX.search(window):
+            continue
+        return _clean(phrase)
+    return ""
+
 
 def _confirmed(text: str, pos: int, window: int = 130) -> bool:
     """A malignancy term counts as a confirmed diagnosis only when a pathology
@@ -240,8 +291,6 @@ def detect_gu_diagnoses(text: str) -> List[GUDiagnosis]:
                 dx.grade = _clean(next(g for g in gm.groups() if g))
         sre = _STATUS.get(organ)
         if sre:
-            sm = sre.search(text)
-            if sm:
-                dx.status = _clean(sm.group(0))
+            dx.status = _status_for(organ, text, sre)
     order = {"cancer": 0, "indeterminate": 1, "benign": 2}
     return sorted(by_organ.values(), key=lambda d: (order[d.category], d.organ))
