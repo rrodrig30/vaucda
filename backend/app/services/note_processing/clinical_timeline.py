@@ -521,6 +521,36 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
                 source_quote=re.sub(r"\s+", " ", q).strip()[:300],
             ))
 
+    # Collapse copied-forward prostate-biopsy pathology. The diagnostic biopsy
+    # result is pasted into every subsequent clinic note, so a per-occurrence
+    # date attaches PHANTOM biopsies to later note-header dates (JELLSEY: 9
+    # "prostatic adenocarcinoma" biopsies dated 2022→2025, HPI then renders the
+    # newest, "biopsy 10/29/2025", after XRT finished in 2022). A given biopsy
+    # RESULT is a single historical event: keep one per distinct finding, dated
+    # by an EXPLICIT biopsy-date anchor ("8/16/2022 Prostate Biopsy") when one
+    # exists, else the earliest observed date. A genuinely different repeat
+    # biopsy has different finding text and is preserved as its own event.
+    bx = [f for f in findings if f.procedure == "prostate biopsy"]
+    if len(bx) > 1:
+        explicit_bx_dates = set()
+        for bm in _BIOPSY_DATE_RE.finditer(raw_text):
+            pd = _parse_date_from_text(bm.group(1))
+            if pd:
+                explicit_bx_dates.add(pd[0])
+
+        def _norm_find(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "").lower()).strip()[:60]
+
+        groups: dict = {}
+        for f in bx:
+            groups.setdefault(_norm_find(f.finding), []).append(f)
+        collapsed: List[ProcedureFinding] = []
+        for grp in groups.values():
+            anchored = [f for f in grp if f.date_key in explicit_bx_dates]
+            pick_from = anchored or grp
+            collapsed.append(min(pick_from, key=lambda f: f.date_key or "9999"))
+        findings = [f for f in findings if f.procedure != "prostate biopsy"] + collapsed
+
     findings.sort(key=lambda f: (f.date_key or "0", f.procedure), reverse=True)
     return findings
 
