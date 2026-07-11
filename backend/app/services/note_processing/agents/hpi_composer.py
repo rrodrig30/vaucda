@@ -69,6 +69,7 @@ from ..temporal_checks import (  # noqa: E402
     scrub_vague_recency as _scrub_vague_recency,
     latest_wins_violations as _latest_wins_violations,
     staleness_violations as _staleness_violations,
+    tier_override_violations as _tier_override_violations,
     reference_ym as _reference_ym,
 )
 
@@ -213,7 +214,8 @@ def _soft(hpi: str, facts: Any, chart: str = "", psa_data: str = "") -> List[str
     return (_grounding_violations(hpi, facts) + _lead_violation(hpi, facts)
             + _completeness_violations(hpi, facts) + _grade_undersell(hpi, chart)
             + _temporal_violations(hpi) + _latest_wins_violations(hpi, facts, psa_data)
-            + _staleness_violations(hpi, _reference_ym(chart)))
+            + _staleness_violations(hpi, _reference_ym(chart))
+            + _tier_override_violations(hpi, facts))
 
 
 # ---- prompt -----------------------------------------------------------------
@@ -255,6 +257,12 @@ RULES:
   result wins; do not carry a stale status forward as if current.
 - NEVER use vague recency ("recent", "recently", "recent MRI/CT", "lately").
   Always name the actual DATE of the study or result instead.
+- SERIAL identical results (e.g. many "no evidence of disease" scans): do NOT
+  list each and do NOT claim continuous truth across the whole span — anchor on
+  the MOST RECENT observation + its date, optionally noting the surveillance span
+  ("stable on serial CT, most recently <date>"). A structured dated result
+  (pathology/imaging/lab) OUTRANKS any prior-note narrative — follow the newest
+  structured result and never carry a narrative claim it contradicts.
 - PSA: state the MOST RECENT value + date, then summarize the trajectory
   (nadir / peak / trend) in ONE sentence. Do NOT list more than ~4 PSA values.
 - Keep procedure findings brief. Cover every documented cancer. End with today's

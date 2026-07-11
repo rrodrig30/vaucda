@@ -187,18 +187,34 @@ def reference_ym(note: str) -> Optional[Tuple[int, int]]:
     return None
 
 
+def _all_ym(text: str) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    for m in re.finditer(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+                         r"(?:\d{1,2},?\s+)?((?:19|20)\d{2})", text, re.IGNORECASE):
+        out.append((int(m.group(2)), _MON3[m.group(1)[:3].lower()]))
+    for m in re.finditer(r"\b\d{1,2}/(\d{1,2})/((?:19|20)?\d{2})\b", text):
+        y = int(m.group(2)); y += 2000 if y < 50 else (1900 if y < 100 else 0)
+        out.append((y, int(m.group(1))))
+    if not out:
+        out = [(int(m.group(1)), 6) for m in re.finditer(r"\b((?:19|20)\d{2})\b", text)]
+    return out
+
+
 def staleness_violations(text: str, ref_ym: Optional[Tuple[int, int]]) -> List[str]:
-    """A dated VOLATILE status older than its modality window can't read as
-    current. (Undated volatiles are handled by temporal_violations.)"""
+    """A dated VOLATILE status whose MOST RECENT supporting observation is older
+    than its modality window can't read as current. Uses the LATEST date in the
+    sentence, so a serial-surveillance summary ("no disease from 2001 until Jun
+    2026") ages off the newest confirmation (2026), not the oldest."""
     if not ref_ym:
         return []
     viol: List[str] = []
     for s in sentences(text):
         if not VOLATILE_STATUS.search(s):
             continue
-        obs = _first_ym(s)
-        if not obs:
+        yms = _all_ym(s)
+        if not yms:
             continue
+        obs = max(yms)   # most recent supporting observation
         age = (ref_ym[0] - obs[0]) * 12 + (ref_ym[1] - obs[1])
         label, window = _window_for(s)
         if age > window:
@@ -208,6 +224,33 @@ def staleness_violations(text: str, ref_ym: Optional[Tuple[int, int]]) -> List[s
                         f"and note it has NOT been reassessed since (do not invent a newer "
                         f"result)")
     return list(dict.fromkeys(viol))
+
+
+# ---- no-lower-tier-override -------------------------------------------------
+# A tier-3 narrative claim (prior HPI/A&P) may not contradict a newer, higher-
+# tier structured result (tier-1 pathology / imaging / staging). Instantiated on
+# the disease-status axis (the highest-value one): a disease-free / stable claim
+# may not stand against the LATEST tier-1 result showing progression.
+_PROGRESSION = re.compile(
+    r"progress|recurren|new\s+lesion|enlarg|increas|\bmets?\b|metasta|worsen|"
+    r"castrat|mcrpc|upgrad|\brising\b", re.IGNORECASE)
+
+
+def tier_override_violations(text: str, facts: Any) -> List[str]:
+    tl = getattr(facts, "clinical_timeline", None) or []
+    evs = [e for e in tl
+           if getattr(e, "event_type", "") in ("STAGING_DECISION", "IMAGING")
+           and getattr(e, "source_tier", 2) == 1 and getattr(e, "date_key", "")]
+    if not evs or not _DISEASE_FREE.search(text):
+        return []
+    latest = max(evs, key=lambda e: e.date_key)
+    blob = f"{getattr(latest, 'modality', '')} {getattr(latest, 'detail', '')}"
+    if _PROGRESSION.search(blob):
+        return [f"a narrative disease-free/stable claim may NOT override the latest "
+                f"structured result ({latest.date_display}: {latest.event_type.lower()} "
+                f"{latest.modality} — {(getattr(latest, 'detail', '') or '')[:50]}), which "
+                f"indicates progression; follow the structured result"]
+    return []
 
 
 def _repair_prompt(text: str, viol: List[str], section: str) -> str:
@@ -221,7 +264,13 @@ observations (e.g. "no recurrence on CT of <date>"); never use vague recency
 ("recent"/"recently"); present the MOST RECENT result as current; do not assert
 a stale point-in-time status. If a status rests on an observation OLDER than its
 surveillance window, keep its date and add that it has NOT been reassessed since
-that date — do NOT invent a newer result. Keep everything else exactly as written.
+that date — do NOT invent a newer result. For SERIAL identical results (e.g.
+many "no evidence of disease" scans), do NOT list each and do NOT claim
+continuous truth across the whole span — anchor on the MOST RECENT observation
+and its date, optionally noting the surveillance span ("stable on serial CT,
+most recently <date>"). A structured dated result (pathology/imaging/lab)
+OUTRANKS any prior-note narrative; follow the newest structured result. Keep
+everything else exactly as written.
 
 {section.upper()}:
 {text}
@@ -251,7 +300,7 @@ def finalize_temporal(
 
     def _viol(t: str) -> List[str]:
         return (temporal_violations(t) + latest_wins_violations(t, facts, psa_data or "")
-                + staleness_violations(t, ref_ym))
+                + staleness_violations(t, ref_ym) + tier_override_violations(t, facts))
 
     try:
         repairs = 0
