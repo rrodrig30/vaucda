@@ -37,7 +37,29 @@ _DATE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b(?:jan|feb|mar|apr|may|jun|ju
                    r"sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}?,?\s*\d{4}\b", re.IGNORECASE)
 
 _LESION_KEYS = ("renal_mass", "prostate_lesion", "dominant_node")
-_NODE_MIN_CM = 1.0   # a "dominant/pathologic" node floor (sub-cm nodes are normal)
+
+# CLINICAL SIGNIFICANCE is not a size cutoff:
+#  - Prostate mpMRI: PI-RADS 4-5 are significant; PI-RADS 1-3 are NOT, regardless
+#    of size — so a prostate lesion is tracked only when PI-RADS 4/5.
+#  - PSMA PET: significance is the avidity/scoring system, not size — small
+#    lesions can be avid and matter (PET's advantage over CT). So NO size floor is
+#    applied to nodes.
+_PIRADS_HI = re.compile(r"PI-?RADS\s*[45]", re.IGNORECASE)
+_PIRADS_LO = re.compile(r"PI-?RADS\s*[123]\b", re.IGNORECASE)
+
+
+def _prostate_significant(quote: str, src_norm: str) -> bool:
+    """A prostate mpMRI lesion is significant only at PI-RADS 4-5. PI-RADS 1-3 is
+    not, regardless of size. If no PI-RADS grade is documented near the lesion,
+    keep it (can't prove insignificance)."""
+    qn = re.sub(r"\s+", " ", quote).strip().lower()
+    pos = src_norm.find(qn)
+    ctx = src_norm[max(0, pos - 140):pos + len(qn) + 140] if pos >= 0 else qn
+    if _PIRADS_HI.search(ctx):
+        return True
+    if _PIRADS_LO.search(ctx):
+        return False
+    return True
 
 
 @dataclass
@@ -75,9 +97,11 @@ def _prompt(ctx: str) -> str:
 Extract a DATED SIZE TRAJECTORY for follow-able lesions from the urology imaging
 material below. Lesion types (only these):
   - renal_mass         (a renal mass / cyst / RCC)
-  - prostate_lesion    (the prostate CANCER lesion on mpMRI / the PI-RADS index
-                        lesion — NOT the whole-gland volume)
-  - dominant_node      (the largest pathologic lymph node)
+  - prostate_lesion    (the prostate CANCER lesion on mpMRI, PI-RADS 4 or 5 ONLY
+                        — PI-RADS 1-3 lesions are NOT significant, omit them
+                        regardless of size; NOT the whole-gland volume)
+  - dominant_node      (a pathologic / avid / enlarged lymph node — do NOT filter
+                        by size: a small PSMA-avid node can be significant)
 
 For EACH lesion type, list every DATED size measurement.
 
@@ -135,10 +159,14 @@ def _date_key(disp: str) -> Optional[str]:
 # photopenic defects, SUV volumes), not anatomic tumor sizes — including them
 # fabricates false progressions (JONES/RIPLEY prostate PET uptake vs the smaller
 # mpMRI lesion). A dated ANATOMIC size trajectory must exclude them.
+# Only exclude when the measured SUBJECT is a functional finding (a
+# tracer-uptake region or a photopenic defect measured in cm). Do NOT exclude on
+# "avid"/"hypermetabolic" — those describe an ANATOMIC lesion's uptake, and an
+# avid node/lesion with a real size is significant (a small avid node matters).
 _FUNCTIONAL = re.compile(
     r"photopenic|tracer[\s-]*uptake|"
-    r"uptake\s+(?:region|focus|foci|seen|within|measur)|"
-    r"hypermetabolic|radiotracer|\bavid\b|metabolic\s+(?:tumou?r\s+)?volume",
+    r"uptake\s+(?:region|focus|foci|seen\s+within|measur)|"
+    r"metabolic\s+(?:tumou?r\s+)?volume",
     re.IGNORECASE)
 
 
@@ -205,9 +233,10 @@ def extract_lesion_series(
             g = _grounded(pt, src_norm, chart)
             if not g:
                 continue
-            # A "dominant" node must be pathologic — sub-centimeter nodes are
-            # normal and should not seed a nodal trajectory (BARRERA 3mm node).
-            if key == "dominant_node" and g.size_cm < _NODE_MIN_CM:
+            # Prostate lesions are tracked only at PI-RADS 4-5 (significance is the
+            # PI-RADS grade, not size). No size floor for nodes — a small PSMA-avid
+            # node can be significant.
+            if key == "prostate_lesion" and not _prostate_significant(g.quote, src_norm):
                 continue
             # one point per study date; keep the largest (dominant lesion)
             if g.date_key not in seen or g.size_cm > seen[g.date_key].size_cm:
