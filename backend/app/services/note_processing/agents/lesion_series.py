@@ -37,6 +37,7 @@ _DATE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b(?:jan|feb|mar|apr|may|jun|ju
                    r"sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}?,?\s*\d{4}\b", re.IGNORECASE)
 
 _LESION_KEYS = ("renal_mass", "prostate_lesion", "dominant_node")
+_NODE_MIN_CM = 1.0   # a "dominant/pathologic" node floor (sub-cm nodes are normal)
 
 
 @dataclass
@@ -135,8 +136,10 @@ def _date_key(disp: str) -> Optional[str]:
 # fabricates false progressions (JONES/RIPLEY prostate PET uptake vs the smaller
 # mpMRI lesion). A dated ANATOMIC size trajectory must exclude them.
 _FUNCTIONAL = re.compile(
-    r"photopenic|tracer|\bSUV\b|uptake|\bPSMA\b|\bPET\b|scintigra|metabolic|"
-    r"\bavid\b|hypermetabolic|radiotracer", re.IGNORECASE)
+    r"photopenic|tracer[\s-]*uptake|"
+    r"uptake\s+(?:region|focus|foci|seen|within|measur)|"
+    r"hypermetabolic|radiotracer|\bavid\b|metabolic\s+(?:tumou?r\s+)?volume",
+    re.IGNORECASE)
 
 
 def _grounded(pt: dict, src_norm: str, source: str) -> Optional[SizePoint]:
@@ -201,6 +204,10 @@ def extract_lesion_series(
                 continue
             g = _grounded(pt, src_norm, chart)
             if not g:
+                continue
+            # A "dominant" node must be pathologic — sub-centimeter nodes are
+            # normal and should not seed a nodal trajectory (BARRERA 3mm node).
+            if key == "dominant_node" and g.size_cm < _NODE_MIN_CM:
                 continue
             # one point per study date; keep the largest (dominant lesion)
             if g.date_key not in seen or g.size_cm > seen[g.date_key].size_cm:
