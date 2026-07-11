@@ -109,6 +109,12 @@ _HEDGING_RE = re.compile(
 )
 
 
+# A cancer term immediately FOLLOWED by "screening" is a screening context
+# (pre-diagnosis), not a confirmed diagnosis. "Surveillance" is intentionally
+# excluded here — that can mean active surveillance of a real cancer.
+_TRAILING_SCREENING_RE = re.compile(r"\s*screening\b", re.IGNORECASE)
+
+
 def _is_family_history_or_hedged(text: str, match_start: int, window: int = 80) -> bool:
     """True if the span at ``match_start`` is a family-history mention or
     a hedged/suspected/comparison reference rather than a confirmed
@@ -141,6 +147,14 @@ def find_cancer_evidence(text: str) -> List[str]:
             # patient. Hedged / suspected / comparison mentions are not
             # confirmed diagnoses. Both must be excluded.
             if _is_family_history_or_hedged(text, m.start()):
+                continue
+            # Trailing-screening guard: "prostate cancer SCREENING" is a
+            # screening context, not a diagnosis. The preceding-window hedge
+            # filter only catches "SCREENING FOR prostate cancer" (screening
+            # before); this catches "screening" AFTER the term. Fixes FLORES
+            # ("#Prostate cancer screening." + benign biopsy) mis-promoted to
+            # cancer_status=PRESENT -> a fabricated "prostate adenocarcinoma".
+            if _TRAILING_SCREENING_RE.match(text[m.end():m.end() + 18]):
                 continue
             found.append(m.group(0))
     # Dedup case-insensitively while preserving first-seen order
