@@ -911,6 +911,7 @@ def build_urology_note(
         # uncertain). Fixes contradictory CCs (JELLSEY "scheduled Eligard
         # injection") while preserving the cascade's specificity. Never returns
         # anything worse than the seed; no-op when disabled.
+        from .cc_checks import strip_liver_directed_therapy
         try:
             from .agents.cc_composer import refine_cc
             from .llm_helper import synthesize_with_llm
@@ -919,10 +920,14 @@ def build_urology_note(
                 return synthesize_with_llm(prompt=p, temperature=0.0,
                                            task_config=None, max_tokens=220)
 
-            return refine_cc(_seed_cc, _hpi_pf, _clinical_doc_cc, _cc_call)
+            _cc_out = refine_cc(_seed_cc, _hpi_pf, _clinical_doc_cc, _cc_call)
         except Exception as _cce:  # noqa: BLE001
             logger.warning(f"CC refiner error (using synthesize_cc): {_cce}")
-            return _seed_cc
+            _cc_out = _seed_cc
+        # Liver-directed-therapy guard: TACE/Y90/(chemo|radio)embolization belong
+        # to a concurrent HCC, never to a renal/urothelial/prostate primary — keep
+        # them off the GU chief complaint (RIVERA dual kidney+liver case).
+        return strip_liver_directed_therapy(_cc_out)
 
     def _build_hpi():
         if _is_consult_val and _consult_hpi_val:

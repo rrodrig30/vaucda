@@ -583,6 +583,12 @@ def build_stage2_note(
             assessment = finalize_temporal(
                 assessment, patient_facts, psa_section(stage1_note),
                 _asmt_repair_call, "Assessment", ref_note=stage1_note)
+            # Liver-directed-therapy guard: strip TACE/Y90/(chemo|radio)-
+            # embolization from GU-cancer sentences that carry no hepatic
+            # referent (the hepatic plan belongs to a concurrent HCC, not the
+            # renal/urothelial/prostate primary).
+            from .cc_checks import scrub_liver_therapy_prose
+            assessment = scrub_liver_therapy_prose(assessment)
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
