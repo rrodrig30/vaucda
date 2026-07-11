@@ -189,7 +189,8 @@ def build_authoritative_patient_facts(
         "PAST SURGICAL HISTORY:\n" + _psh + "\n\n"
         "PATHOLOGY RESULTS:\n" + _path + "\n"
     )
-    facts = extract_patient_status_facts(stub, raw_clinical_text=normalized)
+    facts = extract_patient_status_facts(
+        stub, raw_clinical_text=normalized, raw_source_text=clinical_text)
     # M4: when VAUCDA_L1=1, the fine-tuned L1 narrative extractor augments these
     # facts from the consult/tumor-board prose (no-op + safe-degrade otherwise).
     # Single hook point so Stage 1 and Stage 2 share the identical enriched object.
@@ -509,6 +510,7 @@ def build_urology_note(
         _hpi_patient_facts = extract_patient_status_facts(
             _deterministic_stub_for_hpi,
             raw_clinical_text=clinical_document,
+            raw_source_text=_raw_clinical_text,
         )
     _hpi_authoritative_facts = format_facts_for_prompt(_hpi_patient_facts)
     print(f"      Patient facts (for HPI): cancer={_hpi_patient_facts.cancer_status}, "

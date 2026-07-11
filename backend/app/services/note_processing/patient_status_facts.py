@@ -783,6 +783,7 @@ class PatientStatusFacts:
 def extract_patient_status_facts(
     stage1_note: str,
     raw_clinical_text: Optional[str] = None,
+    raw_source_text: Optional[str] = None,
 ) -> PatientStatusFacts:
     """Compute deterministic ground-truth facts from clinical sources.
 
@@ -948,7 +949,12 @@ def extract_patient_status_facts(
     # Multi-cancer ground truth: patient sex + non-prostate GU diagnoses. The
     # rest of this function is prostate-only; these give the CC/HPI/Assessment/
     # Plan agents a structured anchor for a renal-mass / bladder-tumor primary.
-    detect_src = raw_for_timeline or stage1_note or ""
+    # GU-diagnosis + sex detection must see the ORIGINAL clinician text, not the
+    # VistA->CPRS-normalized form: the normalizer strips narrative clinical
+    # signal (venous invasion "invades the right renal vein", "No change in the
+    # RCC") that the confirmation gate relies on. Same trap as the lesion-size
+    # table — normalized text silently loses the diagnosis. Prefer raw_source_text.
+    detect_src = raw_source_text or raw_for_timeline or stage1_note or ""
     patient_sex = detect_patient_sex(detect_src)
     other_gu = detect_gu_diagnoses(detect_src)
 

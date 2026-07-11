@@ -74,7 +74,13 @@ RULES:
 - Do NOT infer prostate cancer from an elevated PSA alone. An elevated/stable
   PSA without a positive biopsy is NOT prostate cancer.
 - An unbiopsied or radiographically-uncertain lesion is "indeterminate", never
-  "cancer" and never "benign".
+  "cancer" and never "benign". EXCEPTION: a mass is "cancer" even WITHOUT a
+  tissue biopsy when the chart documents a radiographically diagnostic feature —
+  it invades a vein / the IVC / has tumor thrombus, OR it is named as an
+  established diagnosis ("known RCC", "history of renal cell carcinoma"), OR it
+  is being treated with definitive cancer therapy for that mass (SBRT,
+  nephrectomy, ablation, cryoablation). Benign masses do not invade veins and
+  are not given definitive oncologic treatment.
 - READ THE RADIOLOGY CHARACTERIZATION. An adrenal nodule the report describes as
   a myelolipoma, a lipid-rich/lipid-poor adenoma, showing washout, <10 HU,
   "benign", or stable over time is BENIGN and does NOT require follow-up if
@@ -273,6 +279,35 @@ def enrich_facts_with_holistic_diagnoses(
     holistic_organs = {d.organ for d in non_prostate}
     holistic_has_cancer = any(d.category in ("cancer", "indeterminate")
                               for d in non_prostate)
+
+    # Deterministic-cancer override. The regex confirmation gate fires "cancer"
+    # only on STRONG radiographic signals (venous/IVC invasion + tumor thrombus,
+    # "Known/Hx of RCC") that a mass is malignant even without a tissue biopsy.
+    # The holistic LLM's blanket "unbiopsied -> indeterminate" rule wrongly
+    # downgrades those. When the deterministic gate confirmed CANCER for an organ
+    # the holistic called indeterminate, trust the strict gate and upgrade it in
+    # place (keep the holistic's richer status/stage; adopt its confirmed name if
+    # the holistic left a generic "mass"/"lesion"). Fixes RIVERA: 8.5 cm RCC
+    # invading the right renal vein, on SBRT, downgraded to "renal mass of
+    # uncertain significance".
+    _regex_cancer = {
+        d.organ: d
+        for d in (getattr(facts, "other_gu_diagnoses", None) or [])
+        if d.category == "cancer"
+    }
+    _GENERIC_NAME = re.compile(r"\b(mass|lesion|nodule)\b", re.I)
+    for d in non_prostate:
+        if d.organ in _regex_cancer:
+            rd = _regex_cancer[d.organ]
+            if d.category == "indeterminate":
+                d.category = "cancer"
+            # Adopt the deterministic gate's specific histology name ("renal cell
+            # carcinoma") when the holistic pass left a generic "right renal mass"
+            # — the CC/HPI should name the confirmed cancer, not a bland "mass".
+            if (rd.name and not _GENERIC_NAME.search(rd.name)
+                    and (not d.name or _GENERIC_NAME.search(d.name))):
+                d.name = rd.name
+
     merged: List[GUDiagnosis] = list(non_prostate)
     for d in (getattr(facts, "other_gu_diagnoses", None) or []):
         if d.organ in holistic_organs or d.organ == "prostate":
