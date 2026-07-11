@@ -577,6 +577,12 @@ def build_stage2_note(
 
             assessment = finalize_assessment(
                 assessment, stage1_note, patient_facts, _asmt_repair_call)
+            # Temporal-validity pass: no vague recency, volatile statuses dated,
+            # latest-observation-wins. (VAUCDA_TEMPORAL_AP)
+            from .temporal_checks import finalize_temporal, psa_section
+            assessment = finalize_temporal(
+                assessment, patient_facts, psa_section(stage1_note),
+                _asmt_repair_call, "Assessment")
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
@@ -646,6 +652,17 @@ def build_stage2_note(
         try:
             from .agents.assessment_composer import strip_garbage_lines
             plan = strip_garbage_lines(plan)
+            # Temporal-validity pass on the Plan: no vague recency ("repeat
+            # recent MRI" -> the date), volatile statuses dated, latest-wins.
+            from .temporal_checks import finalize_temporal, psa_section
+            from .llm_helper import synthesize_with_llm as _synth_plan
+
+            def _plan_temporal_call(_p: str) -> str:
+                return _synth_plan(prompt=_p, temperature=0.0,
+                                   task_config=task_config, max_tokens=1200)
+
+            plan = finalize_temporal(plan, patient_facts, psa_section(stage1_note),
+                                     _plan_temporal_call, "Plan")
         except Exception:  # noqa: BLE001
             pass
 

@@ -63,17 +63,12 @@ _CANCER_KW = ("cancer", "carcinoma", "adenocarc", "malign", "\brcc\b", "renal ce
               "tumou", "seminoma", "gleason", "grade group", "urotheli")
 
 
-_UNI_SPACE = re.compile("[\u00a0\u2000-\u200a\u202f\u205f\u3000]")
-
-
-def _norm(text: str) -> str:
-    """Normalize unicode spaces (LLMs emit narrow/thin/no-break spaces around
-    '+' and numbers) so grade/drug extraction and matching are not blinded."""
-    return _UNI_SPACE.sub(" ", text or "")
-
-
-def _sentences(text: str) -> List[str]:
-    return re.split(r"(?<=[.!?])\s+", text or "")
+from ..temporal_checks import (  # noqa: E402
+    norm as _norm, sentences as _sentences,
+    temporal_violations as _temporal_violations,
+    scrub_vague_recency as _scrub_vague_recency,
+    latest_wins_violations as _latest_wins_violations,
+)
 
 
 # ---- grade grounding --------------------------------------------------------
@@ -132,56 +127,6 @@ def _drug_violations(hpi: str, chart: str) -> List[str]:
                             f"in the chart — name only the documented agent")
                 flagged.add(generic)
     return viol
-
-
-# ---- temporal validity ------------------------------------------------------
-# Assertion CLASS: DURABLE facts (a biopsy-proven diagnosis, a completed
-# procedure) persist once true. VOLATILE facts (disease status, treatment
-# status) are true only AS OF their observation date — a "no recurrence" CT is
-# true when reported, not before or after — so they must carry that date and be
-# re-anchored to the latest result, never carried forward as a standing truth.
-# Vague recency ("recent MRI", "recently") hides the as-of date and is banned;
-# the actual date must be used.
-_DATE_IN_SENT = re.compile(
-    r"\b(?:19|20)\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b|"
-    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}",
-    re.IGNORECASE)
-_VAGUE_RECENCY = re.compile(r"\b(?<!most )(?:recent|recently|lately|newly)\b", re.IGNORECASE)
-_VOLATILE_STATUS = re.compile(
-    r"no\s+evidence\s+of\s+(?:disease|recurren|malignan)|\bNED\b|"
-    r"no\s+(?:recurren|residual|metasta|progression)|stable\s+disease|"
-    r"in\s+remission|\bremission\b|biochemical\s+control|disease[-\s]free|"
-    r"complete\s+response|"
-    r"(?:on|continues\s+on|remains\s+on|currently\s+on)\s+"
-    r"(?:continuous\s+|active\s+)?(?:ADT|androgen\s+deprivation|leuprolide|eligard|"
-    r"lupron|degarelix|abiraterone|enzalutamide|apalutamide|darolutamide)",
-    re.IGNORECASE)
-
-
-def _temporal_violations(hpi: str) -> List[str]:
-    viol: List[str] = []
-    for s in _sentences(hpi):
-        dated = bool(_DATE_IN_SENT.search(s))
-        if _VAGUE_RECENCY.search(s):
-            viol.append("replace vague recency ('recent' / 'recently' / 'recent "
-                        "MRI/CT') with the actual DATE of the study or result")
-        if _VOLATILE_STATUS.search(s) and not dated:
-            viol.append("a point-in-time status (NED / no recurrence / stable / on "
-                        "ADT) is stated without its as-of DATE — add the date it was "
-                        "observed (e.g. 'no recurrence on CT of <date>')")
-    return list(dict.fromkeys(viol))
-
-
-def _scrub_vague_recency(hpi: str) -> str:
-    """Guarantee no bare 'recent/recently' survives in an UNDATED sentence (keep
-    'most recent'); the date is preferred, but the vague wording must never ship."""
-    out = []
-    for s in _sentences(hpi):
-        if _VAGUE_RECENCY.search(s) and not _DATE_IN_SENT.search(s):
-            s = _VAGUE_RECENCY.sub("", s)
-            s = re.sub(r"\s{2,}", " ", s).replace(" ,", ",").replace(" .", ".")
-        out.append(s.strip())
-    return " ".join(x for x in out if x)
 
 
 # ---- date grounding (year-level, ledger) ------------------------------------
@@ -260,51 +205,6 @@ def _completeness_violations(hpi: str, facts: Any) -> List[str]:
 
 def _hard(hpi: str, chart: str) -> List[str]:
     return _grade_violations(hpi, chart) + _drug_violations(hpi, chart)
-
-
-# ---- latest-observation-wins (volatile facts) -------------------------------
-_MON3 = {m: i for i, m in enumerate(
-    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
-_PROGRESSED = ("recurren", "mcrpc", "castrat", "progress", "metasta")
-_DISEASE_FREE = re.compile(
-    r"\bNED\b|no\s+(?:evidence\s+of\s+)?recurren|disease[-\s]free|complete\s+response|"
-    r"no\s+metasta", re.IGNORECASE)
-
-
-def _psa_pairs(psa_data: str) -> List[Tuple[str, float]]:
-    pairs = []
-    for m in re.finditer(
-            r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})[^\n]*?(\d+\.\d+)", psa_data or ""):
-        mon = _MON3.get(m.group(1)[:3].lower())
-        if mon:
-            pairs.append((f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}", float(m.group(4))))
-    return pairs
-
-
-def _latest_wins_violations(hpi: str, facts: Any, psa_data: str) -> List[str]:
-    viol: List[str] = []
-    # PSA: the value the HPI presents as most-recent/current must be the latest.
-    pairs = _psa_pairs(psa_data)
-    if len(pairs) >= 2:
-        latest = max(pairs, key=lambda p: p[0])[1]
-        m = re.search(r"(?:most\s+recent|current|latest)\s+(?:serum\s+)?"
-                      r"(?:prostate[\s-]specific\s+antigen|psa)[^.\n]*?(\d+\.\d+)",
-                      _norm(hpi), re.IGNORECASE)
-        if m and abs(float(m.group(1)) - latest) > 0.011:
-            viol.append(f"the HPI calls {m.group(1)} the most-recent PSA, but the "
-                        f"LATEST documented PSA is {latest:g} — the newest result wins")
-    # Disease status: if the latest staging indicates progression, the HPI must
-    # not assert current disease-free / no-recurrence.
-    staging = [e for e in (getattr(facts, "clinical_timeline", None) or [])
-               if getattr(e, "event_type", "") == "STAGING_DECISION" and getattr(e, "date_key", "")]
-    if staging:
-        latest_ev = max(staging, key=lambda e: e.date_key)
-        blob = f"{getattr(latest_ev, 'modality', '')} {getattr(latest_ev, 'detail', '')}".lower()
-        if any(k in blob for k in _PROGRESSED) and _DISEASE_FREE.search(hpi):
-            viol.append(f"the LATEST documented disease state ({latest_ev.date_display}: "
-                        f"{latest_ev.modality}) indicates progression/recurrence, but the "
-                        f"HPI asserts disease-free/no-recurrence — reconcile to the latest state")
-    return viol
 
 
 def _soft(hpi: str, facts: Any, chart: str = "", psa_data: str = "") -> List[str]:
