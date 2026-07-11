@@ -1205,6 +1205,27 @@ def build_urology_note(
 
     synthesis_tasks['lesion_table'] = _lesion_table_task
 
+    # LLM-forward PSMA PET tracking (VAUCDA_PSMA_TABLE, off by default). Tracks
+    # avid disease SITES + SUVmax + impression per dated study (significance is
+    # avidity/PSMA-RADS, not size). Every entry grounded; provider-verify.
+    def _psma_table_task():
+        import os as _os
+        if _os.environ.get("VAUCDA_PSMA_TABLE", "0") != "1":
+            return ""
+        try:
+            from .agents.psma_pet_series import extract_psma_series, render_psma_table
+            from .llm_helper import synthesize_with_llm as _synth_ps
+
+            def _ps_call(p: str) -> str:
+                return _synth_ps(prompt=p, temperature=0.0, task_config=None, max_tokens=1200)
+
+            return render_psma_table(extract_psma_series(_raw_clinical_text, _ps_call))
+        except Exception as _pe:  # noqa: BLE001
+            logger.warning(f"PSMA PET table skipped: {_pe}")
+            return ""
+
+    synthesis_tasks['psma_table'] = _psma_table_task
+
     synthesis_tasks['ros'] = lambda: synthesize_ros(gu_notes, non_gu_notes)
 
     # Capture patient_sex in closure
@@ -1279,6 +1300,7 @@ def build_urology_note(
     allergies = results.get('allergies', '')
     imaging = results.get('imaging', '')
     lesion_table = results.get('lesion_table', '')
+    psma_table = results.get('psma_table', '')
     ros = results.get('ros', '')
     pe = results.get('pe', '')
 
@@ -1312,6 +1334,7 @@ def build_urology_note(
         labs=labs,
         imaging=imaging,
         lesion_table=lesion_table,
+        psma_table=psma_table,
         ros=ros,
         pe=pe,
         is_consult=is_consult,
@@ -1636,6 +1659,10 @@ def assemble_note(**sections) -> str:
     # imaging so the size history is next to the reports it came from.
     if sections.get("lesion_table"):
         note_parts.append(f"\n{sections['lesion_table']}\n")
+
+    # Dated PSMA PET tracking (avid sites + SUVmax; provider-verify).
+    if sections.get("psma_table"):
+        note_parts.append(f"\n{sections['psma_table']}\n")
 
     # ROS — narrowed by 4 chars for CPRS width
     if sections.get("ros"):
