@@ -134,6 +134,56 @@ def _drug_violations(hpi: str, chart: str) -> List[str]:
     return viol
 
 
+# ---- temporal validity ------------------------------------------------------
+# Assertion CLASS: DURABLE facts (a biopsy-proven diagnosis, a completed
+# procedure) persist once true. VOLATILE facts (disease status, treatment
+# status) are true only AS OF their observation date — a "no recurrence" CT is
+# true when reported, not before or after — so they must carry that date and be
+# re-anchored to the latest result, never carried forward as a standing truth.
+# Vague recency ("recent MRI", "recently") hides the as-of date and is banned;
+# the actual date must be used.
+_DATE_IN_SENT = re.compile(
+    r"\b(?:19|20)\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b|"
+    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}",
+    re.IGNORECASE)
+_VAGUE_RECENCY = re.compile(r"\b(?<!most )(?:recent|recently|lately|newly)\b", re.IGNORECASE)
+_VOLATILE_STATUS = re.compile(
+    r"no\s+evidence\s+of\s+(?:disease|recurren|malignan)|\bNED\b|"
+    r"no\s+(?:recurren|residual|metasta|progression)|stable\s+disease|"
+    r"in\s+remission|\bremission\b|biochemical\s+control|disease[-\s]free|"
+    r"complete\s+response|"
+    r"(?:on|continues\s+on|remains\s+on|currently\s+on)\s+"
+    r"(?:continuous\s+|active\s+)?(?:ADT|androgen\s+deprivation|leuprolide|eligard|"
+    r"lupron|degarelix|abiraterone|enzalutamide|apalutamide|darolutamide)",
+    re.IGNORECASE)
+
+
+def _temporal_violations(hpi: str) -> List[str]:
+    viol: List[str] = []
+    for s in _sentences(hpi):
+        dated = bool(_DATE_IN_SENT.search(s))
+        if _VAGUE_RECENCY.search(s):
+            viol.append("replace vague recency ('recent' / 'recently' / 'recent "
+                        "MRI/CT') with the actual DATE of the study or result")
+        if _VOLATILE_STATUS.search(s) and not dated:
+            viol.append("a point-in-time status (NED / no recurrence / stable / on "
+                        "ADT) is stated without its as-of DATE — add the date it was "
+                        "observed (e.g. 'no recurrence on CT of <date>')")
+    return list(dict.fromkeys(viol))
+
+
+def _scrub_vague_recency(hpi: str) -> str:
+    """Guarantee no bare 'recent/recently' survives in an UNDATED sentence (keep
+    'most recent'); the date is preferred, but the vague wording must never ship."""
+    out = []
+    for s in _sentences(hpi):
+        if _VAGUE_RECENCY.search(s) and not _DATE_IN_SENT.search(s):
+            s = _VAGUE_RECENCY.sub("", s)
+            s = re.sub(r"\s{2,}", " ", s).replace(" ,", ",").replace(" .", ".")
+        out.append(s.strip())
+    return " ".join(x for x in out if x)
+
+
 # ---- date grounding (year-level, ledger) ------------------------------------
 def _ledger_year_sets(facts: Any) -> Tuple[Set[str], Set[str]]:
     biopsy: Set[str] = set()
@@ -214,7 +264,8 @@ def _hard(hpi: str, chart: str) -> List[str]:
 
 def _soft(hpi: str, facts: Any, chart: str = "") -> List[str]:
     return (_grounding_violations(hpi, facts) + _lead_violation(hpi, facts)
-            + _completeness_violations(hpi, facts) + _grade_undersell(hpi, chart))
+            + _completeness_violations(hpi, facts) + _grade_undersell(hpi, chart)
+            + _temporal_violations(hpi))
 
 
 # ---- prompt -----------------------------------------------------------------
@@ -248,6 +299,14 @@ RULES:
   write 'recurrence in 2010 with PSA ... on <2026 date>').
 - Reflect CURRENT_TREATMENT_STATUS (do not write "on/continues ADT" for a
   completed/discontinued course). CURRENT_PHASE is a hint and may be stale.
+- TEMPORAL VALIDITY: a finding is true only AS OF the date it was reported. Write
+  time-sensitive findings as DATED observations — "CT on <date> showed no
+  recurrence", "PSA <value> on <date>", "no metastatic disease on bone scan of
+  <date>". NEVER assert a bare, undated point-in-time status (no "NED",
+  "stable", "no recurrence", "on ADT" without its date). The MOST RECENT dated
+  result wins; do not carry a stale status forward as if current.
+- NEVER use vague recency ("recent", "recently", "recent MRI/CT", "lately").
+  Always name the actual DATE of the study or result instead.
 - PSA: state the MOST RECENT value + date, then summarize the trajectory
   (nadir / peak / trend) in ONE sentence. Do NOT list more than ~4 PSA values.
 - Keep procedure findings brief. Cover every documented cancer. End with today's
@@ -310,6 +369,8 @@ def _postprocess(hpi: str, psa_data: str, pathology_data: str, psh_data: str) ->
         hpi = _collapse_word_doubling(hpi)
     except Exception:  # noqa: BLE001
         pass
+    # Guarantee no undated vague-recency wording survives.
+    hpi = _scrub_vague_recency(hpi)
     return hpi.strip()
 
 
