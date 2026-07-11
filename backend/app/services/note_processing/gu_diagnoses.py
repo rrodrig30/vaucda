@@ -23,6 +23,11 @@ _NEG = re.compile(
     r"no evidence of|free of)\b", re.IGNORECASE)
 _FAMILY = re.compile(r"\b(family (history|hx)|father|mother|brother|sister|"
                      r"son|daughter|maternal|paternal|sibling)\b", re.IGNORECASE)
+# A negation whose OBJECT is one of these is not a diagnosis-negation — it negates
+# metastasis / interval change, not the primary cancer ("No change in the ... RCC").
+_NONDX = re.compile(r"metasta|distant|\bmets\b|nodal\s+disease|\bchange\b|"
+                    r"interval|\bnew\b|increase|decrease|growth|enlarge|significant",
+                    re.IGNORECASE)
 
 
 def _clean(q: str) -> str:
@@ -30,8 +35,21 @@ def _clean(q: str) -> str:
 
 
 def _negated_or_family(text: str, pos: int, window: int = 70) -> bool:
+    if _FAMILY.search(text[max(0, pos - window):pos + window]):
+        return True
     pre = text[max(0, pos - window):pos]
-    return bool(_NEG.search(pre) or _FAMILY.search(text[max(0, pos - window):pos + window]))
+    # A negation counts only if it negates THIS finding. Skip negations whose
+    # OBJECT is not the diagnosis: a metastasis-negation ("no evidence of
+    # metastatic disease") negates spread, and an interval/stability negation
+    # ("No change in the right renal cell carcinoma", "no new lesion") negates
+    # change, NOT the primary cancer — neither must suppress the diagnosis
+    # (RIVERA: "No change in the right renal cell carcinoma ... invades the renal
+    # vein").
+    for m in _NEG.finditer(pre):
+        if _NONDX.match(pre[m.end():m.end() + 28].lstrip()):
+            continue
+        return True
+    return False
 
 
 @dataclass
@@ -141,11 +159,18 @@ _CONFIRM = re.compile(
     # bare "Nx" is avoided because it is also the TNM node stage.
     r"s/?p\s+(?:partial\s+|radical\s+)?nephrectomy|(?:partial|radical)\s+nx\b|"
     r"s/?p\s+(?:microwave\s+|cryo\s*|radiofrequency\s+|RF\s+|thermal\s+)?ablation|"
-    # An ESTABLISHED prior diagnosis (history/known of RCC / urothelial ca /
-    # bladder cancer) is itself confirmation — it is not "of uncertain
-    # significance" anymore (FLORES: "Hx of Right RCC ...").
-    r"(?:hx|history|known)\s+of\s+(?:right\s+|left\s+|bilateral\s+)?"
+    # An ESTABLISHED diagnosis (history/known of RCC / urothelial ca / bladder
+    # cancer, or "Known renal cell carcinoma") is itself confirmation — it is not
+    # "of uncertain significance" anymore (FLORES: "Hx of Right RCC ...";
+    # RIVERA: "Known renal cell carcinoma").
+    r"(?:hx|history|known)\s+(?:of\s+)?(?:right\s+|left\s+|bilateral\s+)?"
     r"(?:rcc\b|renal\s+cell|urothelial\s+carcinoma|bladder\s+cancer)|"
+    # Venous / vascular invasion or tumour thrombus is, by definition, a
+    # malignancy — a benign/indeterminate mass does not invade the renal vein
+    # (RIVERA: "renal cell carcinoma which ... invades the right renal vein").
+    r"invad\w+\s+(?:the\s+)?(?:right\s+|left\s+)?(?:renal\s+vein|ivc|"
+    r"inferior\s+vena\s+cava)|(?:renal\s+vein|ivc)\s+(?:thrombus|invasion|extension)|"
+    r"tumou?r\s+thrombus|"
     r"Fuhrman|nuclear\s+grade|grade\s+group|WHO\s+grade|"
     # carcinoma-in-situ and explicit TNM staging are, by definition, a
     # pathology-confirmed malignancy.
@@ -248,18 +273,27 @@ def detect_gu_diagnoses(text: str) -> List[GUDiagnosis]:
         by_organ[organ] = GUDiagnosis(organ=organ, category=category, name=name, evidence=quote)
 
     # Malignancy terms: confirmed -> cancer; unconfirmed -> indeterminate (mass).
+    # Scan ALL non-negated mentions per organ — a CONFIRMED one anywhere (biopsy,
+    # venous invasion, "known RCC") outranks an earlier unconfirmed mention, so a
+    # radiographically-declared RCC with renal-vein invasion (RIVERA) is not left
+    # "of uncertain significance" just because its first mention lacked a signal.
     for organ, pat, label in _CANCER:
+        first_unconf = None
+        confirmed = False
         for m in re.finditer(pat, text, re.IGNORECASE):
             if _negated_or_family(text, m.start()):
                 continue
             if _confirmed(text, m.start()):
                 consider(organ, "cancer", label, _clean(m.group(0)))
-            else:
-                consider(organ, "indeterminate",
-                         {"renal": "renal mass of uncertain significance",
-                          "bladder": "bladder tumor of uncertain significance"}.get(organ, label),
-                         _clean(m.group(0)))
-            break
+                confirmed = True
+                break
+            if first_unconf is None:
+                first_unconf = m
+        if not confirmed and first_unconf is not None:
+            consider(organ, "indeterminate",
+                     {"renal": "renal mass of uncertain significance",
+                      "bladder": "bladder tumor of uncertain significance"}.get(organ, label),
+                     _clean(first_unconf.group(0)))
     for organ, pat, label in _INDETERMINATE:
         for m in re.finditer(pat, text, re.IGNORECASE):
             if _negated_or_family(text, m.start()):

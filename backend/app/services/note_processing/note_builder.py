@@ -1185,7 +1185,7 @@ def build_urology_note(
     # dated table, a stable one a one-line summary. Flagged for provider review.
     def _lesion_table_task():
         import os as _os
-        if _os.environ.get("VAUCDA_LESION_TABLE", "0") != "1":
+        if _os.environ.get("VAUCDA_LESION_TABLE", "1") != "1":
             return ""
         try:
             from .agents.lesion_series import extract_lesion_series, render_lesion_table
@@ -1210,7 +1210,7 @@ def build_urology_note(
     # avidity/PSMA-RADS, not size). Every entry grounded; provider-verify.
     def _psma_table_task():
         import os as _os
-        if _os.environ.get("VAUCDA_PSMA_TABLE", "0") != "1":
+        if _os.environ.get("VAUCDA_PSMA_TABLE", "1") != "1":
             return ""
         try:
             from .agents.psma_pet_series import extract_psma_series, render_psma_table
