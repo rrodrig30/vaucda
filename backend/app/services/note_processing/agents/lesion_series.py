@@ -86,6 +86,9 @@ RULES:
   - Report the LARGEST dimension, in cm (convert mm to cm).
   - EXCLUDE prostate gland volume (cc / gram / mL), kidney length, ureteral
     stents, post-void residual, and digital-rectal-exam gland estimates.
+  - EXCLUDE PSMA PET / nuclear-scan measurements (tracer-uptake regions,
+    photopenic defects, SUV volumes) — those are FUNCTIONAL, not anatomic tumor
+    sizes. Use ONLY anatomic sizes from mpMRI / CT / ultrasound.
   - Use ONLY measurements explicitly written in the text. Do NOT infer or invent.
     If you cannot tell the study date for a measurement, OMIT that point.
   - "quote" MUST be copied VERBATIM from the text (the exact phrase containing the
@@ -127,9 +130,19 @@ def _date_key(disp: str) -> Optional[str]:
     return None
 
 
+# PSMA PET / nuclear-scan measurements are FUNCTIONAL (tracer-uptake regions,
+# photopenic defects, SUV volumes), not anatomic tumor sizes — including them
+# fabricates false progressions (JONES/RIPLEY prostate PET uptake vs the smaller
+# mpMRI lesion). A dated ANATOMIC size trajectory must exclude them.
+_FUNCTIONAL = re.compile(
+    r"photopenic|tracer|\bSUV\b|uptake|\bPSMA\b|\bPET\b|scintigra|metabolic|"
+    r"\bavid\b|hypermetabolic|radiotracer", re.IGNORECASE)
+
+
 def _grounded(pt: dict, src_norm: str, source: str) -> Optional[SizePoint]:
     """Keep a point only if its verbatim quote is in the source, its date appears
-    in the source, and its size is consistent with the quote."""
+    in the source, its size is consistent with the quote, and it is an ANATOMIC
+    (not functional/PET) measurement."""
     quote = str(pt.get("quote", "")).strip()
     date_disp = str(pt.get("date", "")).strip()
     try:
@@ -140,6 +153,12 @@ def _grounded(pt: dict, src_norm: str, source: str) -> Optional[SizePoint]:
         return None
     qn = re.sub(r"\s+", " ", quote).strip().lower()
     if len(qn) < 6 or qn not in src_norm:            # provenance: quote in source
+        return None
+    # Exclude FUNCTIONAL (PET/nuclear) measurements — check the source CONTEXT
+    # around the quote, since the SUV/PET marker often sits just outside the
+    # quoted size ("measuring 3.1 x 2.7 cm (Max SUV 12.4)").
+    qpos = src_norm.find(qn)
+    if qpos >= 0 and _FUNCTIONAL.search(src_norm[max(0, qpos - 130):qpos + len(qn) + 130]):
         return None
     # size consistent with a number in the quote (as cm, or its mm form)
     nums = [float(x) for x in re.findall(r"\d+\.?\d*", quote)]
@@ -191,7 +210,7 @@ def extract_lesion_series(
     return out
 
 
-def is_changing(points: List[SizePoint], thresh_cm: float = 0.3) -> bool:
+def is_changing(points: List[SizePoint], thresh_cm: float = 0.5) -> bool:
     """A trajectory is 'changing' if max-min exceeds a small threshold."""
     if len(points) < 2:
         return False
