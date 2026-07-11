@@ -992,7 +992,10 @@ def build_urology_note(
 
                 _composed_hpi = compose_hpi(_hpi_pf, _doc_psa, _doc_path,
                                             document_psh, clinical_document,
-                                            _hpi_call, v1_text)
+                                            _hpi_call, v1_text,
+                                            patient_name=_patient_name_val,
+                                            patient_age=_patient_age_val,
+                                            patient_sex=_patient_sex_val)
                 if _composed_hpi:
                     return _composed_hpi
             except Exception as _hce:  # noqa: BLE001

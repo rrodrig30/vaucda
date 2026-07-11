@@ -183,11 +183,61 @@ def _has_cancer(facts: Any) -> bool:
 def _lead_violation(hpi: str, facts: Any) -> List[str]:
     if not _has_cancer(facts):
         return []
-    opener = " ".join(_sentences(hpi)[:2]).lower()
-    if not any(re.search(k, opener) for k in _CANCER_KW):
-        return ["the HPI opens on a secondary/benign complaint though the patient "
-                "has a documented cancer — open with the cancer"]
+    # The FIRST sentence must carry the cancer. Checking the first two let a note
+    # bury the cancer behind an incidental opener (TAYLOR: "...chronic kidney
+    # disease... vitamin D capsule. He is being evaluated for prostate
+    # adenocarcinoma...") — sentence 1 was CKD/vitamin-D, cancer only in sentence 2.
+    first = (_sentences(hpi)[:1] or [""])[0].lower()
+    if not any(re.search(k, first) for k in _CANCER_KW):
+        return ["the FIRST sentence does not name the cancer though the patient has "
+                "a documented cancer — open the FIRST sentence with the cancer "
+                "diagnosis, not an incidental problem (CKD, vitamin D, HTN, BPH)"]
     return []
+
+
+# ---- named opening enforcement ----------------------------------------------
+# The template opener is "<NAME> is a <AGE>-year-old <sex> who ...". The composer,
+# given only the fact ledger, writes "The patient is a male ..." — dropping the
+# name and age (a regression vs v1/v2). This deterministically restores them.
+# period-tolerant (matches through an honorific like "Mr.") but bounded so it
+# stays within the opening clause.
+_OPENER_HAS_NAME = re.compile(
+    r"^\s*\S.{0,60}?\bis\s+an?\s+\d{1,3}[-\s]year[-\s]old\b", re.IGNORECASE)
+_WEAK_SUBJECT = re.compile(
+    r"^\s*(?:the\s+patient|this\s+patient|this|the\s+veteran|he|she|"
+    r"mr\.?|ms\.?|mrs\.?)\s+is\s+an?\s+"
+    r"(?:\d{1,3}[-\s]year[-\s]old\s+)?"
+    r"(?:male|female|man|woman|gentleman|gentlewoman|lady|boy|girl)\b",
+    re.IGNORECASE)
+
+
+def _sex_word(sex: str) -> str:
+    s = (sex or "").strip().lower()
+    if s.startswith("m"):
+        return "male"
+    if s.startswith("f"):
+        return "female"
+    return "patient"
+
+
+def _ensure_named_opening(hpi: str, name: Optional[str], age: Optional[Any],
+                          sex: Optional[str]) -> str:
+    """Guarantee the HPI opens with '<NAME> is a <AGE>-year-old <sex>'."""
+    if not hpi or not name:
+        return hpi
+    if _OPENER_HAS_NAME.search(hpi):
+        return hpi  # already named + aged
+    age_str = str(age).strip() if age not in (None, "") else ""
+    subj = (f"{name} is a {age_str}-year-old {_sex_word(sex)}"
+            if age_str else f"{name} is a {_sex_word(sex)}")
+    m = _WEAK_SUBJECT.search(hpi)
+    if m:
+        # "The patient is a male with a history of RCC..." ->
+        # "<NAME> is a <AGE>-year-old male with a history of RCC..."
+        return subj + hpi[m.end():]
+    # No recognizable subject phrase — prepend a canonical opener sentence.
+    body = hpi.lstrip()
+    return f"{subj} presents for urologic follow-up. " + body[:1].upper() + body[1:]
 
 
 def _completeness_violations(hpi: str, facts: Any) -> List[str]:
@@ -237,8 +287,12 @@ PATHOLOGY:
 {pathology_data or "(none)"}
 
 RULES:
-- If the patient has a cancer, OPEN with it (diagnosis, grade, treatment course).
-  Do NOT open with a secondary/benign complaint (incontinence, BPH).
+- Begin the FIRST sentence with the patient and the reason for the visit, e.g.
+  "<the patient> is a <age>-year-old man who returns for <primary problem>".
+- If the patient has a cancer, the FIRST sentence must name it (diagnosis, grade,
+  treatment course). Do NOT open on a secondary/benign/incidental problem
+  (chronic kidney disease, vitamin D, hypertension, incontinence, BPH) — those
+  come later, if at all.
 - Use the EXACT dates from the CLINICAL TIMELINE; a biopsy/treatment happened on
   its documented date, never a later clinic-visit date.
 - Use the EXACT Gleason score and Grade Group as documented — never round or
@@ -341,6 +395,9 @@ def compose_hpi(
     llm_call: LLMCallable,
     v1_fallback: Optional[str] = None,
     max_repair: int = 1,
+    patient_name: Optional[str] = None,
+    patient_age: Optional[Any] = None,
+    patient_sex: Optional[str] = None,
 ) -> Optional[str]:
     """LLM-forward HPI; None to fall back to the v2/v1 HPI path."""
     if os.environ.get("VAUCDA_HPI_COMPOSER", "0") != "1":
@@ -366,6 +423,9 @@ def compose_hpi(
     if not draft or len(draft) < 60:
         return None
     draft = _postprocess(draft, psa_data or "", pathology_data or "", psh_data or "")
+    # Restore the "<NAME> is a <AGE>-year-old <sex>" template opener the composer
+    # drops (it only sees the fact ledger, so it writes "The patient is a male").
+    draft = _ensure_named_opening(draft, patient_name, patient_age, patient_sex)
     # HARD violations that survive => unsafe to emit; fall back to v2/v1.
     hard = _hard(draft, chart)
     if hard:
