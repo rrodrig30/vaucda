@@ -582,7 +582,7 @@ def build_stage2_note(
             from .temporal_checks import finalize_temporal, psa_section
             assessment = finalize_temporal(
                 assessment, patient_facts, psa_section(stage1_note),
-                _asmt_repair_call, "Assessment")
+                _asmt_repair_call, "Assessment", ref_note=stage1_note)
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
@@ -662,7 +662,7 @@ def build_stage2_note(
                                    task_config=task_config, max_tokens=1200)
 
             plan = finalize_temporal(plan, patient_facts, psa_section(stage1_note),
-                                     _plan_temporal_call, "Plan")
+                                     _plan_temporal_call, "Plan", ref_note=stage1_note)
         except Exception:  # noqa: BLE001
             pass
 

@@ -68,6 +68,8 @@ from ..temporal_checks import (  # noqa: E402
     temporal_violations as _temporal_violations,
     scrub_vague_recency as _scrub_vague_recency,
     latest_wins_violations as _latest_wins_violations,
+    staleness_violations as _staleness_violations,
+    reference_ym as _reference_ym,
 )
 
 
@@ -210,7 +212,8 @@ def _hard(hpi: str, chart: str) -> List[str]:
 def _soft(hpi: str, facts: Any, chart: str = "", psa_data: str = "") -> List[str]:
     return (_grounding_violations(hpi, facts) + _lead_violation(hpi, facts)
             + _completeness_violations(hpi, facts) + _grade_undersell(hpi, chart)
-            + _temporal_violations(hpi) + _latest_wins_violations(hpi, facts, psa_data))
+            + _temporal_violations(hpi) + _latest_wins_violations(hpi, facts, psa_data)
+            + _staleness_violations(hpi, _reference_ym(chart)))
 
 
 # ---- prompt -----------------------------------------------------------------

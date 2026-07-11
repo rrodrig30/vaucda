@@ -44,7 +44,7 @@ DATE_IN_SENT = re.compile(
 VAGUE_RECENCY = re.compile(r"\b(?<!most )(?:recent|recently|lately|newly)\b", re.IGNORECASE)
 VOLATILE_STATUS = re.compile(
     r"no\s+evidence\s+of\s+(?:disease|recurren|malignan)|\bNED\b|"
-    r"no\s+(?:recurren|residual|metasta|progression)|stable\s+disease|"
+    r"no\s+(?:\w+\s+){0,3}(?:recurren|residual|metasta|progression)|stable\s+disease|"
     r"in\s+remission|\bremission\b|biochemical\s+control|disease[-\s]free|"
     r"complete\s+response|"
     r"(?:on|continues\s+on|remains\s+on|currently\s+on)\s+"
@@ -125,6 +125,91 @@ def latest_wins_violations(text: str, facts: Any, psa_data: str) -> List[str]:
     return viol
 
 
+# ---- staleness windows ------------------------------------------------------
+# A VOLATILE negative/status resting on an observation OLDER than its
+# modality-appropriate surveillance window must not read as current — it is
+# stated as a dated observation and flagged "not reassessed since". Sensible
+# defaults for prostate/urologic surveillance; TUNE per program / risk group.
+_MODALITY_WINDOW_MONTHS = {
+    "psa": 6,          # biochemical status: q3-6 mo on surveillance/treatment
+    "ct": 12, "mri": 12, "ultrasound": 12,
+    "bone_scan": 12, "psma": 12,          # osseous / metastatic restaging
+    "cystoscopy": 12,                     # bladder surveillance (risk-adjusted)
+    "dexa": 24,                           # bone density
+}
+_DEFAULT_WINDOW_MONTHS = 12
+# (label, keyword tuple) — most specific first.
+_MODALITY_PICK = [
+    ("bone_scan", ("bone scan", "bone scintigraphy", "nm bone")),
+    ("psma", ("psma", "pet/ct", "pet ct", " pet")),
+    ("dexa", ("dexa", "bone density", "bone densitometry")),
+    ("cystoscopy", ("cystoscop", "cystourethroscop")),
+    ("mri", ("mri", "mpmri", "multiparametric", "magnetic resonance")),
+    ("ct", ("ct ", "ct,", "ct.", "ct/", "computed tomography", "cross-sectional")),
+    ("ultrasound", ("ultrasound", "sonograph", " us ")),
+    ("psa", ("psa", "prostate-specific antigen", "prostate specific antigen",
+             "biochemical", "phoenix", "recurrence", "remission", "ned",
+             "disease-free", "metasta", "adt", "androgen")),
+]
+
+
+def _first_ym(text: str) -> Optional[Tuple[int, int]]:
+    m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+                  r"(?:\d{1,2},?\s+)?((?:19|20)\d{2})", text, re.IGNORECASE)
+    if m:
+        return (int(m.group(2)), _MON3[m.group(1)[:3].lower()])
+    m = re.search(r"\b(\d{1,2})/\d{1,2}/((?:19|20)?\d{2})\b", text)
+    if m:
+        y = int(m.group(2)); y += 2000 if y < 50 else (1900 if y < 100 else 0)
+        return (y, int(m.group(1)))
+    m = re.search(r"\b((?:19|20)\d{2})\b", text)
+    if m:
+        return (int(m.group(1)), 6)   # bare year -> mid-year approximation
+    return None
+
+
+def _window_for(sentence: str) -> Tuple[str, int]:
+    sl = sentence.lower()
+    for label, kws in _MODALITY_PICK:
+        if any(k in sl for k in kws):
+            return label, _MODALITY_WINDOW_MONTHS.get(label, _DEFAULT_WINDOW_MONTHS)
+    return "", _DEFAULT_WINDOW_MONTHS
+
+
+def reference_ym(note: str) -> Optional[Tuple[int, int]]:
+    """The visit's (year, month) from the note header, used as 'now' for age."""
+    for pat in (r"VISIT\s+DATE:\s*(\d{1,2})/\d{1,2}/((?:19|20)?\d{2})",
+                r"\bDATE:\s*(\d{1,2})/\d{1,2}/((?:19|20)\d{2})"):
+        m = re.search(pat, note or "", re.IGNORECASE)
+        if m:
+            y = int(m.group(2)); y += 2000 if y < 50 else (1900 if y < 100 else 0)
+            return (y, int(m.group(1)))
+    return None
+
+
+def staleness_violations(text: str, ref_ym: Optional[Tuple[int, int]]) -> List[str]:
+    """A dated VOLATILE status older than its modality window can't read as
+    current. (Undated volatiles are handled by temporal_violations.)"""
+    if not ref_ym:
+        return []
+    viol: List[str] = []
+    for s in sentences(text):
+        if not VOLATILE_STATUS.search(s):
+            continue
+        obs = _first_ym(s)
+        if not obs:
+            continue
+        age = (ref_ym[0] - obs[0]) * 12 + (ref_ym[1] - obs[1])
+        label, window = _window_for(s)
+        if age > window:
+            viol.append(f"a status rests on a ~{age}-month-old {label or 'observation'} "
+                        f"({obs[1]:02d}/{obs[0]}) but reads as current; the surveillance "
+                        f"window is ~{window} months — present it as a dated observation "
+                        f"and note it has NOT been reassessed since (do not invent a newer "
+                        f"result)")
+    return list(dict.fromkeys(viol))
+
+
 def _repair_prompt(text: str, viol: List[str], section: str) -> str:
     issues = "\n".join(f"  - {v}" for v in viol)
     return f"""\
@@ -134,7 +219,9 @@ The {section} below has temporal-validity problem(s):
 Rewrite it fixing ONLY these: render time-sensitive findings as DATED
 observations (e.g. "no recurrence on CT of <date>"); never use vague recency
 ("recent"/"recently"); present the MOST RECENT result as current; do not assert
-a stale point-in-time status. Keep everything else exactly as written.
+a stale point-in-time status. If a status rests on an observation OLDER than its
+surveillance window, keep its date and add that it has NOT been reassessed since
+that date — do NOT invent a newer result. Keep everything else exactly as written.
 
 {section.upper()}:
 {text}
@@ -148,28 +235,35 @@ def finalize_temporal(
     psa_data: str = "",
     llm_call: Optional[Any] = None,
     section: str = "note section",
+    ref_note: str = "",
     max_repair: int = 1,
 ) -> str:
     """Deterministic scrub of vague recency + an optional repair loop for
-    volatile-must-be-dated / latest-wins. Safe-degrade: returns the scrubbed text
-    on any error or when disabled."""
+    volatile-must-be-dated / latest-wins / staleness. Safe-degrade: returns the
+    scrubbed text on any error or when disabled."""
     import os
     if not text or os.environ.get("VAUCDA_TEMPORAL_AP", "1") != "1":
         return text
     text = scrub_vague_recency(text)
     if facts is None:
         return text
+    ref_ym = reference_ym(ref_note)
+
+    def _viol(t: str) -> List[str]:
+        return (temporal_violations(t) + latest_wins_violations(t, facts, psa_data or "")
+                + staleness_violations(t, ref_ym))
+
     try:
         repairs = 0
         while llm_call is not None and repairs < max_repair:
-            viol = temporal_violations(text) + latest_wins_violations(text, facts, psa_data or "")
+            viol = _viol(text)
             if not viol:
                 break
             new = (llm_call(_repair_prompt(text, viol, section)) or "").strip()
             if new and len(new) > 40:
                 text = scrub_vague_recency(new)
             repairs += 1
-        residual = temporal_violations(text) + latest_wins_violations(text, facts, psa_data or "")
+        residual = _viol(text)
         if residual:
             logger.info(f"[TEMPORAL:{section}] residual: {residual}")
     except Exception as e:  # noqa: BLE001
