@@ -262,10 +262,55 @@ def _hard(hpi: str, chart: str) -> List[str]:
     return _grade_violations(hpi, chart) + _drug_violations(hpi, chart)
 
 
-def _soft(hpi: str, facts: Any, chart: str = "") -> List[str]:
+# ---- latest-observation-wins (volatile facts) -------------------------------
+_MON3 = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+_PROGRESSED = ("recurren", "mcrpc", "castrat", "progress", "metasta")
+_DISEASE_FREE = re.compile(
+    r"\bNED\b|no\s+(?:evidence\s+of\s+)?recurren|disease[-\s]free|complete\s+response|"
+    r"no\s+metasta", re.IGNORECASE)
+
+
+def _psa_pairs(psa_data: str) -> List[Tuple[str, float]]:
+    pairs = []
+    for m in re.finditer(
+            r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})[^\n]*?(\d+\.\d+)", psa_data or ""):
+        mon = _MON3.get(m.group(1)[:3].lower())
+        if mon:
+            pairs.append((f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}", float(m.group(4))))
+    return pairs
+
+
+def _latest_wins_violations(hpi: str, facts: Any, psa_data: str) -> List[str]:
+    viol: List[str] = []
+    # PSA: the value the HPI presents as most-recent/current must be the latest.
+    pairs = _psa_pairs(psa_data)
+    if len(pairs) >= 2:
+        latest = max(pairs, key=lambda p: p[0])[1]
+        m = re.search(r"(?:most\s+recent|current|latest)\s+(?:serum\s+)?"
+                      r"(?:prostate[\s-]specific\s+antigen|psa)[^.\n]*?(\d+\.\d+)",
+                      _norm(hpi), re.IGNORECASE)
+        if m and abs(float(m.group(1)) - latest) > 0.011:
+            viol.append(f"the HPI calls {m.group(1)} the most-recent PSA, but the "
+                        f"LATEST documented PSA is {latest:g} — the newest result wins")
+    # Disease status: if the latest staging indicates progression, the HPI must
+    # not assert current disease-free / no-recurrence.
+    staging = [e for e in (getattr(facts, "clinical_timeline", None) or [])
+               if getattr(e, "event_type", "") == "STAGING_DECISION" and getattr(e, "date_key", "")]
+    if staging:
+        latest_ev = max(staging, key=lambda e: e.date_key)
+        blob = f"{getattr(latest_ev, 'modality', '')} {getattr(latest_ev, 'detail', '')}".lower()
+        if any(k in blob for k in _PROGRESSED) and _DISEASE_FREE.search(hpi):
+            viol.append(f"the LATEST documented disease state ({latest_ev.date_display}: "
+                        f"{latest_ev.modality}) indicates progression/recurrence, but the "
+                        f"HPI asserts disease-free/no-recurrence — reconcile to the latest state")
+    return viol
+
+
+def _soft(hpi: str, facts: Any, chart: str = "", psa_data: str = "") -> List[str]:
     return (_grounding_violations(hpi, facts) + _lead_violation(hpi, facts)
             + _completeness_violations(hpi, facts) + _grade_undersell(hpi, chart)
-            + _temporal_violations(hpi))
+            + _temporal_violations(hpi) + _latest_wins_violations(hpi, facts, psa_data))
 
 
 # ---- prompt -----------------------------------------------------------------
@@ -343,7 +388,9 @@ def _timeline_text(facts: Any, limit: int = 20) -> str:
         et = (getattr(e, "event_type", "") or "").replace("_", " ").lower()
         mod = getattr(e, "modality", "") or ""
         detail = (getattr(e, "detail", "") or "")[:80]
-        out.append(f"  {disp} — {et} {mod}: {detail}".rstrip())
+        tag = ("  [volatile — true only as of this date; do not carry forward]"
+               if getattr(e, "assertion_class", "") == "volatile" else "")
+        out.append(f"  {disp} — {et} {mod}: {detail}{tag}".rstrip())
     return "\n".join(out)
 
 
@@ -397,7 +444,7 @@ def compose_hpi(
                                           timeline)) or "").strip()
         repairs = 0
         while draft and repairs < max_repair:
-            viol = _hard(draft, chart) + _soft(draft, facts, chart)
+            viol = _hard(draft, chart) + _soft(draft, facts, chart, psa_data or "")
             if not viol:
                 break
             draft = (llm_call(_repair_prompt(ledger, timeline, draft, viol)) or draft).strip()
@@ -413,7 +460,7 @@ def compose_hpi(
     if hard:
         logger.info(f"[HPI] hard violation survives ({hard}); falling back to v2/v1")
         return None
-    soft = _soft(draft, facts, chart)
+    soft = _soft(draft, facts, chart, psa_data or "")
     if soft:
         logger.info(f"[HPI] composed with residual soft notes: {soft}")
     return draft or None

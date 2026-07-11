@@ -79,6 +79,41 @@ class TimelineEvent:
     modality: str = ""          # "ADT" / "EBRT" / "abiraterone" / "cystoscopy" / "PSMA PET" etc.
     detail: str = ""            # short, readable detail (the finding / value / context)
     source_quote: str = ""      # the original quote from source (for provenance)
+    # Temporal-validity metadata (see _classify_event). source_tier ranks
+    # trustworthiness: 1 = structured dated result (path / imaging / lab /
+    # procedure), 2 = dated history (treatment course), 3 = narrative.
+    # assertion_class: "durable" facts persist once true; "volatile" facts
+    # (disease status, on-treatment status, a measured value, an imaging
+    # impression) are true only AS OF their date and must be re-anchored to the
+    # latest observation, never carried forward as a standing truth.
+    source_tier: int = 2
+    assertion_class: str = ""   # "durable" | "volatile" | ""
+
+
+# Source-reliability tier by event type (1 = most trustworthy point-in-time
+# fact). Assertion class by event type: a completed/declined treatment, a
+# diagnosis, a pathology report and a procedure are DURABLE historical facts; an
+# imaging impression, a lab value, a staging decision and an ongoing-treatment
+# start/restart are VOLATILE (true only as of their date).
+_TIER_BY_TYPE = {
+    "PATHOLOGY": 1, "IMAGING": 1, "PROCEDURE": 1, "LAB_TREND": 1,
+    "DIAGNOSIS": 1, "STAGING_DECISION": 1,
+    "TREATMENT_STARTED": 2, "TREATMENT_COMPLETED": 2,
+    "TREATMENT_RESTARTED": 2, "TREATMENT_DECLINED": 2, "VISIT": 3,
+}
+_VOLATILE_TYPES = {"IMAGING", "LAB_TREND", "STAGING_DECISION",
+                   "TREATMENT_STARTED", "TREATMENT_RESTARTED"}
+_DURABLE_TYPES = {"DIAGNOSIS", "PATHOLOGY", "PROCEDURE",
+                  "TREATMENT_COMPLETED", "TREATMENT_DECLINED"}
+
+
+def _classify_event(e: "TimelineEvent") -> "TimelineEvent":
+    e.source_tier = _TIER_BY_TYPE.get(e.event_type, 2)
+    if e.event_type in _VOLATILE_TYPES:
+        e.assertion_class = "volatile"
+    elif e.event_type in _DURABLE_TYPES:
+        e.assertion_class = "durable"
+    return e
 
 
 EVENT_TYPES = (
@@ -1180,6 +1215,9 @@ def extract_clinical_timeline(
             detail=pf.finding,
             source_quote=pf.source_quote,
         ))
+
+    # Tag each event with its source tier + assertion class (temporal validity).
+    events = [_classify_event(e) for e in events]
 
     # Sort: events with dates ascend chronologically; dateless to the end.
     def sort_key(e: TimelineEvent):
