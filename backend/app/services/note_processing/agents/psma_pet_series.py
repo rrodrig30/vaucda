@@ -8,9 +8,10 @@ impression, so serial PSMA PETs show response vs progression (SUV falling / site
 resolving, or SUV rising / new sites).
 
 The LLM reads the PSMA PET material and returns one entry per dated study; every
-entry is GROUNDED — its verbatim quote must be in the source, its date must
-appear in the source, and each cited SUVmax must appear as an "SUV" value in the
-source (so a mis-read like the statin "suvastatin 10" cannot become "SUV 10").
+entry is GROUNDED — its date must appear in the source AND it must carry a
+grounded anchor (each cited SUVmax must be a real "SUV" value in the source, so
+the statin "suvastatin 10" cannot become "SUV 10"; or a short verbatim quote).
+The long radiology impression is a summary, not required to substring-match.
 Flagged for provider verification; nothing here is authoritative.
 """
 from __future__ import annotations
@@ -84,7 +85,8 @@ RULES:
   - Use ONLY what is written. Do NOT invent SUV values, sites, or dates.
   - An "SUV" value is written as "SUV 30.8" / "SUV=30.8" / "SUVmax of 8". Do NOT
     treat drug names like "suvastatin" as an SUV.
-  - "quote" MUST be copied VERBATIM from the text.
+  - "quote" = a SHORT verbatim phrase (<= 12 words) copied exactly from the text
+    (e.g. "maximum SUV of 5.1" or "no distant metastatic disease").
 
 Output ONLY JSON (empty array if no PSMA PET):
 {{"studies":[{{"date":"M/D/YYYY","impression":"...","sites":["..."],
@@ -128,27 +130,21 @@ def _suv_in_source(num: float, source: str) -> bool:
 
 
 def _ground(st: dict, src_norm: str, source: str) -> Optional[PsmaStudy]:
-    quote = str(st.get("quote", "")).strip()
+    """A study is trustworthy when its DATE grounds AND it has a grounded ANCHOR —
+    a grounded SUV site, the dominant SUVmax, or a (short) verbatim quote. The long
+    radiology impression itself is NOT required to substring-match (200-char quotes
+    rarely do after whitespace/formatting differences — that was the false-negative
+    cause); the grounded SUVs + date anchor the study, the impression is a summary."""
     date_disp = str(st.get("date", "")).strip()
     impression = re.sub(r"\s+", " ", str(st.get("impression", "")).strip())
-    qn = re.sub(r"\s+", " ", quote).strip().lower()
-    if len(qn) < 6 or qn not in src_norm:            # provenance
-        return None
+    quote = re.sub(r"\s+", " ", str(st.get("quote", "")).strip())
     dk = _date_key(date_disp)
     if not dk:
         return None
     parts = re.findall(r"\d+", date_disp)
     if date_disp not in source and not (parts and all(p in source for p in parts[:2])):
         return None
-    # dominant SUV must be a real SUV in the source (else null it, keep the study)
-    dom = None
-    try:
-        v = float(st.get("dominant_suv") or 0)
-        if v > 0 and _suv_in_source(v, source):
-            dom = round(v, 1)
-    except Exception:  # noqa: BLE001
-        pass
-    # keep only sites whose cited SUV (if any) is grounded
+    # keep only sites whose cited SUV (if any) is a real SUV in the source
     sites = []
     for s in (st.get("sites") or []):
         s = re.sub(r"\s+", " ", str(s)).strip()
@@ -158,7 +154,20 @@ def _ground(st: dict, src_norm: str, source: str) -> Optional[PsmaStudy]:
         if sm and not _suv_in_source(float(sm.group(1)), source):
             continue
         sites.append(s[:70])
-    return PsmaStudy(date_disp, dk, impression[:120], sites[:6], dom, quote[:90])
+    dom = None
+    try:
+        v = float(st.get("dominant_suv") or 0)
+        if v > 0 and _suv_in_source(v, source):
+            dom = round(v, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    ql = quote.lower()
+    quote_grounds = len(ql) >= 6 and ql in src_norm
+    # require at least one grounded anchor besides the date
+    if not (quote_grounds or sites or dom is not None):
+        return None
+    prov = quote[:90] if quote_grounds else (sites[0] if sites else f"SUVmax {dom}")
+    return PsmaStudy(date_disp, dk, impression[:120], sites[:6], dom, prov)
 
 
 def extract_psma_series(chart: str, llm_call: LLMCallable) -> List[PsmaStudy]:
@@ -199,7 +208,10 @@ def render_psma_table(studies: List[PsmaStudy]) -> str:
     trend = ""
     if len(suvs) >= 2:
         d = suvs[-1][1] - suvs[0][1]
-        word = "rising" if d > 0 else ("falling" if d < 0 else "stable")
+        # only call it rising/falling for a meaningful change (>=1.0 or >=25%);
+        # small SUV differences are measurement noise
+        signif = abs(d) >= 1.0 and abs(d) >= 0.25 * suvs[0][1]
+        word = ("rising" if d > 0 else "falling") if signif else "stable"
         trend = (f"\n  Dominant SUVmax {word}: {suvs[0][1]} ({suvs[0][0]}) "
                  f"-> {suvs[-1][1]} ({suvs[-1][0]})")
     return ("PSMA PET TRAJECTORY (auto-extracted — provider to VERIFY against the "
