@@ -1179,6 +1179,32 @@ def build_urology_note(
         _doc_imaging, gu_notes, procedure_findings=_proc_findings,
     )
 
+    # LLM-forward dated lesion-size trajectory table (VAUCDA_LESION_TABLE, off by
+    # default). The LLM associates each size with the imaging STUDY it came from
+    # and every point is grounded verbatim to the source; a CHANGING lesion gets a
+    # dated table, a stable one a one-line summary. Flagged for provider review.
+    def _lesion_table_task():
+        import os as _os
+        if _os.environ.get("VAUCDA_LESION_TABLE", "0") != "1":
+            return ""
+        try:
+            from .agents.lesion_series import extract_lesion_series, render_lesion_table
+            from .llm_helper import synthesize_with_llm as _synth_ls
+
+            def _ls_call(p: str) -> str:
+                return _synth_ls(prompt=p, temperature=0.0, task_config=None, max_tokens=1200)
+
+            # RAW text, not the normalizer output: the VistA->CPRS normalizer
+            # drops narrative size mentions (e.g. RIVERA's "measures 8.5 cm"),
+            # same as it strips PSA TOTAL. Extract from raw so no measurement is
+            # lost before grounding.
+            return render_lesion_table(extract_lesion_series(_raw_clinical_text, _ls_call))
+        except Exception as _le:  # noqa: BLE001
+            logger.warning(f"lesion-size table skipped: {_le}")
+            return ""
+
+    synthesis_tasks['lesion_table'] = _lesion_table_task
+
     synthesis_tasks['ros'] = lambda: synthesize_ros(gu_notes, non_gu_notes)
 
     # Capture patient_sex in closure
@@ -1252,6 +1278,7 @@ def build_urology_note(
     medications = results.get('medications', '')
     allergies = results.get('allergies', '')
     imaging = results.get('imaging', '')
+    lesion_table = results.get('lesion_table', '')
     ros = results.get('ros', '')
     pe = results.get('pe', '')
 
@@ -1284,6 +1311,7 @@ def build_urology_note(
         stone=stone,
         labs=labs,
         imaging=imaging,
+        lesion_table=lesion_table,
         ros=ros,
         pe=pe,
         is_consult=is_consult,
@@ -1603,6 +1631,11 @@ def assemble_note(**sections) -> str:
     # Imaging — narrowed by 4 (2 each side of title) for CPRS width
     if sections.get("imaging"):
         note_parts.append(f"\n{'='*36} IMAGING {'='*30}\n{sections['imaging']}\n")
+
+    # Dated lesion-size trajectory (auto-extracted, provider-verify) — sits with
+    # imaging so the size history is next to the reports it came from.
+    if sections.get("lesion_table"):
+        note_parts.append(f"\n{sections['lesion_table']}\n")
 
     # ROS — narrowed by 4 chars for CPRS width
     if sections.get("ros"):
