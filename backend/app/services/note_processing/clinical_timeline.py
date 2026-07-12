@@ -204,6 +204,39 @@ def _date_in_window(text: str, center: int, window: int = 80) -> Optional[Tuple[
     return _parse_date_from_text(snippet)
 
 
+# Any date-like token, used to pick the date NEAREST a keyword (by position)
+# rather than the first-by-format-priority date _parse_date_from_text returns.
+_ANY_DATE_TOKEN = re.compile(
+    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|"
+    r"\b[A-Za-z]{3,9}\s+\d{0,2},?\s*\d{4}\b|"
+    r"\b\d{1,2}/\d{4}\b|"
+    r"\b(?:19[89]\d|20\d\d)\b")
+
+
+def _date_forward(text: str, pos: int, span: int = 40) -> Optional[Tuple[str, str]]:
+    """The POSITIONALLY-FIRST date in a TIGHT window immediately AFTER ``pos``.
+    Position-based (not _parse_date_from_text's format-priority) so 'radiation
+    therapy 4/2022. Pathology 12/15/2021' dates to 4/2022 — the date adjacent to
+    the treatment word — not the full-format pathology stamp just after it."""
+    seg = text[pos:pos + span]
+    for mm in _ANY_DATE_TOKEN.finditer(seg):
+        d = _parse_date_from_text(mm.group(0))
+        if d:
+            return d
+    return None
+
+
+def _date_before_nearest(text: str, pos: int, span: int = 70) -> Optional[Tuple[str, str]]:
+    """The date CLOSEST before ``pos`` (rightmost in the preceding segment) —
+    positionally nearest, not first-by-format."""
+    seg = text[max(0, pos - span):pos]
+    for mm in reversed(list(_ANY_DATE_TOKEN.finditer(seg))):
+        d = _parse_date_from_text(mm.group(0))
+        if d:
+            return d
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Pattern catalogs
 # ---------------------------------------------------------------------------
@@ -357,9 +390,14 @@ def _find_treatment_events(
                     continue
             if not _in_prostate_context(text, m.start()):
                 continue
-            # Date can be on either side, prefer following (~50 chars after)
-            d = (_date_in_window(text, m.end(), window=60)
-                 or _date_in_window(text, m.start(), window=80))
+            # Date association: a treatment's date is the one adjacent to the
+            # treatment word — prefer a date immediately FOLLOWING it ("radiation
+            # therapy 4/2022"), then the NEAREST date before it. The old centered
+            # ±60 window returned the first-by-format date, so a diagnosis/MRI
+            # date one clause back hijacked the treatment (WHITEHEAD: radiation
+            # 4/2022 mis-dated to the 12/2021 diagnosis).
+            d = (_date_forward(text, m.end(), span=40)
+                 or _date_before_nearest(text, m.start(), span=70))
             if not d:
                 continue
             date_key, date_display = d
@@ -407,6 +445,26 @@ def _preceding_note_date(raw_text: str, anchor: int, window: int = 20000) -> Opt
       5. Bare "MM/DD/YYYY HH:MM" at line start
     """
     preceding = raw_text[max(0, anchor - window):anchor]
+    # 0. Closest inline PATHOLOGY/specimen date header ("Pathology 3/6/2023",
+    #    "Path Report: MM/DD/YYYY", "PATHOLOGY: ...", "Collected: ...", "Date
+    #    Spec taken: MMM DD, YYYY"). These sit at the top of a copy-forward path
+    #    block and ARE the finding's true date — take the CLOSEST one within a
+    #    tight window so a pathology finding isn't dated to a far, unrelated
+    #    note header (BILEK: 3/6/2023 biopsy findings mis-dated to a 6/1/2011
+    #    orthopedics "DATE OF NOTE" stamp).
+    tight = raw_text[max(0, anchor - 1500):anchor]
+    path_best = None
+    for m in re.finditer(
+        r"(?i)(?:patholog\w*|path\s*report|collected|date\s+spec\s+taken|"
+        r"accession(?:ed)?)\s*:?\s*"
+        r"((?:\d{1,2}/\d{1,2}/\d{4})|(?:[A-Z]{3,9}\s+\d{1,2},?\s+\d{4}))",
+        tight,
+    ):
+        path_best = m  # last = closest to the anchor
+    if path_best is not None:
+        d = _parse_date_from_text(path_best.group(1))
+        if d:
+            return d
     best = None
     # 1. "MM/DD/YYYY HH:MM Local Title:" (most-specific)
     for m in re.finditer(
@@ -576,6 +634,7 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
         def _norm_find(s: str) -> str:
             return re.sub(r"\s+", " ", (s or "").lower()).strip()[:60]
 
+        from collections import Counter
         groups: dict = {}
         for f in bx:
             groups.setdefault(_norm_find(f.finding), []).append(f)
@@ -583,7 +642,16 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
         for grp in groups.values():
             anchored = [f for f in grp if f.date_key in explicit_bx_dates]
             pick_from = anchored or grp
-            collapsed.append(min(pick_from, key=lambda f: f.date_key or "9999"))
+            # Copy-forward pastes the SAME pathology block into many later notes,
+            # so the CORRECT biopsy date recurs across copies, while a copy whose
+            # date mis-resolved to an unrelated note header (BILEK: a 3/6/2023
+            # biopsy block that fell back to a 6/1/2011 orthopedics stamp) appears
+            # once. Pick the MOST COMMON date; tie-break by earliest (preserves the
+            # JELLSEY phantom-biopsy fix, where distinct copy dates all tie -> the
+            # earliest, closest-to-the-real-diagnosis, wins).
+            counts = Counter(f.date_key for f in pick_from)
+            best = min(counts, key=lambda dk: (-counts[dk], dk or "9999"))
+            collapsed.append(next(f for f in pick_from if f.date_key == best))
         findings = [f for f in findings if f.procedure != "prostate biopsy"] + collapsed
 
     findings.sort(key=lambda f: (f.date_key or "0", f.procedure), reverse=True)
