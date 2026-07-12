@@ -928,7 +928,10 @@ def extract_patient_status_facts(
             detect_current_active_treatments,
             extract_procedure_findings,
         )
-        timeline = extract_clinical_timeline(raw_for_timeline)
+        # Timeline also runs on the ORIGINAL text (same normalizer-strips-
+        # pathology-headers reason as procedure findings) so copy-forward biopsy
+        # events date to their own report, not a nearer non-prostate stamp.
+        timeline = extract_clinical_timeline(raw_source_text or raw_for_timeline)
         current_phase = classify_current_phase(timeline)
         # current_active_treatments now comes from the AUTHORITATIVE VistA
         # RXOP active-outpatient list (see detect_current_active_treatments).
@@ -937,7 +940,12 @@ def extract_patient_status_facts(
         # via treatment_active_status because intermittent ADT is often absent
         # from the active Rx list even when ongoing.)
         active_meds = detect_current_active_treatments(raw_for_timeline)
-        proc_findings = extract_procedure_findings(raw_for_timeline)
+        # Procedure findings run on the ORIGINAL text: the VistA->CPRS normalizer
+        # strips the pathology "Collected: <date>" specimen headers that anchor a
+        # biopsy to its own report, so on normalized text a prostate biopsy can be
+        # mis-dated to a nearer non-prostate specimen (BILEK: colon adenoma
+        # 06/01/2011). Same normalizer trap as gu-diagnoses / the lesion table.
+        proc_findings = extract_procedure_findings(raw_source_text or raw_for_timeline)
 
         # Authoritative reconciliation: cancer_status is the single source of
         # truth for whether this patient HAS prostate cancer. When it is

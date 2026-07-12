@@ -506,6 +506,44 @@ def _preceding_note_date(raw_text: str, anchor: int, window: int = 20000) -> Opt
     return _parse_date_from_text(best.group(1))
 
 
+# PROSTATE-qualified pathology-collection dating. VistA charts interleave many
+# copy-forward specimens (prostate, colon, skin); the nearest "Collected:" header
+# to a prostate biopsy can belong to a DIFFERENT specimen (BILEK: a colon TUBULAR
+# ADENOMA "Collected: 06/01/2011" hijacking the 2019 prostate adenocarcinoma).
+# Only a collection header whose specimen block is prostate counts.
+_PROSTATE_PATH_CTX = re.compile(r"prostat|gleason|grade\s+group|\bGG[1-5]\b", re.I)
+_PATH_COLLECT_RE = re.compile(
+    r"(?i)(?:collected|received|date\s+spec(?:imen)?\s+taken|pathology|path\s*report|"
+    r"reported)\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Z]{3,9}\s+\d{1,2},?\s+\d{4})")
+
+
+def _prostate_pathology_date_before(
+    raw_text: str, anchor: int, window: int = 1800,
+) -> Optional[Tuple[str, str]]:
+    """Closest PROSTATE-qualified collection date heading the block before
+    ``anchor`` (the collection header whose specimen description is prostate)."""
+    seg = raw_text[max(0, anchor - window):anchor]
+    best = None
+    for m in _PATH_COLLECT_RE.finditer(seg):
+        block = seg[m.start():min(len(seg), m.end() + 300)]
+        if _PROSTATE_PATH_CTX.search(block):
+            best = m  # last = closest to the anchor
+    return _parse_date_from_text(best.group(1)) if best else None
+
+
+def _prostate_pathology_date_keys(raw_text: str) -> set:
+    """date_keys of every PROSTATE-qualified pathology collection date — the true
+    prostate biopsy dates, used to anchor the copy-forward collapse."""
+    keys = set()
+    for m in _PATH_COLLECT_RE.finditer(raw_text):
+        block = raw_text[m.start():min(len(raw_text), m.end() + 300)]
+        if _PROSTATE_PATH_CTX.search(block):
+            d = _parse_date_from_text(m.group(1))
+            if d:
+                keys.add(d[0])
+    return keys
+
+
 def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
     """Surface key findings from urologic procedures.
 
@@ -534,9 +572,17 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
             #      the preceding ~2500 chars (catches "UROLOGY PROCEDURE
             #      NOTE" headers that sit hundreds of chars above the
             #      procedure-specific keyword).
-            d = (_date_in_window(raw_text, m.start(), window=80)
-                 or _date_in_window(raw_text, m.end(), window=80)
-                 or _preceding_note_date(raw_text, m.start()))
+            if proc_label == "prostate biopsy":
+                # Date a prostate biopsy by ITS OWN prostate report's collection
+                # header, not a coincidental nearer non-prostate specimen date.
+                d = (_prostate_pathology_date_before(raw_text, m.start())
+                     or _date_in_window(raw_text, m.start(), window=80)
+                     or _date_in_window(raw_text, m.end(), window=80)
+                     or _preceding_note_date(raw_text, m.start()))
+            else:
+                d = (_date_in_window(raw_text, m.start(), window=80)
+                     or _date_in_window(raw_text, m.end(), window=80)
+                     or _preceding_note_date(raw_text, m.start()))
             date_key = d[0] if d else ""
             date_display = d[1] if d else "(undated)"
             # Skip purely planning-context mentions ("consider cystoscopy"),
@@ -630,6 +676,9 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
             pd = _parse_date_from_text(bm.group(1))
             if pd:
                 explicit_bx_dates.add(pd[0])
+        # Prostate-qualified pathology collection dates are authoritative biopsy
+        # anchors — they exclude non-prostate specimen dates (colon adenoma).
+        explicit_bx_dates |= _prostate_pathology_date_keys(raw_text)
 
         def _norm_find(s: str) -> str:
             return re.sub(r"\s+", " ", (s or "").lower()).strip()[:60]
