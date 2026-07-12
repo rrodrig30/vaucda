@@ -153,6 +153,61 @@ def _ledger_year_sets(facts: Any) -> Tuple[Set[str], Set[str]]:
     return biopsy, treatment
 
 
+# ---- biopsy-date grounding against the RAW SOURCE (HARD) --------------------
+# The ledger (clinical_timeline / procedure_findings) can mis-date a biopsy on a
+# copy-forward chart (BILEK: a colon "TUBULAR ADENOMA Collected: 06/01/2011"
+# mis-read as the prostate diagnosis; FRAGA: an ungrounded "9/11/2014"). The
+# composer renders the ledger faithfully, so a bad ledger date becomes a
+# fabricated HPI biopsy date. This check grounds each stated biopsy year against
+# PROSTATE-specific biopsy/pathology/diagnosis dates in the RAW source; an
+# unconfirmable biopsy date is a HARD violation -> repair, else fall back to v2.
+_DATE_TOK = r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{4})"
+_PROSTATE_CTX = re.compile(r"prostat|gleason|grade\s+group|\bGG[1-5]\b|adenocarcinoma", re.I)
+_BX_DATE_PATS = [
+    re.compile(rf"(?:prostate\s+)?(?:biopsy|core\s+needle\s+biopsy|TRUS\s*bx|prostate\s*bx)"
+               rf"\s+(?:on\s+|performed\s+(?:on\s+)?|dated\s+)?{_DATE_TOK}", re.I),
+    re.compile(rf"{_DATE_TOK}\s+(?:prostate\s+)?(?:biopsy|core\s+needle|TRUS|prostate\s*bx)\b", re.I),
+    re.compile(rf"(?:pathology|path\s*report|collected|date\s+spec(?:imen)?\s+taken|"
+               rf"accession\w*)\s*:?\s*{_DATE_TOK}", re.I),
+    re.compile(rf"(?:initial\s+diagnosis|date\s+of\s+(?:initial\s+)?diagnosis)\s*:?\s*{_DATE_TOK}", re.I),
+    re.compile(rf"(?:initially\s+)?diagnos\w+\s+(?:with\s+[^.]{{0,40}}?)?(?:on\s+|in\s+)?{_DATE_TOK}", re.I),
+]
+_YEAR = re.compile(r"(19[89]\d|20\d\d)")
+
+
+def _source_prostate_biopsy_years(chart: str) -> Set[str]:
+    """Years of PROSTATE biopsy/pathology/diagnosis dates in the raw source.
+    Prostate-qualified so a non-prostate specimen date (colon adenoma) doesn't
+    count; verb + label forms both covered so real dates aren't missed."""
+    years: Set[str] = set()
+    for pat in _BX_DATE_PATS:
+        for m in pat.finditer(chart):
+            if _PROSTATE_CTX.search(chart[max(0, m.start() - 120):m.end() + 120]):
+                ym = _YEAR.search(m.group(1) or "")
+                if ym:
+                    years.add(ym.group(1))
+    return years
+
+
+def _biopsy_date_hard(hpi: str, chart: str) -> List[str]:
+    allowed = _source_prostate_biopsy_years(chart)
+    if not allowed:
+        return []  # nothing to ground against -> can't prove a violation
+    for s in _sentences(hpi):
+        if not _BIOPSY_KW.search(s):
+            continue
+        low = s.lower()
+        if "no biops" in low or "denies" in low or "without" in low:
+            continue
+        yrs = set(re.findall(r"\b((?:19|20)\d{2})\b", s))
+        if yrs and not (yrs & allowed):
+            return [f"the biopsy date {sorted(yrs)} in the HPI is not corroborated by any "
+                    f"documented PROSTATE biopsy/pathology/diagnosis date (documented "
+                    f"prostate biopsy years: {sorted(allowed)}) — use a documented biopsy "
+                    f"date or state the diagnosis WITHOUT an unverified date"]
+    return []
+
+
 def _grounding_violations(hpi: str, facts: Any) -> List[str]:
     b_years, t_years = _ledger_year_sets(facts)
     viol: List[str] = []
@@ -257,7 +312,8 @@ def _completeness_violations(hpi: str, facts: Any) -> List[str]:
 
 
 def _hard(hpi: str, chart: str) -> List[str]:
-    return _grade_violations(hpi, chart) + _drug_violations(hpi, chart)
+    return (_grade_violations(hpi, chart) + _drug_violations(hpi, chart)
+            + _biopsy_date_hard(hpi, chart))
 
 
 def _soft(hpi: str, facts: Any, chart: str = "", psa_data: str = "") -> List[str]:
