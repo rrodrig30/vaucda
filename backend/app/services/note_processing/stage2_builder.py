@@ -238,6 +238,21 @@ async def retrieve_active_rag_context(
     return context, all_sources
 
 
+def _break_dash_bullets(text: str) -> str:
+    """Put each dash-delimited comment on its own line. The LLM often runs
+    Plan bullets together ("- Continue X. - Refer Y. - Order Z."); split before
+    a " - " that starts a new directive (preceded by end-of-clause, followed by
+    a capital) so it doesn't touch reference ranges (0.2 - 4.0), dosing (5-10 cc),
+    or mid-sentence dashes. Also strips stray markdown-bold leakage ("**")."""
+    import re as _re
+    if not text:
+        return text
+    text = _re.sub(r'(?<=[.\w)])[ \t]+-[ \t]+(?=[A-Z])', '\n- ', text)
+    text = text.replace('**', '')
+    text = _re.sub(r'[ \t]+\n', '\n', text)
+    return text.strip()
+
+
 def extract_prior_assessments_and_plans(
     gu_notes: List[Dict[str, str]],
     stage1_note: Optional[str] = None
@@ -589,6 +604,7 @@ def build_stage2_note(
             # renal/urothelial/prostate primary).
             from .cc_checks import scrub_liver_therapy_prose
             assessment = scrub_liver_therapy_prose(assessment)
+            assessment = _break_dash_bullets(assessment)
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
@@ -669,6 +685,7 @@ def build_stage2_note(
 
             plan = finalize_temporal(plan, patient_facts, psa_section(stage1_note),
                                      _plan_temporal_call, "Plan", ref_note=stage1_note)
+            plan = _break_dash_bullets(plan)
         except Exception:  # noqa: BLE001
             pass
 

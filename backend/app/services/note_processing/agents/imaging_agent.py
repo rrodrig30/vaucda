@@ -4,9 +4,29 @@ Imaging Agent
 Combines and summarizes imaging results.
 """
 
+import re
 from typing import List, Dict, Optional
 from ..llm_helper import combine_sections_with_llm
 from .history_cleaners import clean_llm_commentary
+
+
+# Break a run-together numbered impression ("1. X 2. Y 3. Z") so each item
+# starts on its own line. Matches " N. " (1-2 digits) only when followed by a
+# capital letter or "(" — so decimals (7.1), "US-3", and "(SEE NOTE 1.)" are
+# left intact — and only reflows lines that actually carry >=2 such markers.
+_ENUM_BREAK = re.compile(r'\s+(?=\d{1,2}\.\s+[A-Z(])')
+_ENUM_HAS2 = re.compile(r'\d{1,2}\.\s+[A-Z(].*?\d{1,2}\.\s+[A-Z(]')
+
+
+def _break_enumerated_findings(text: str) -> str:
+    if not text:
+        return text
+    out = []
+    for line in text.split('\n'):
+        if _ENUM_HAS2.search(line):
+            line = _ENUM_BREAK.sub('\n', line)
+        out.append(line)
+    return '\n'.join(out)
 
 
 def _render_procedure_imaging_entries(procedure_findings) -> str:
@@ -72,6 +92,15 @@ def synthesize_imaging(
     Returns:
         Summarized imaging results in reverse chronological order
     """
+    return _break_enumerated_findings(_synthesize_imaging_body(
+        document_imaging, gu_notes, procedure_findings))
+
+
+def _synthesize_imaging_body(
+    document_imaging: str,
+    gu_notes: List[Dict[str, str]],
+    procedure_findings: Optional[List] = None,
+) -> str:
     procedure_block = _render_procedure_imaging_entries(procedure_findings)
 
     # Document-level extraction wins when available. extract_imaging()

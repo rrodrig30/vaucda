@@ -263,6 +263,15 @@ def extract_psa(note_content: str) -> str:
         date_matches = list(re.finditer(date_pattern, text_before, re.IGNORECASE))
         if date_matches:
             last_date_match = date_matches[-1]
+            # PROXIMITY GUARD: only trust "nearest preceding specimen date" when
+            # the header is actually close to this PSA line. VA charts dump dozens
+            # of date-first PSA lines ("12/09/2024 13:55 ... PSA TOTAL 0.05") that
+            # carry their OWN date (Pattern 2d handles those); without this guard,
+            # each of those grabs a far, unrelated specimen header and a real value
+            # is stamped with the WRONG date — the false-PSA signature the user saw
+            # (multiple values collapsed onto one specimen timestamp).
+            if psa_match.start() - last_date_match.end() > 400:
+                continue
             date = last_date_match.group(1).strip()
             time = last_date_match.group(2).strip()
             entry = f"{date} {time}: {psa_value}"
@@ -295,16 +304,20 @@ def extract_psa(note_content: str) -> str:
     # The date leads the line and there is no "Specimen Collection Date:"
     # header, so Patterns 2a-2c miss it. This is the VA lab system of record.
     labline_pattern = (
-        r'(\d{1,2}/\d{1,2}/\d{4})\s+(?:\d{1,2}:\d{2}\s+)?'
+        r'(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2})?\s*'    # capture time when present
         r'(?:SERUM|PLASMA|BLOOD|WHOLE\s+BLOOD)?\s*'
         r'PSA\s+TOTAL\s+(<?\d+\.?\d*)\s*[LHlh]?\s*n[gG]/mL'
     )
     for m in re.finditer(labline_pattern, note_content, re.IGNORECASE):
         d = _normalize_psa_date(m.group(1).strip())
-        v = m.group(2).strip()
+        t = m.group(2).strip() if m.group(2) else None
+        v = m.group(3).strip()
         if not _is_plausible_psa_value(v):
             continue
-        entry = f"{d}: {v}"
+        # Keep the collection time when the source has it (issue: date-first lab
+        # lines were dropping their HH:MM, so the curve showed a time on some
+        # values but not others).
+        entry = f"{d} {t}: {v}" if t else f"{d}: {v}"
         if entry not in labreport_entries:
             labreport_entries.append(entry)
 
