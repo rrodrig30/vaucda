@@ -106,3 +106,46 @@ tests/**/output_new/
 tests/**/output_l1/
 tests/**/output_l1off/
 tests/**/output_l1_prefix/
+
+# ============================================================
+# Data & generated artifacts (keep `git status` clean; NOT deleted from disk)
+# ============================================================
+# Clinical document corpus (RAG source: AUA/NCCN guidelines, PDFs — large, PHI-adjacent)
+backend/data/documents/
+
+# Generated evaluation note outputs
+backend/eval/notes_*/
+
+# Local virtualenv
+backend/venv/
+
+# Test-case input data + batch/debug output dirs.
+# (Tracked test code — tests/test_*.py — is unaffected: git-ignore never untracks.)
+tests/*.txt
+tests/*.zip
+tests/*.json
+tests/*.html
+tests/*/
+
+# Loose scratch / data / debug-script files at repo root
+/chatgpt.txt
+/cysto.txt
+/instructions.txt
+/*.msg
+/L1 gold review.html
+/run_batch.py
+/run_subset.py
+/scan_output_errors.py
+/test_critical_issues.py
+/test_edge_cases.py
+/test_pattern_analysis.py
+/test_psa_debug.py
+/test_psa_honest_broker.py
+
+# venv symlink (backend/venv -> ../.venv)
+backend/venv
+
+# Local-only project files (per user: keep on disk, out of git)
+backend/database/run_graphrag_migration.py
+docker-compose.dev.yml
+md_docs/ADDENDUM_CROSS_SPECIALTY_AND_TEMPORAL_PROGRESSION.md
