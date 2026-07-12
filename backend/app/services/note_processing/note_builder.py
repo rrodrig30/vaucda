@@ -981,7 +981,7 @@ def build_urology_note(
         # survive. Ordered BEFORE v2; v1_text is the universal fallback. Safe-
         # degrade to v2/v1 on any miss / when disabled.
         import os as _os
-        if _os.environ.get("VAUCDA_HPI_COMPOSER", "0") == "1":
+        if _os.environ.get("VAUCDA_HPI_COMPOSER", "1") == "1":
             try:
                 from .agents.hpi_composer import compose_hpi
                 from .llm_helper import synthesize_with_llm as _synth_hpi

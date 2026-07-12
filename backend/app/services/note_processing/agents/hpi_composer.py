@@ -437,9 +437,23 @@ def _postprocess(hpi: str, psa_data: str, pathology_data: str, psh_data: str) ->
         hpi = _collapse_word_doubling(hpi)
     except Exception:  # noqa: BLE001
         pass
+    # Strip ledger-field / coding leakage the LLM occasionally pastes into prose
+    # ("(radiation status = COMPLETED)", "cystoscopy (CPT 52000)", "phase = ...").
+    hpi = _LEAK_FIELD.sub(" ", hpi)
+    hpi = _LEAK_CPT.sub(" ", hpi)
+    hpi = re.sub(r"\s{2,}", " ", hpi)
+    hpi = re.sub(r"\s+([.,;)])", r"\1", hpi)
     # Guarantee no undated vague-recency wording survives.
     hpi = _scrub_vague_recency(hpi)
     return hpi.strip()
+
+
+# ledger-field annotations ("(radiation status = COMPLETED)", "phase = X") and
+# procedure codes ("(CPT 52000)") that leak from the fact block into the prose.
+_LEAK_FIELD = re.compile(
+    r"\s*\(?\s*(?:[A-Za-z]+\s+)?(?:status|phase|category)\s*=\s*[A-Za-z_]+\s*\)?",
+    re.IGNORECASE)
+_LEAK_CPT = re.compile(r"\s*\(?\s*CPT(?:\s*code)?\s*[:#]?\s*\d{4,5}\s*\)?", re.IGNORECASE)
 
 
 def compose_hpi(
