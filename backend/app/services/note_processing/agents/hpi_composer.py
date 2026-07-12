@@ -470,7 +470,7 @@ def compose_hpi(
     patient_sex: Optional[str] = None,
 ) -> Optional[str]:
     """LLM-forward HPI; None to fall back to the v2/v1 HPI path."""
-    if os.environ.get("VAUCDA_HPI_COMPOSER", "0") != "1":
+    if os.environ.get("VAUCDA_HPI_COMPOSER", "1") != "1":
         return None
     if facts is None:
         return None
