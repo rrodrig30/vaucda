@@ -227,6 +227,47 @@ _COMPLETION_VERB_PATTERN = (
 )
 _COMPLETION_VERB_RE = re.compile(_COMPLETION_VERB_PATTERN, re.IGNORECASE)
 
+# Discussion / counseling / option-list / intent / CONDITIONAL-FUTURE markers.
+# When any sit in the same window as a treatment keyword, the prose is COUNSELING
+# about the option or describing a FUTURE/CONDITIONAL plan — NOT asserting the
+# treatment was performed. The conditional-future clauses ("if his PSA rises",
+# "should the PSA become detectable") specifically catch SALVAGE-radiation
+# hypotheticals: a s/p-RALP patient with an undetectable PSA whose chart merely
+# DISCUSSES salvage RT must NOT be logged as s/p radiation (which would wrongly
+# set phoenix_applicable=True and confabulate a radiation course). Shared by both
+# treatment detectors so they filter identically.
+_TREATMENT_DISCUSSION_RE = re.compile(
+    r"\b(?:discuss(?:ed|ing|ion)?|consider(?:ed|ing|ation)?|"
+    r"offer(?:ed|ing)?|interest(?:ed)?\s+in|may\s+benefit|"
+    r"option(?:s)?\s+(?:of|for|include|are|to)|"
+    r"candidate\s+(?:for|of)|recommend(?:ed|ing|ation)?|"
+    r"plan(?:ned|ning)?\s+(?:for|to)|consult(?:ed|ation)?\s+(?:for|to)|"
+    r"referred\s+(?:for|to)|scheduled\s+(?:for|to)|"
+    r"await(?:ing|s)?|elect(?:ed)?\s+against|"
+    r"under\s+consideration|"
+    r"including|consist(?:ing|s)\s+of|such\s+as|"
+    r"pursu(?:e|ing|ed)|"
+    r"if\s+(?:his\s+|the\s+)?psa|should\s+(?:his\s+|the\s+)?psa|"
+    r"when\s+(?:his\s+|the\s+)?psa|"
+    r"if\s+[^.]{0,40}?(?:rise|recur|detectable|persist|elevat)|"
+    r"would\s+(?:need|require|be\s+offered|consider)|"
+    r"never\s+heard\s+of|never\s+been\s+told\s+about)\b",
+    re.IGNORECASE,
+)
+_TREATMENT_DECLINED_RE = re.compile(
+    r"\b(?:declined|declines|refuses|refused|deferred|not\s+a\s+candidate)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_hypothetical_or_declined_treatment(text: str, match_start: int,
+                                           match_end: int) -> bool:
+    """True if the treatment mention is a discussion / option / conditional-
+    future / declined statement rather than a performed treatment."""
+    window = text[max(0, match_start - 100):match_end + 60]
+    return bool(_TREATMENT_DISCUSSION_RE.search(window)
+                or _TREATMENT_DECLINED_RE.search(window))
+
 
 def _completion_verb_nearby(text: str, position: int, window: int = 60) -> bool:
     """True if a completion verb appears within the ``window`` chars BEFORE
@@ -250,6 +291,11 @@ def find_completed_treatments(text: str) -> List[str]:
                 continue
             if not _completion_verb_nearby(text, m.start()):
                 continue
+            # Reject discussion / option / conditional-future ("salvage RT if PSA
+            # rises") / declined mentions — a completion-like verb can sit near a
+            # merely-planned treatment (parity with find_treatment_in_raw_...).
+            if _is_hypothetical_or_declined_treatment(text, m.start(), m.end()):
+                continue
             # Capture the verb..noun span for a readable quote
             quote_start = max(0, m.start() - 60)
             raw = text[quote_start:m.end()]
@@ -271,6 +317,8 @@ def find_completed_treatments(text: str) -> List[str]:
             if not qualifier_re.search(window_text):
                 continue
             if not _completion_verb_nearby(text, m.start()):
+                continue
+            if _is_hypothetical_or_declined_treatment(text, m.start(), m.end()):
                 continue
             found.append(m.group(0))
 
@@ -412,31 +460,10 @@ def find_treatment_in_raw_clinical_text(text: str) -> List[str]:
     if not text:
         return []
 
-    declined_re = re.compile(
-        r"\b(?:declined|declines|refuses|refused|deferred|not\s+a\s+candidate)\b",
-        re.IGNORECASE,
-    )
-    # Discussion / counseling / option-list / intent markers. When any
-    # of these sit in the same window as a "completion-verb-like" token,
-    # the prose is COUNSELING about the option, not asserting it was
-    # performed. Without this filter, sentences like
-    #   "He says that he was only offered RALP and AS at USA"
-    # — where 'was on' matches inside 'was only' or where 'history of'
-    # appears nearby — register as completed RALP.
-    discussion_re = re.compile(
-        r"\b(?:discuss(?:ed|ing|ion)?|consider(?:ed|ing|ation)?|"
-        r"offer(?:ed|ing)?|interest(?:ed)?\s+in|may\s+benefit|"
-        r"option(?:s)?\s+(?:of|for|include|are|to)|"
-        r"candidate\s+(?:for|of)|recommend(?:ed|ing|ation)?|"
-        r"plan(?:ned|ning)?\s+(?:for|to)|consult(?:ed|ation)?\s+(?:for|to)|"
-        r"referred\s+(?:for|to)|scheduled\s+(?:for|to)|"
-        r"await(?:ing|s)?|elect(?:ed)?\s+against|"
-        r"under\s+consideration|"
-        r"including|consist(?:ing|s)\s+of|such\s+as|"
-        r"pursu(?:e|ing|ed)|"
-        r"never\s+heard\s+of|never\s+been\s+told\s+about)\b",
-        re.IGNORECASE,
-    )
+    # Shared module-level filters (see _TREATMENT_DISCUSSION_RE / _DECLINED_RE):
+    # keeps both treatment detectors identical, incl. conditional-future markers.
+    declined_re = _TREATMENT_DECLINED_RE
+    discussion_re = _TREATMENT_DISCUSSION_RE
 
     found: List[str] = []
     for tx_pattern in _RAW_TREATMENT_TOKENS:

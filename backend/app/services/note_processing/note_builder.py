@@ -644,7 +644,19 @@ def build_urology_note(
         )
 
     if patient_name or patient_ssn or patient_age:
-        print(f"      Patient: {patient_name} (SSN: {patient_ssn}, Age: {patient_age}, Sex: {patient_sex}, Race: {patient_race})")
+        # PHI-safe debug line: never log the full SSN or full name to stdout/logs.
+        # Redact SSN to last-4 (matches the note-header convention) and reduce the
+        # name to initials so processing is traceable without a direct identifier.
+        _ssn_disp = "XXX-XX-XXXX"
+        if patient_ssn:
+            _d = re.sub(r"\D", "", str(patient_ssn))
+            if len(_d) >= 4:
+                _ssn_disp = f"XXX-XX-{_d[-4:]}"
+        _name_disp = ""
+        if patient_name:
+            _parts = [p for p in re.split(r"[\s,]+", str(patient_name).strip()) if p]
+            _name_disp = "".join(p[0].upper() for p in _parts if p[:1].isalpha())[:4] or "?"
+        print(f"      Patient: {_name_disp} (SSN: {_ssn_disp}, Age: {patient_age}, Sex: {patient_sex}, Race: {patient_race})")
     else:
         print(f"      Patient demographics: Not found in document")
 
