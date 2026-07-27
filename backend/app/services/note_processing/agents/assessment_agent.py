@@ -583,6 +583,14 @@ OUTPUT REQUIREMENTS:
 - Provide ONLY the assessment narrative (4-8 sentences)
 - NO meta-commentary, preamble, or explanations
 - Just the clean, clinical assessment text
+- AFFIRMATIVE ONLY: state what IS true and what WILL be done. Do NOT include
+  recommendations against inapplicable tests ("PSMA PET is not indicated as the
+  PSA is undetectable"), hypothetical contingencies ("should he fail to void,
+  surgical options could be explored"), or patronizing/tautological rationale
+  ("...as the prostate has been removed"). Omit the inapplicable rather than
+  explaining why it doesn't apply. (A guideline-grounded deferral with real
+  weight — e.g. deferring screening for limited life expectancy — may be stated
+  once, concisely.)
 
 The assessment should read as a coherent clinical impression that demonstrates awareness of this specific patient's presentation and history.
 """

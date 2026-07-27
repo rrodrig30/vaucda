@@ -322,6 +322,29 @@ PROBLEM SELECTION RULES:
 - NO TECHNICAL METADATA in plan items: never include phantom size, kVp/mAs,
   reconstruction params, CPT/procedure codes, or raw reference-range numbers.
 
+AFFIRMATIVE RECOMMENDATIONS ONLY (MANDATORY — this is a common failure):
+Every plan bullet must be an ACTION to take now, grounded in a real current
+finding. Do NOT write:
+  (a) Recommendations AGAINST a test/procedure that is obviously inapplicable —
+      OMIT it silently, never explain why it isn't needed. E.g. do NOT write
+      "no need for prostate biopsy" for a patient s/p prostatectomy, or "PSMA PET
+      is not indicated as PSA is undetectable", or "no cystoscopy needed". If it
+      doesn't apply, it simply does not appear.
+  (b) HYPOTHETICAL / CONTINGENCY bullets for problems the patient does not
+      currently have. Do NOT write "should he fail to void, we could explore
+      surgical options including...", "if the PSA rises we would consider...",
+      "in the event of recurrence...". Plan only for the patient's ACTUAL current
+      state. (A concrete return-precaution the patient should act on — "return or
+      call for fever, gross hematuria, or inability to void" — is allowed; open-
+      ended future management menus are not.)
+  (c) PATRONIZING or tautological justifications — never justify a
+      recommendation (or its absence) with an obvious anatomical/common-sense
+      fact ("...as the prostate has been removed", "...since he has no measurable
+      PSA"). State the affirmative action without the obvious rationale.
+Exception: a deliberate, guideline-grounded deferral with real clinical weight
+(e.g. "defer routine PSA screening given limited life expectancy per AUA") may be
+stated ONCE, concisely — that is a decision, not a hypothetical.
+
 TASK:
 Using THIS PATIENT'S specific history, labs, imaging, medications, surgical history, and other findings from the Stage 1 note above, create urology-focused plans addressing each of the patient's active problems.
 

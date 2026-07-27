@@ -238,6 +238,93 @@ async def retrieve_active_rag_context(
     return context, all_sources
 
 
+import re as _re_unprod
+
+# --- unproductive-recommendation scrubber -----------------------------------
+# Remove (a) hypothetical/contingency management of problems the patient does
+# NOT currently have, and (b) recommendations AGAINST an inapplicable test —
+# both of which the user flagged as space-wasting / patronizing. Conservative:
+# a segment is dropped only on a clear signal, guideline-grounded deferrals and
+# patient return-precautions are preserved.
+_UP_CONTINGENCY = _re_unprod.compile(
+    r'\b(?:should\s+(?:he|she|the\s+patient|his|her|symptoms|the\s+psa|urinary)|'
+    r'if\s+(?:he|she|the\s+patient|symptoms|his|her|the\s+psa|urinary|voiding)|'
+    r'in\s+the\s+event|were\s+(?:he|she|the\s+patient|it)\s+to|'
+    r'in\s+case\s+(?:of|he|she))\b', _re_unprod.IGNORECASE)
+_UP_FUTURE_MGMT = _re_unprod.compile(
+    r'\b(?:explore|consider|could|would|may\s+(?:proceed|offer|pursue|explore|consider)|'
+    r'option(?:s)?\s+(?:include|are|of|for)|we\s+c(?:an|ould)|surgical\s+option|'
+    r'proceed\s+with|pursue|offer|can\s+be\s+(?:explored|offered|considered))\b',
+    _re_unprod.IGNORECASE)
+# Patient-directed return precautions are legitimate — never drop these.
+_UP_PRECAUTION = _re_unprod.compile(
+    r'\b(?:return|call|seek|report|contact|come\s+back|present\s+to|'
+    r'go\s+to\s+the\s+(?:er|ed|emergency)|advise[ds]?\s+to)\b', _re_unprod.IGNORECASE)
+_UP_NEG_REC = _re_unprod.compile(
+    r'\b(?:no\s+(?:need|indication|role)\s+for|'
+    # "No additional/further/repeat/routine <test> ... is indicated/needed" — the
+    # qualifier is required so "No EVIDENCE of metastatic disease" is NOT matched.
+    r'no\s+(?:additional|further|repeat|routine|new)\b[^.]{0,70}?\b'
+    r'(?:indicated|necessary|needed|required|warranted)\b|'
+    r'not\s+(?:indicated|necessary|needed|required|warranted|recommended)|'
+    r'do(?:es)?\s+not\s+(?:need|require))\b',
+    _re_unprod.IGNORECASE)
+_UP_TEST_TOKEN = _re_unprod.compile(
+    r'\b(?:biopsy|psma|pet|mp?mri|\bct\b|cystoscop|imaging|scan|bone\s+scan|\bpsa\b|'
+    r'screening|ultrasound|turp|nephrectomy|prostatectomy|radiation|mri)\b',
+    _re_unprod.IGNORECASE)
+# Guideline-grounded deferral / real clinical rationale — a decision, keep it.
+_UP_JUSTIFIED = _re_unprod.compile(
+    r'\b(?:per\s+(?:aua|nccn|eau)|life\s+expectancy|guideline|limited\s+life|'
+    r'comorbid|frail|advanced\s+age)\b', _re_unprod.IGNORECASE)
+
+
+def _is_unproductive_segment(seg: str) -> bool:
+    """True if a Plan bullet / Assessment sentence is a hypothetical-contingency
+    or a recommendation-against-an-inapplicable-test (and not a guideline
+    deferral or a patient return-precaution)."""
+    if not seg or not seg.strip():
+        return False
+    contingency = (_UP_CONTINGENCY.search(seg) and _UP_FUTURE_MGMT.search(seg)
+                   and not _UP_PRECAUTION.search(seg))
+    neg_rec = (_UP_NEG_REC.search(seg) and _UP_TEST_TOKEN.search(seg)
+               and not _UP_JUSTIFIED.search(seg))
+    return bool(contingency or neg_rec)
+
+
+def _scrub_unproductive_plan(plan: str) -> str:
+    """Drop unproductive dash-bullets from the Plan (keeps PROBLEM headers and
+    every affirmative bullet)."""
+    if not plan:
+        return plan
+    out = []
+    for line in plan.split('\n'):
+        body = line.lstrip()
+        if body.startswith('-') and _is_unproductive_segment(body):
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
+def _scrub_unproductive_assessment(text: str) -> str:
+    """Drop whole unproductive sentences from the Assessment narrative; also trim
+    an unproductive trailing clause after ';' when the lead clause is good."""
+    if not text:
+        return text
+    sents = _re_unprod.split(r'(?<=[.!?])\s+', text.strip())
+    kept = []
+    for s in sents:
+        if _is_unproductive_segment(s):
+            # try to salvage a good lead clause before a ';'/' - ' offender
+            parts = _re_unprod.split(r'\s*[;—]\s*|\s+-\s+', s, maxsplit=1)
+            if len(parts) == 2 and not _is_unproductive_segment(parts[0]) and len(parts[0]) > 15:
+                lead = parts[0].rstrip(' ,;')
+                kept.append(lead + ('.' if not lead.endswith('.') else ''))
+            continue
+        kept.append(s)
+    return ' '.join(kept).strip()
+
+
 def _break_dash_bullets(text: str) -> str:
     """Put each dash-delimited comment on its own line. The LLM often runs
     Plan bullets together ("- Continue X. - Refer Y. - Order Z."); split before
@@ -605,6 +692,7 @@ def build_stage2_note(
             from .cc_checks import scrub_liver_therapy_prose
             assessment = scrub_liver_therapy_prose(assessment)
             assessment = _break_dash_bullets(assessment)
+            assessment = _scrub_unproductive_assessment(assessment)
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
@@ -686,6 +774,7 @@ def build_stage2_note(
             plan = finalize_temporal(plan, patient_facts, psa_section(stage1_note),
                                      _plan_temporal_call, "Plan", ref_note=stage1_note)
             plan = _break_dash_bullets(plan)
+            plan = _scrub_unproductive_plan(plan)
         except Exception:  # noqa: BLE001
             pass
 
