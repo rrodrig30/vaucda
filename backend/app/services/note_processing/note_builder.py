@@ -884,7 +884,48 @@ def build_urology_note(
     _doc_psh_cc = document_psh
     _clinical_doc_cc = clinical_document
 
+    # ---- LLM-FIRST HOLISTIC CC + HPI (VAUCDA_CC_HPI_HOLISTIC) ----
+    # One expert pass over the WHOLE chart writes BOTH the CC and the HPI, with
+    # the deterministic facts passed as ADVISORY (overridable by the chart) rather
+    # than as absolute rules. Fixes the fragmented-agent incoherence AND the
+    # false-fact-injection class (e.g. a discussed-but-never-done salvage RT). The
+    # result feeds BOTH _build_cc and _build_hpi below; either section falls back
+    # to its existing path when the holistic pass returns None. Skipped for
+    # consults (they have their own CC/HPI extraction).
+    _holistic_cc_hpi = None
+    import os as _os_h
+    if (_os_h.environ.get("VAUCDA_CC_HPI_HOLISTIC", "0") == "1"
+            and not _is_consult_val):
+        try:
+            from .agents.holistic_cc_hpi import compose_cc_hpi
+            from .llm_helper import synthesize_with_llm as _synth_h
+
+            def _h_call(p: str) -> str:
+                return _synth_h(prompt=p, temperature=0.0,
+                                task_config=task_config, max_tokens=2400)
+
+            _prior_hpi_h, _prior_plan_h = _extract_prior_hpi_and_plan(
+                clinical_document or "")
+            _holistic_cc_hpi = compose_cc_hpi(
+                facts=_hpi_pf,
+                raw_chart=_raw_clinical_text,
+                normalized_chart=clinical_document,
+                psa_data=_doc_psa,
+                pathology_data=_doc_path,
+                psh_data=document_psh,
+                prior_hpi=_prior_hpi_h,
+                patient_name=_patient_name_val,
+                patient_age=_patient_age_val,
+                patient_sex=_patient_sex_val,
+                llm_call=_h_call,
+            )
+        except Exception as _he:  # noqa: BLE001
+            logger.warning(f"Holistic CC/HPI error (falling back): {_he}")
+            _holistic_cc_hpi = None
+
     def _build_cc():
+        if _holistic_cc_hpi and _holistic_cc_hpi.get("cc"):
+            return _holistic_cc_hpi["cc"]
         if _consult_cc_val:
             return _consult_cc_val
         # Pass urologic clinical context so synthesize_cc can:
@@ -942,6 +983,8 @@ def build_urology_note(
         return strip_liver_directed_therapy(_cc_out)
 
     def _build_hpi():
+        if _holistic_cc_hpi and _holistic_cc_hpi.get("hpi"):
+            return _holistic_cc_hpi["hpi"]
         if _is_consult_val and _consult_hpi_val:
             reason_for_request = (
                 _consult_data_val.get('reason_for_request', '')

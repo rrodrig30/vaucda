@@ -280,9 +280,28 @@ def _ensure_named_opening(hpi: str, name: Optional[str], age: Optional[Any],
     """Guarantee the HPI opens with '<NAME> is a <AGE>-year-old <sex>'."""
     if not hpi or not name:
         return hpi
+    # Normalize Unicode hyphens the LLM emits in "59‑year‑old" (U+2010/U+2011
+    # non-breaking hyphen, U+2012/U+2013/U+2212) to ASCII "-". Without this, the
+    # opener regexes ([-\s]year) miss the LLM's own opener, wrongly prepend a
+    # second one, and the collapse net can't match to fix it (doubled opener).
+    hpi = re.sub(r"[‐‑‒–−]", "-", hpi)
     if _OPENER_HAS_NAME.search(hpi):
         return hpi  # already named + aged
     age_str = str(age).strip() if age not in (None, "") else ""
+    # Named opener that is MISSING the age ("<Name> is a male who ...") at the
+    # start — insert the age in place rather than prepend a second opener.
+    m0 = re.match(r"\s*([A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]*){0,3})\s+is\s+an?\s+"
+                  r"(?:male|female|man|woman|gentleman|gentlewoman|lady|boy|girl)\b",
+                  hpi)
+    if m0 and age_str:
+        return f"{m0.group(1)} is a {age_str}-year-old {_sex_word(sex)}" + hpi[m0.end():]
+    # Anti-double guard: if ANY named opener (with OR without an age) already
+    # exists anywhere in the HPI, do NOT prepend another one (avoids a duplicate
+    # opener sentence when a post-processor shifted the LLM's opener).
+    if re.search(r"\b[A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]*){0,3}\s+is\s+an?\s+"
+                 r"(?:\d{1,3}[-\s]year[-\s]old|male|female|man|woman|gentleman|"
+                 r"gentlewoman|lady|boy|girl)\b", hpi):
+        return hpi
     subj = (f"{name} is a {age_str}-year-old {_sex_word(sex)}"
             if age_str else f"{name} is a {_sex_word(sex)}")
     m = _WEAK_SUBJECT.search(hpi)
