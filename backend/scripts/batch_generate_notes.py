@@ -13,6 +13,7 @@ Usage:
 If specific filenames are given, only those are (re)generated; otherwise
 every *.txt in <input_dir> (excluding the output/ subdir) is processed.
 """
+import os
 import sys
 import time
 import traceback
@@ -36,8 +37,9 @@ from app.services.note_processing.stage2_builder import build_stage2_note
 from app.services.llm_config_manager import LLMConfigManager, LLMTaskType
 
 # Production config pulled from data/vaucda.db user f09a0349 preferences.
-STAGE1_MODEL = "gpt-oss:120b-cloud"
-STAGE2_MODEL = "gpt-oss:120b-cloud"
+# Overridable via VAUCDA_BATCH_MODEL (e.g. glm-5.2:cloud) for model A/B validation.
+STAGE1_MODEL = os.environ.get("VAUCDA_BATCH_MODEL", "gpt-oss:120b-cloud")
+STAGE2_MODEL = os.environ.get("VAUCDA_BATCH_MODEL", "gpt-oss:120b-cloud")
 # Production user has source_format='vista' — input is a VistA CLINIC PREP
 # EXTRACT, NOT CPRS. The VistA->CPRS normalizer must run first or every
 # document-level extractor (PMH/PSH/MEDS/PATH) sees the wrong layout and
