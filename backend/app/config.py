@@ -242,7 +242,8 @@ class Settings(BaseSettings):
     BATCH_ALLOWED_DIRS: str = '[]'  # JSON array of allowed base directories for batch processing
     BATCH_MAX_RETRIES: int = 3
     BATCH_FILE_SEPARATOR: str = "+++++++++"
-    BATCH_FILE_TIMEOUT: int = 5400  # seconds per file (90 minutes)
+    BATCH_FILE_TIMEOUT: int = 600  # seconds per file (10 minutes) — a stuck cloud
+    # call auto-fails that one note so the batch moves on instead of freezing
     BATCH_MAX_FILES: int = 200  # maximum files in a single batch
 
     @property

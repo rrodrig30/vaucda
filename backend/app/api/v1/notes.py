@@ -1945,6 +1945,9 @@ async def batch_upload_and_process(
                     except asyncio.TimeoutError:
                         error_msg = f"Timed out after {file_timeout}s"
                         purge_all_patient_data()
+                        # Fail-fast: don't retry a timeout (would burn another full
+                        # window). Mark failed and move to the next note.
+                        break
                     except Exception as e:
                         error_msg = f"Processing error: {type(e).__name__}"
                         purge_all_patient_data()
@@ -2501,6 +2504,8 @@ async def batch_process_folder_stream(
                     except asyncio.TimeoutError:
                         result['error_message'] = f"Timed out after {file_timeout}s"
                         purge_func()
+                        # Fail-fast: don't retry a timeout; move to the next note.
+                        break
                     except Exception as e:
                         result['error_message'] = f"Processing error: {type(e).__name__}"
                         purge_func()

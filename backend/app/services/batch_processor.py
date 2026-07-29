@@ -328,6 +328,10 @@ async def run_batch_processing(
                 )
                 result.error_message = error_msg
                 purge_func()
+                # Fail-fast on timeout: retrying a stuck/oversized note just burns
+                # another full timeout window (30 min across 3 attempts). Mark it
+                # failed and move on so the batch is never frozen by one bad note.
+                break
 
             except Exception as e:
                 error_msg = f"Processing error: {type(e).__name__}"
