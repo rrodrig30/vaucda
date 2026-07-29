@@ -245,11 +245,13 @@ class Settings(BaseSettings):
     BATCH_FILE_TIMEOUT: int = 600  # seconds per file (10 minutes) — a stuck cloud
     # call auto-fails that one note so the batch moves on instead of freezing
     BATCH_MAX_FILES: int = 200  # maximum files in a single batch
-    # Reject an oversized chart BEFORE it enters the pipeline. A ~157K-char chart
-    # (4x normal) pegs CPU + saturates the agent thread pool and makes the whole
-    # server unresponsive for the full timeout window. Failing it in milliseconds
-    # keeps the batch (and the app) responsive. 0 disables the guard.
-    BATCH_MAX_FILE_CHARS: int = 120000
+    # Reject only ABSURDLY oversized charts before the pipeline. These VistA
+    # exports are routinely 150-240K chars (copy-forward bloat) and process fine,
+    # so the guard must clear them — it only blocks the rare monster (400K+) that
+    # would peg the server. The 10-min per-note timeout is the backstop for merely
+    # slow files. (Was 120000, which wrongly rejected normal large charts.)
+    # 0 disables the guard.
+    BATCH_MAX_FILE_CHARS: int = 350000
 
     @property
     def batch_allowed_dirs_list(self) -> List[str]:

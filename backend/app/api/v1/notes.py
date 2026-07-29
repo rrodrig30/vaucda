@@ -1950,6 +1950,12 @@ async def batch_upload_and_process(
                         break
                     except Exception as e:
                         error_msg = f"Processing error: {type(e).__name__}"
+                        # Log the full traceback (message + stack) so batch
+                        # failures are diagnosable; the UI only sees the type.
+                        logger.exception(
+                            f"[{idx + 1}/{len(saved_files)}] {filename} attempt "
+                            f"{attempt} FAILED: {type(e).__name__}: {e}"
+                        )
                         purge_all_patient_data()
 
                     if attempt < max_retries:
@@ -2508,6 +2514,10 @@ async def batch_process_folder_stream(
                         break
                     except Exception as e:
                         result['error_message'] = f"Processing error: {type(e).__name__}"
+                        logger.exception(
+                            f"Batch note FAILED (attempt {attempt}): "
+                            f"{type(e).__name__}: {e}"
+                        )
                         purge_func()
 
                     if attempt < max_retries:
