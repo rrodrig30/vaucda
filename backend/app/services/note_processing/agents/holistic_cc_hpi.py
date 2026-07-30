@@ -231,7 +231,7 @@ def compose_cc_hpi(
 ) -> Optional[Dict[str, str]]:
     """Return {"cc": str, "hpi": str} from one holistic LLM pass, or None to fall
     back to the existing CC/HPI paths."""
-    if os.environ.get("VAUCDA_CC_HPI_HOLISTIC", "0") != "1":
+    if os.environ.get("VAUCDA_CC_HPI_HOLISTIC", "1") != "1":
         return None
     if facts is None:
         return None

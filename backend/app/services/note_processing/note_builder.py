@@ -894,7 +894,7 @@ def build_urology_note(
     # consults (they have their own CC/HPI extraction).
     _holistic_cc_hpi = None
     import os as _os_h
-    if (_os_h.environ.get("VAUCDA_CC_HPI_HOLISTIC", "0") == "1"
+    if (_os_h.environ.get("VAUCDA_CC_HPI_HOLISTIC", "1") == "1"
             and not _is_consult_val):
         try:
             from .agents.holistic_cc_hpi import compose_cc_hpi
