@@ -1343,6 +1343,25 @@ def build_urology_note(
         if _hpi_dropped:
             print(f"      ✂ HPI fact-guard dropped {len(_hpi_dropped)} "
                   f"contradicting sentence(s): {[s[:80] for s in _hpi_dropped]}")
+    # Temporal-validity repair on the HPI (symmetry with the Stage-2
+    # Assessment/Plan pass): latest-wins / staleness / vague-recency. Catches a
+    # current recurrence/rising-PSA claim contradicted by an undetectable PSA
+    # (MORENO: "second biochemical recurrence in 2026" while PSA <0.01), so the
+    # HPI can't disagree with the Assessment. Safe-degrade when disabled/on error.
+    if hpi and _hpi_pf is not None:
+        try:
+            from .temporal_checks import finalize_temporal as _finalize_temporal_hpi
+            from .llm_helper import synthesize_with_llm as _synth_hpi_temporal
+
+            def _hpi_temporal_call(_p: str) -> str:
+                return _synth_hpi_temporal(prompt=_p, temperature=0.0,
+                                           task_config=task_config, max_tokens=1600)
+
+            hpi = _finalize_temporal_hpi(
+                hpi, _hpi_pf, _doc_psa or "", _hpi_temporal_call,
+                "HPI", ref_note=clinical_document or "")
+        except Exception as _hte:  # noqa: BLE001
+            logger.warning(f"HPI temporal finalize skipped: {_hte}")
     # Readability: collapse a choppy one-sentence-per-line HPI into flowing
     # prose (whitespace-only — does not change any clinical content).
     if hpi:
