@@ -59,6 +59,21 @@ _DISEASE_FREE = re.compile(
     r"\bNED\b|no\s+(?:evidence\s+of\s+)?recurren|disease[-\s]free|complete\s+response|"
     r"no\s+metasta", re.IGNORECASE)
 
+# A CURRENT recurrence / rising-PSA claim, contradicted when the latest PSA is
+# undetectable (MORENO: "developed biochemical recurrence in 2026" while PSA is
+# <0.01 post-salvage-RT — a copy-forward "biochemically relapsed" dx over-read as
+# active). A treated historical relapse must be framed as history, not current.
+_RECURRENCE_WORD = re.compile(
+    r"\b(?:biochemical(?:ly)?\s+(?:recurrence|relaps\w*|failure)|biochemical\s+recurrence|"
+    r"rising\s+psa|psa\s+(?:is\s+|has\s+been\s+)?rising|"
+    r"recurrent\s+(?:prostate\s+)?(?:cancer|disease)|develop\w*\s+recurrence)\b",
+    re.IGNORECASE)
+# Clause-local markers that make a recurrence mention HISTORICAL/resolved (no flag).
+_RECUR_HISTORICAL = re.compile(
+    r"\b(?:history\s+of|hx\s+of|prior|previously|status\s+post|s/p|treated\s+with|"
+    r"following\s+salvage|after\s+salvage|resolved|remission|now\s+undetectable)\b",
+    re.IGNORECASE)
+
 
 def temporal_violations(text: str) -> List[str]:
     viol: List[str] = []
@@ -122,6 +137,21 @@ def latest_wins_violations(text: str, facts: Any, psa_data: str) -> List[str]:
             viol.append(f"the LATEST documented disease state ({latest_ev.date_display}: "
                         f"{latest_ev.modality}) indicates progression/recurrence, but the "
                         f"text asserts disease-free/no-recurrence — reconcile to the latest state")
+    # Reverse: a CURRENT recurrence / rising-PSA claim contradicted by an
+    # undetectable latest PSA (< 0.1). Clause-local, so a correctly-framed
+    # "history of biochemical recurrence s/p salvage RT, now undetectable" is
+    # spared while "developed biochemical recurrence in 2026" (PSA <0.01) is caught.
+    if pairs:
+        latest_val = max(pairs, key=lambda p: p[0])[1]
+        if latest_val < 0.1:
+            for clause in re.split(r"[.;,]", text):
+                if _RECURRENCE_WORD.search(clause) and not _RECUR_HISTORICAL.search(clause):
+                    viol.append(
+                        f"the text asserts a CURRENT biochemical recurrence / rising PSA, but "
+                        f"the most recent PSA is UNDETECTABLE ({latest_val:g}) — a recurrence, "
+                        f"if any, was treated: state it as history and report the current "
+                        f"undetectable PSA, do not assert active recurrence")
+                    break
     return viol
 
 
