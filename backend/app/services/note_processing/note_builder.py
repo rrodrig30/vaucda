@@ -1354,12 +1354,29 @@ def build_urology_note(
             from .llm_helper import synthesize_with_llm as _synth_hpi_temporal
 
             def _hpi_temporal_call(_p: str) -> str:
+                # High token ceiling: deepseek/kimi are THINKING models, so
+                # num_predict caps thinking + answer COMBINED — a low cap (1600)
+                # lets the reasoning eat the budget and truncates the rewritten
+                # HPI mid-sentence. Match the note's configured output budget.
                 return _synth_hpi_temporal(prompt=_p, temperature=0.0,
-                                           task_config=task_config, max_tokens=1600)
+                                           task_config=task_config, max_tokens=16000)
 
-            hpi = _finalize_temporal_hpi(
-                hpi, _hpi_pf, _doc_psa or "", _hpi_temporal_call,
+            _hpi_before = hpi
+            _hpi_fixed = _finalize_temporal_hpi(
+                _hpi_before, _hpi_pf, _doc_psa or "", _hpi_temporal_call,
                 "HPI", ref_note=clinical_document or "")
+            # Length-preservation guard: accept the temporal rewrite ONLY when it
+            # keeps essentially the whole HPI. A materially shorter result means the
+            # thinking-model rewrite truncated or over-condensed the narrative —
+            # keep the complete original rather than ship a truncated HPI. (The
+            # deterministic vague-recency scrub trims only a few words, so a real
+            # fix stays well above the 0.9 floor; MORENO's fix was longer.)
+            if _hpi_fixed and len(_hpi_fixed) >= 0.9 * len(_hpi_before):
+                hpi = _hpi_fixed
+            elif _hpi_fixed and _hpi_fixed != _hpi_before:
+                logger.warning(
+                    f"HPI temporal rewrite rejected (len {len(_hpi_fixed)} < "
+                    f"0.9×{len(_hpi_before)}) — keeping complete original HPI")
         except Exception as _hte:  # noqa: BLE001
             logger.warning(f"HPI temporal finalize skipped: {_hte}")
     # Readability: collapse a choppy one-sentence-per-line HPI into flowing
