@@ -137,21 +137,44 @@ def latest_wins_violations(text: str, facts: Any, psa_data: str) -> List[str]:
             viol.append(f"the LATEST documented disease state ({latest_ev.date_display}: "
                         f"{latest_ev.modality}) indicates progression/recurrence, but the "
                         f"text asserts disease-free/no-recurrence — reconcile to the latest state")
-    # Reverse: a CURRENT recurrence / rising-PSA claim contradicted by an
-    # undetectable latest PSA (< 0.1). Clause-local, so a correctly-framed
-    # "history of biochemical recurrence s/p salvage RT, now undetectable" is
-    # spared while "developed biochemical recurrence in 2026" (PSA <0.01) is caught.
+    # A recurrence / rising-PSA claim the PSA record contradicts. Split on
+    # SENTENCES (not commas) so cross-clause context ("...which was treated") is
+    # seen, and YEAR-ANCHOR against the per-year PSA: a recurrence tied to a year
+    # whose documented PSA never rose to >=0.1 is UNGROUNDED (the fabricated
+    # "biochemical recurrence in 2026" while every 2026 PSA is <0.01), while a
+    # year with a real rise (the TRUE 2022 BCR s/p salvage RT) is spared — so the
+    # repair prompt names the specific bogus year instead of threatening the whole
+    # (legitimate) recurrence history, which is what made the old repair mangle it.
     if pairs:
         latest_val = max(pairs, key=lambda p: p[0])[1]
-        if latest_val < 0.1:
-            for clause in re.split(r"[.;,]", text):
-                if _RECURRENCE_WORD.search(clause) and not _RECUR_HISTORICAL.search(clause):
-                    viol.append(
-                        f"the text asserts a CURRENT biochemical recurrence / rising PSA, but "
-                        f"the most recent PSA is UNDETECTABLE ({latest_val:g}) — a recurrence, "
-                        f"if any, was treated: state it as history and report the current "
-                        f"undetectable PSA, do not assert active recurrence")
-                    break
+        year_max = {}
+        for dk, val in pairs:
+            try:
+                y = int(dk[:4])
+            except (ValueError, TypeError):
+                continue
+            year_max[y] = max(year_max.get(y, 0.0), val)
+        for sent in re.split(r"[.;\n]", text):
+            if not _RECURRENCE_WORD.search(sent) or _RECUR_HISTORICAL.search(sent):
+                continue
+            years = [int(y) for y in re.findall(r"\b(?:19|20)\d{2}\b", sent)]
+            if any(year_max.get(y, 0.0) >= 0.1 for y in years):
+                continue  # a documented PSA rise that year -> real recurrence
+            bad_years = [y for y in years if y in year_max and year_max[y] < 0.1]
+            if bad_years:
+                viol.append(
+                    f"the text asserts a biochemical recurrence / rising PSA in {bad_years[0]}, "
+                    f"but the documented PSA in {bad_years[0]} was UNDETECTABLE (never rose to "
+                    f">=0.1) — that recurrence and any treatment for it are UNGROUNDED; remove "
+                    f"the fabricated event and report the actual undetectable PSA")
+                break
+            if not years and latest_val < 0.1:
+                viol.append(
+                    f"the text asserts a CURRENT biochemical recurrence / rising PSA, but the "
+                    f"most recent PSA is UNDETECTABLE ({latest_val:g}) — state any prior "
+                    f"recurrence as treated history and report the current undetectable PSA, "
+                    f"do not assert active recurrence")
+                break
     return viol
 
 

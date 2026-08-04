@@ -116,6 +116,10 @@ RULES:
   that is absent:
   * every active/relevant urologic cancer, each with its current status
     (on surveillance / treatment-naive / on treatment / post-treatment);
+  * the DEFINITIVE PATHOLOGY for each cancer as documented: histology, the
+    highest Gleason score / Grade Group, stage, and adverse features when present
+    (positive/close surgical margin, perineural / lymphovascular invasion,
+    extraprostatic extension) — with the pathology/surgery date;
   * the PSA trajectory: the most-recent value WITH its date, plus the prior
     value(s) with dates that establish the direction (rising / stable / declining);
   * each documented treatment or procedure with its agent/type and date, and the
