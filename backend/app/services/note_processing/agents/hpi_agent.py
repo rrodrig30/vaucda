@@ -374,6 +374,61 @@ def _merge_he_history_run(text: str) -> str:
     return " ".join(out)
 
 
+# Dated measured weight in CPRS/VistA vitals, e.g.
+#   "WT: 154.5 lb [70.08 kg] (05/27/2026 11:00)"
+#   "Weight: 152.8 lb [69.31 kg] (04/25/2024 13:39)"
+#   "150 lb [68.04 kg] (01/08/2025 09:15)"
+_MEASURED_WT_RE = re.compile(
+    r"(\d{2,3}(?:\.\d+)?)\s*lb\s*\[[^\]]*\]\s*\((\d{1,2})/(\d{1,2})/(\d{4})",
+    re.IGNORECASE)
+# The HPI carries a (patient-reported) weight-loss statement.
+_WT_LOSS_MENTION_RE = re.compile(
+    r"\b(?:unintentional\s+)?weight\s+loss\b|\blost\s+(?:approximately\s+|about\s+)?"
+    r"\d+\s*(?:lb|lbs|pound)", re.IGNORECASE)
+# An objective, dated weight value is ALREADY present in the HPI prose.
+_WT_MEASURED_IN_HPI_RE = re.compile(
+    r"\bmeasured\s+weight\b|\bweigh(?:s|ed|t\s+was)\b[^.]*\d{2,3}(?:\.\d+)?\s*lb",
+    re.IGNORECASE)
+
+
+def anchor_measured_weight(hpi: str, clinical_document: Optional[str]) -> str:
+    """When the HPI reports weight loss but states no objective value, append the
+    most-recent MEASURED weight+date from the chart vitals so the reader can
+    reconcile a patient-reported loss against the measured trend.
+
+    Deterministic and conservative: fires only when (a) the HPI mentions weight
+    loss, (b) it does not already state a measured lb value, and (c) the chart has
+    at least one dated weight. Adds one factual sentence; never removes content.
+    """
+    import os
+    if os.environ.get("VAUCDA_HPI_WEIGHT_ANCHOR", "1") != "1":
+        return hpi
+    if not hpi or not clinical_document:
+        return hpi
+    if not _WT_LOSS_MENTION_RE.search(hpi) or _WT_MEASURED_IN_HPI_RE.search(hpi):
+        return hpi
+    best = None  # (sort_key, value_str, mm, dd, yyyy)
+    for m in _MEASURED_WT_RE.finditer(clinical_document):
+        val, mm, dd, yyyy = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        if not (1 <= mm <= 12 and 1 <= dd <= 31 and 1900 <= yyyy <= 2100):
+            continue
+        key = (yyyy, mm, dd)
+        if best is None or key > best[0]:
+            best = (key, val, mm, dd, yyyy)
+    if best is None:
+        return hpi
+    _, val, mm, dd, yyyy = best
+    sentence = (f"His most recently measured weight was {val} lb "
+                f"({mm:02d}/{dd:02d}/{yyyy}).")
+    body = hpi.rstrip()
+    # Insert before the closing "Today's visit ..." beat if present, else append.
+    m = re.search(r"(Today'?s visit\b)", body, re.IGNORECASE)
+    if m:
+        return body[:m.start()].rstrip() + " " + sentence + " " + body[m.start():]
+    sep = "" if body.endswith((".", "!", "?")) else "."
+    return body + sep + " " + sentence
+
+
 def reflow_hpi(hpi: str) -> str:
     """Collapse a choppy one-sentence-per-line HPI into flowing prose.
 

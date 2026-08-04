@@ -1379,6 +1379,12 @@ def build_urology_note(
                     f"0.9×{len(_hpi_before)}) — keeping complete original HPI")
         except Exception as _hte:  # noqa: BLE001
             logger.warning(f"HPI temporal finalize skipped: {_hte}")
+    # Objective-weight anchor: if the HPI reports a (patient-reported) weight
+    # loss but states no measured value, append the most-recent measured weight
+    # + date from the chart vitals so the reader can reconcile report vs. trend.
+    if hpi:
+        from .agents.hpi_agent import anchor_measured_weight
+        hpi = anchor_measured_weight(hpi, clinical_document or "")
     # Readability: collapse a choppy one-sentence-per-line HPI into flowing
     # prose (whitespace-only — does not change any clinical content).
     if hpi:
