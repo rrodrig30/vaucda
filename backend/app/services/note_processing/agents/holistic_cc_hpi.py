@@ -116,10 +116,17 @@ RULES:
   that is absent:
   * every active/relevant urologic cancer, each with its current status
     (on surveillance / treatment-naive / on treatment / post-treatment);
-  * the DEFINITIVE PATHOLOGY for each cancer as documented: histology, the
-    highest Gleason score / Grade Group, stage, and adverse features when present
-    (positive/close surgical margin, perineural / lymphovascular invasion,
-    extraprostatic extension) — with the pathology/surgery date;
+  * the DEFINITIVE PATHOLOGY for each CONFIRMED cancer, as documented, using the
+    grading system APPROPRIATE TO THAT ORGAN — prostate: Gleason score / Grade
+    Group; kidney: histologic subtype + nucleolar (Fuhrman/ISUP) grade; bladder /
+    upper-tract: WHO low-/high-grade + invasion depth (Ta/T1/T2, CIS); testis:
+    germ-cell histology + serum markers; adrenal: Weiss score — plus stage and any
+    adverse features (margin, PNI/LVI, extra-organ extension) and the pathology
+    date. NEVER assign a Gleason score to a non-prostate cancer.
+  * a BENIGN or NEGATIVE-for-malignancy biopsy is stated AS SUCH with its date
+    (e.g. "prostate biopsy 03/2026 benign, negative for malignancy"); do NOT
+    assign it a grade and do NOT call it cancer. Most prostate biopsies are
+    benign — report the benign result, never an invented grade;
   * the PSA trajectory: the most-recent value WITH its date, plus the prior
     value(s) with dates that establish the direction (rising / stable / declining);
   * each documented treatment or procedure with its agent/type and date, and the
@@ -236,6 +243,136 @@ def _cc_defects(cc: str, chart: str, facts: Any) -> list:
     return out
 
 
+# ---- cancer-type-aware pathology completeness -----------------------------
+# Grading/staging is ORGAN-SPECIFIC and NOT interchangeable: prostate uses
+# Gleason / Grade Group; renal uses histologic subtype + nucleolar (Fuhrman/
+# ISUP/WHO) grade; urothelial (bladder / upper-tract) uses WHO low/high grade +
+# invasion depth (Ta/T1/T2, CIS) — never Gleason; testicular uses germ-cell
+# histology + serum markers; penile / adrenal / other each differ again. For
+# each organ we list pathology ASPECTS as (label, regex). An aspect is REQUIRED
+# in the HPI only when it is DOCUMENTED in the chart/pathology yet ABSENT from
+# the HPI — so we never demand a value the record lacks, and never demand a
+# prostate-shaped value for a kidney or bladder tumor.
+_PATH_ASPECTS = {
+    "prostate": [
+        ("Gleason score / Grade Group",
+         re.compile(r"\bGleason\s+\d\s*\+\s*\d\b|\bGrade\s+Group\s+[1-5]\b", re.I)),
+        # No trailing \b: must still match the pT in a concatenated "pT2N0".
+        ("pathologic stage",
+         re.compile(r"\bpT[0-4][a-d]?", re.I)),
+        # Two-way, proximity-based so "positive right posterior margin" and
+        # "margins negative" both count on either the chart or the HPI side.
+        ("surgical margin status",
+         re.compile(r"(?:positive|negative|close|involved|uninvolved)\b[^.\n]{0,35}?margins?\b|"
+                    r"margins?\b[^.\n]{0,25}?(?:positive|negative|involved|free|uninvolved|close)",
+                    re.I)),
+        ("perineural / lymphovascular invasion",
+         re.compile(r"perineural\s+invasion|lymphovascular\s+invasion|\bPNI\b|\bLVI\b", re.I)),
+    ],
+    "renal": [
+        ("histologic subtype",
+         re.compile(r"clear[\s-]cell|papillary|chromophobe|collecting\s+duct|"
+                    r"translocation|oncocytic", re.I)),
+        ("nucleolar (Fuhrman/ISUP/WHO) grade",
+         re.compile(r"(?:Fuhrman|ISUP|WHO)\s*(?:nucleolar\s*)?grade\s*(?:[1-4]|I{1,3}V?)|"
+                    r"nuclear\s+grade\s*[1-4]", re.I)),
+        ("pathologic stage",
+         re.compile(r"\bpT[1-4][a-c]?", re.I)),
+        ("sarcomatoid/rhabdoid features or tumor necrosis",
+         re.compile(r"sarcomatoid|rhabdoid|tumou?r\s+necrosis|coagulative\s+necrosis", re.I)),
+    ],
+    "bladder": [
+        ("WHO grade (low- vs high-grade)",
+         re.compile(r"\b(?:low|high)[\s-]grade\b", re.I)),
+        ("invasion depth / stage (Ta/T1/T2, muscle-invasive, CIS)",
+         re.compile(r"\b(?:Ta|Tis|T1|T2|T3|T4)\b|muscle[\s-]invasi|non[\s-]muscle[\s-]invasi|"
+                    r"lamina\s+propria|muscularis\s+propria|carcinoma\s+in\s+situ|\bCIS\b", re.I)),
+        ("lymphovascular invasion / variant histology",
+         re.compile(r"lymphovascular\s+invasion|\bLVI\b|micropapillary|plasmacytoid|"
+                    r"sarcomatoid\s+variant|squamous\s+differentiation", re.I)),
+    ],
+    "upper_tract": [   # urothelial — same system as bladder
+        ("WHO grade (low- vs high-grade)",
+         re.compile(r"\b(?:low|high)[\s-]grade\b", re.I)),
+        ("stage / invasion",
+         re.compile(r"\b(?:Ta|Tis|T[1-4])\b|invasi|carcinoma\s+in\s+situ|\bCIS\b", re.I)),
+        ("lymphovascular invasion",
+         re.compile(r"lymphovascular\s+invasion|\bLVI\b", re.I)),
+    ],
+    "testicular": [
+        ("germ-cell histology (seminoma vs NSGCT components)",
+         re.compile(r"seminoma|embryonal|yolk\s+sac|choriocarcinoma|teratoma|"
+                    r"mixed\s+germ\s+cell|non[\s-]?seminomatous", re.I)),
+        ("serum tumor markers (AFP, β-hCG, LDH)",
+         re.compile(r"\bAFP\b|alpha[\s-]?fetoprotein|beta[\s-]?hCG|\bhCG\b|\bLDH\b", re.I)),
+        ("stage / invasion (pT, LVI, rete testis)",
+         re.compile(r"\bpT[1-4]|lymphovascular\s+invasion|\bLVI\b|rete\s+testis", re.I)),
+    ],
+    "penile": [
+        ("grade / differentiation",
+         re.compile(r"grade\s*[1-3]\b|well|moderately|poorly\s+differentiated", re.I)),
+        ("stage",
+         re.compile(r"\bpT[1-4][a-b]?", re.I)),
+        ("LVI / PNI / HPV (p16) status",
+         re.compile(r"lymphovascular\s+invasion|perineural\s+invasion|\bLVI\b|\bPNI\b|"
+                    r"\bp16\b|\bHPV\b", re.I)),
+    ],
+    "adrenal": [
+        ("Weiss score",
+         re.compile(r"Weiss\s+score|Weiss[:\s]+\d", re.I)),
+        ("Ki-67 proliferation index",
+         re.compile(r"Ki[\s-]?67", re.I)),
+        ("stage (ENSAT / pT)",
+         re.compile(r"\bpT[1-4]|ENSAT", re.I)),
+    ],
+    "other": [   # paratesticular / retroperitoneal / unclassified — generic
+        ("histologic diagnosis",
+         re.compile(r"sarcoma|lymphoma|germ\s+cell|carcinoma|liposarcoma|"
+                    r"leiomyosarcoma", re.I)),
+        ("grade",
+         re.compile(r"grade\s*[1-3]\b|high[\s-]grade|low[\s-]grade|FNCLCC", re.I)),
+        ("stage",
+         re.compile(r"\bpT[1-4]|stage\s+(?:I|II|III|IV)\b", re.I)),
+    ],
+}
+
+
+def _cancer_organs(facts: Any) -> list:
+    """Ordered, de-duplicated list of organ keys for the patient's CONFIRMED
+    cancers (prostate from the main facts model; the rest from the multi-cancer
+    other_gu_diagnoses ledger). Only category=='cancer' — an indeterminate renal
+    mass or a bladder lesion 'of uncertain significance' is NOT a resected cancer
+    with a grade, so it is skipped."""
+    organs = []
+    if (getattr(facts, "cancer_status", "") or "").upper() in ("PRESENT", "TREATED"):
+        organs.append("prostate")
+    for d in (getattr(facts, "other_gu_diagnoses", None) or []):
+        if getattr(d, "category", "") == "cancer":
+            org = (getattr(d, "organ", "") or "other")
+            organs.append(org if org in _PATH_ASPECTS else "other")
+    return list(dict.fromkeys(organs))
+
+
+def _pathology_completeness_defects(hpi: str, chart: str, pathology_data: str,
+                                    facts: Any) -> list:
+    """Cancer-type-aware pathology completeness: for each CONFIRMED cancer, flag
+    the ORGAN-APPROPRIATE pathology aspects that are documented in the record but
+    missing from the HPI. Best-effort (drives a repair round, never a fallback)."""
+    if os.environ.get("VAUCDA_HPI_PATH_COMPLETENESS", "1") != "1":
+        return []
+    src = f"{pathology_data or ''}\n{chart or ''}"
+    hpi_l = hpi or ""
+    out = []
+    for org in _cancer_organs(facts):
+        for label, pat in _PATH_ASPECTS.get(org, []):
+            if pat.search(src) and not pat.search(hpi_l):
+                out.append(f"the record documents the {org} cancer's {label}, but the "
+                           f"HPI omits it — state the documented {label}")
+            if len(out) >= 4:
+                return out
+    return out
+
+
 def compose_cc_hpi(
     facts: Any,
     raw_chart: str,
@@ -281,7 +418,8 @@ def compose_cc_hpi(
         repairs = 0
         while repairs < max_repair:
             issues = (_hpi_hard(hpi, chart) + _hpi_soft(hpi, facts, chart, psa_data or "")
-                      + _cc_defects(cc, chart, facts))
+                      + _cc_defects(cc, chart, facts)
+                      + _pathology_completeness_defects(hpi, chart, pathology_data or "", facts))
             if not issues:
                 break
             fixed = _parse_json(
