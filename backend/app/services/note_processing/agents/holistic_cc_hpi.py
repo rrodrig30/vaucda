@@ -429,6 +429,27 @@ def compose_cc_hpi(
             cc = (fixed.get("chief_complaint") or fixed.get("cc") or cc).strip()
             hpi = (fixed.get("hpi") or hpi).strip()
             repairs += 1
+
+        # Targeted SECOND round for RESIDUAL pathology-completeness gaps only.
+        # A thin run can pass the general repair yet still omit documented adverse
+        # pathology (stage / margin / PNI). Re-prompt ONCE, focused solely on the
+        # missing organ-appropriate aspects. Fires only when a gap remains, so a
+        # clean first pass pays no extra latency; accepted only if the rewrite
+        # actually CLOSES >=1 gap AND does not shrink the HPI (never ship a
+        # shorter/truncated result — same lesson as the temporal pass).
+        path_gaps = _pathology_completeness_defects(hpi, chart, pathology_data or "", facts)
+        if path_gaps:
+            refixed = _parse_json(
+                (llm_call(_repair_prompt(chart, facts_block, cc, hpi, path_gaps)) or "").strip())
+            if refixed:
+                new_hpi = (refixed.get("hpi") or "").strip()
+                new_cc = (refixed.get("chief_complaint") or refixed.get("cc") or cc).strip()
+                if (new_hpi and len(new_hpi) >= 0.9 * len(hpi)
+                        and len(_pathology_completeness_defects(
+                            new_hpi, chart, pathology_data or "", facts)) < len(path_gaps)):
+                    hpi, cc = new_hpi, (new_cc or cc)
+                    logger.info(f"[HOLISTIC] targeted pathology round closed "
+                                f"{len(path_gaps)} gap(s)")
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Holistic CC/HPI failed, falling back: {e}")
         return None
