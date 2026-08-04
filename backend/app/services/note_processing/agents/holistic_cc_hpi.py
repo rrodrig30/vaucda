@@ -107,9 +107,24 @@ RULES:
   documented reason for today's visit. Lead with the cancer or primary diagnosis;
   a radiology-benign incidental (simple cyst, adrenal myelolipoma/adenoma) never
   leads. Name a confirmed cancer as such — never "of uncertain significance".
-- HPI: 1-2 flowing paragraphs. Open the FIRST sentence with
-  "{opener} who ..." and state the primary diagnosis in that first sentence — not
-  an incidental problem (CKD, vitamin D, HTN, BPH).
+- HPI: 1-3 flowing paragraphs — favor COMPLETE over brief; a careful clinician
+  would not drop documented, clinically-relevant history to save space. Open the
+  FIRST sentence with "{opener} who ..." and state the primary diagnosis in that
+  first sentence — not an incidental problem (CKD, vitamin D, HTN, BPH).
+- MUST INCLUDE (completeness contract) — cover EACH of the following THAT IS
+  DOCUMENTED in the chart; do not omit a documented item, and do not invent one
+  that is absent:
+  * every active/relevant urologic cancer, each with its current status
+    (on surveillance / treatment-naive / on treatment / post-treatment);
+  * the PSA trajectory: the most-recent value WITH its date, plus the prior
+    value(s) with dates that establish the direction (rising / stable / declining);
+  * each documented treatment or procedure with its agent/type and date, and the
+    current treatment status;
+  * documented constitutional symptoms — e.g. UNINTENTIONAL WEIGHT LOSS, fatigue,
+    night sweats, decreased appetite — when the record notes them;
+  * current urologic symptom status as documented (LUTS/IPSS with the score,
+    hematuria, erectile dysfunction and the therapies tried);
+  * the documented reason for today's visit.
 - GROUND EVERY FACT in the chart. Never invent or alter a date, PSA value,
   Gleason score / Grade Group, drug name, or procedure. Each event happened on
   its DOCUMENTED date (a biopsy/treatment on its report date, never a later
@@ -142,8 +157,10 @@ Your CC/HPI has factual problem(s) against the documented chart:
 
 Rewrite BOTH the chief complaint and the complete HPI, keeping everything already
 correct and fixing the problems above. Use ONLY documented facts; the chart is
-authoritative over any advisory extraction. Keep the HPI concise (1-2 paragraphs)
-and keep the "<NAME> is a <AGE>-year-old <sex> who ..." opener.
+authoritative over any advisory extraction. Do NOT drop any documented,
+clinically-relevant history while fixing the problems (keep every active cancer,
+the dated PSA trajectory, documented treatments, constitutional symptoms, and
+symptom status). Keep the "<NAME> is a <AGE>-year-old <sex> who ..." opener.
 
 ADVISORY FACTS (may be wrong — defer to the chart):
 {facts_block}

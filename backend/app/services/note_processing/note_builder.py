@@ -901,8 +901,14 @@ def build_urology_note(
             from .llm_helper import synthesize_with_llm as _synth_h
 
             def _h_call(p: str) -> str:
+                # High ceiling: deepseek/kimi are THINKING models, so num_predict
+                # caps thinking + the CC+HPI JSON COMBINED. A tight cap (2400) lets
+                # long reasoning truncate the JSON — parse-fail -> fallback, or a
+                # thinned/sparse HPI. This was the biggest source of run-to-run HPI
+                # variance (409c sparse vs 995c full on the SAME chart). num_predict
+                # is a ceiling, not a target, so a 2-paragraph HPI still stops early.
                 return _synth_h(prompt=p, temperature=0.0,
-                                task_config=task_config, max_tokens=2400)
+                                task_config=task_config, max_tokens=16000)
 
             _prior_hpi_h, _prior_plan_h = _extract_prior_hpi_and_plan(
                 clinical_document or "")
