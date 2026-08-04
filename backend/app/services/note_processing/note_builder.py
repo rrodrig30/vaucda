@@ -1216,20 +1216,29 @@ def build_urology_note(
         # finding ledger, so no documented finding is dropped and every cancer's
         # pathology (prostate Gleason, renal grade, penile SCC, ...) is covered.
         # Falls back to the regex synthesizer on any miss / when disabled.
+        from .agents.pathology_agent import ensure_pathology_completeness
         try:
             from .agents.pathology_composer import compose_pathology
             from .llm_helper import synthesize_with_llm
 
             def _call(p: str) -> str:
+                # High ceiling: deepseek/kimi are THINKING models, so a tight cap
+                # lets reasoning starve the composed pathology and drop specimens.
                 return synthesize_with_llm(prompt=p, temperature=0.0,
-                                           task_config=None, max_tokens=1800)
+                                           task_config=None, max_tokens=16000)
 
             composed = compose_pathology(clinical_document, _call)
             if composed:
-                return composed
+                # Deterministic backstop: restore any critical documented finding
+                # (stage / margin / PNI / LVI) the LLM composer dropped, checked
+                # against the deterministic regex extraction. Keeps the granular
+                # pathology guaranteed-complete IN THE PATHOLOGY SECTION so the
+                # holistic HPI can stay cohesive without restating it.
+                return ensure_pathology_completeness(composed, _doc_path or "")
         except Exception as _pe:  # noqa: BLE001
             logger.warning(f"Pathology composer error (using regex synth): {_pe}")
-        return synthesize_pathology(_doc_path, gu_notes)
+        return ensure_pathology_completeness(
+            synthesize_pathology(_doc_path, gu_notes), _doc_path or "")
 
     synthesis_tasks['pathology'] = _pathology_task
 

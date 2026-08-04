@@ -23,6 +23,59 @@ from ..extractors.pathology_fact_verifier import (
 logger = logging.getLogger(__name__)
 
 
+# Critical, high-value pathology findings an LLM composer sometimes drops when
+# reformatting the section. Each entry: (label, SOURCE capture pattern, SECTION
+# presence pattern). The source pattern captures the finding verbatim from the
+# DETERMINISTIC regex extraction; the (looser) presence pattern decides whether
+# the rendered section already covers the concept. A finding documented in the
+# deterministic extraction but absent from the section is restored — so the
+# PATHOLOGY section can never silently lose documented staging / margin /
+# invasion detail regardless of LLM behavior. Grade-agnostic (works for prostate
+# pT/margin/PNI, renal pT, urothelial invasion, etc.).
+_PATH_CRITICAL = [
+    ("stage",
+     re.compile(r"\bp?T\d[a-d]?(?:\s*,?\s*p?N\d[a-c]?)?(?:\s*,?\s*p?M\d)?", re.I),
+     re.compile(r"\bp?T\d", re.I)),
+    ("surgical margin",
+     re.compile(r"(?:positive|negative|involved|close|uninvolved)\s+(?:surgical\s+)?"
+                r"margins?[^.\n;,]{0,45}|margins?\s+(?:are\s+|were\s+)?"
+                r"(?:positive|negative|involved|free|uninvolved)[^.\n;,]{0,30}", re.I),
+     re.compile(r"margins?\b", re.I)),
+    ("perineural invasion",
+     re.compile(r"perineural\s+invasion(?:\s+(?:present|identified))?", re.I),
+     re.compile(r"perineural|\bPNI\b", re.I)),
+    ("lymphovascular invasion",
+     re.compile(r"lymphovascular\s+invasion(?:\s+(?:present|identified))?", re.I),
+     re.compile(r"lymphovascular|\bLVI\b", re.I)),
+]
+
+
+def ensure_pathology_completeness(section: str, deterministic_pathology: str) -> str:
+    """Deterministic backstop: guarantee the rendered PATHOLOGY section retains the
+    critical documented findings (stage / margin / perineural + lymphovascular
+    invasion) an LLM composer sometimes drops. Compares against the DETERMINISTIC
+    regex extraction and appends any dropped finding verbatim. Never removes
+    content; a no-op when the section already covers every documented finding."""
+    if not section or not deterministic_pathology:
+        return section
+    missing = []
+    for _label, source_pat, present_pat in _PATH_CRITICAL:
+        m = source_pat.search(deterministic_pathology)
+        if m and not present_pat.search(section):
+            missing.append(re.sub(r"\s+", " ", m.group(0)).strip(" ;,."))
+    if not missing:
+        return section
+    seen, uniq = set(), []
+    for s in missing:
+        if s.lower() not in seen:
+            seen.add(s.lower())
+            uniq.append(s)
+    logger.info(f"[PATHOLOGY] deterministic backstop restored dropped finding(s): {uniq}")
+    return (section.rstrip()
+            + "\n\nAdditional documented pathology (retained from source): "
+            + "; ".join(uniq) + ".")
+
+
 # Markers that distinguish a real pathology REPORT (with specimen-level
 # findings) from a narrative MENTION of cancer ("history of prostate
 # cancer per outside biopsy"). Per-note Pathology extractions only

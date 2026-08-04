@@ -243,96 +243,53 @@ def _cc_defects(cc: str, chart: str, facts: Any) -> list:
     return out
 
 
-# ---- cancer-type-aware pathology completeness -----------------------------
-# Grading/staging is ORGAN-SPECIFIC and NOT interchangeable: prostate uses
-# Gleason / Grade Group; renal uses histologic subtype + nucleolar (Fuhrman/
-# ISUP/WHO) grade; urothelial (bladder / upper-tract) uses WHO low/high grade +
-# invasion depth (Ta/T1/T2, CIS) — never Gleason; testicular uses germ-cell
-# histology + serum markers; penile / adrenal / other each differ again. For
-# each organ we list pathology ASPECTS as (label, regex). An aspect is REQUIRED
-# in the HPI only when it is DOCUMENTED in the chart/pathology yet ABSENT from
-# the HPI — so we never demand a value the record lacks, and never demand a
-# prostate-shaped value for a kidney or bladder tumor.
+# ---- cancer-type-aware pathology completeness (HPI = narrative grade only) --
+# Division of labor: the granular pathology (stage / margin / PNI / LVI / adverse
+# features) is guaranteed COMPLETE in the deterministic PATHOLOGY RESULTS section
+# (see pathology_agent.ensure_pathology_completeness), so the holistic HPI does
+# NOT need to restate it — forcing that granular detail into the prose is what
+# thinned/de-cohered the HPI and fought the LLM. Here the HPI is only required to
+# carry the ORGAN-APPROPRIATE DIAGNOSIS + GRADE, the narrative-standard fact a
+# clinician expects in the story (Gleason/GG for prostate; histologic subtype for
+# kidney; WHO low/high-grade for bladder — never Gleason for a non-prostate
+# cancer; germ-cell histology for testis; etc.). An aspect is flagged only when
+# DOCUMENTED in the record yet ABSENT from the HPI. The LLM reliably includes
+# these grades, so the check is a light safety net, not a source of churn.
 _PATH_ASPECTS = {
     "prostate": [
         ("Gleason score / Grade Group",
          re.compile(r"\bGleason\s+\d\s*\+\s*\d\b|\bGrade\s+Group\s+[1-5]\b", re.I)),
-        # No trailing \b: must still match the pT in a concatenated "pT2N0".
-        ("pathologic stage",
-         re.compile(r"\bpT[0-4][a-d]?", re.I)),
-        # Two-way, proximity-based so "positive right posterior margin" and
-        # "margins negative" both count on either the chart or the HPI side.
-        ("surgical margin status",
-         re.compile(r"(?:positive|negative|close|involved|uninvolved)\b[^.\n]{0,35}?margins?\b|"
-                    r"margins?\b[^.\n]{0,25}?(?:positive|negative|involved|free|uninvolved|close)",
-                    re.I)),
-        ("perineural / lymphovascular invasion",
-         re.compile(r"perineural\s+invasion|lymphovascular\s+invasion|\bPNI\b|\bLVI\b", re.I)),
     ],
     "renal": [
         ("histologic subtype",
          re.compile(r"clear[\s-]cell|papillary|chromophobe|collecting\s+duct|"
-                    r"translocation|oncocytic", re.I)),
-        ("nucleolar (Fuhrman/ISUP/WHO) grade",
-         re.compile(r"(?:Fuhrman|ISUP|WHO)\s*(?:nucleolar\s*)?grade\s*(?:[1-4]|I{1,3}V?)|"
-                    r"nuclear\s+grade\s*[1-4]", re.I)),
-        ("pathologic stage",
-         re.compile(r"\bpT[1-4][a-c]?", re.I)),
-        ("sarcomatoid/rhabdoid features or tumor necrosis",
-         re.compile(r"sarcomatoid|rhabdoid|tumou?r\s+necrosis|coagulative\s+necrosis", re.I)),
+                    r"translocation|oncocytic|renal\s+cell\s+carcinoma|\bRCC\b", re.I)),
     ],
     "bladder": [
         ("WHO grade (low- vs high-grade)",
          re.compile(r"\b(?:low|high)[\s-]grade\b", re.I)),
-        ("invasion depth / stage (Ta/T1/T2, muscle-invasive, CIS)",
-         re.compile(r"\b(?:Ta|Tis|T1|T2|T3|T4)\b|muscle[\s-]invasi|non[\s-]muscle[\s-]invasi|"
-                    r"lamina\s+propria|muscularis\s+propria|carcinoma\s+in\s+situ|\bCIS\b", re.I)),
-        ("lymphovascular invasion / variant histology",
-         re.compile(r"lymphovascular\s+invasion|\bLVI\b|micropapillary|plasmacytoid|"
-                    r"sarcomatoid\s+variant|squamous\s+differentiation", re.I)),
     ],
-    "upper_tract": [   # urothelial — same system as bladder
+    "upper_tract": [   # urothelial — same WHO grade system as bladder
         ("WHO grade (low- vs high-grade)",
          re.compile(r"\b(?:low|high)[\s-]grade\b", re.I)),
-        ("stage / invasion",
-         re.compile(r"\b(?:Ta|Tis|T[1-4])\b|invasi|carcinoma\s+in\s+situ|\bCIS\b", re.I)),
-        ("lymphovascular invasion",
-         re.compile(r"lymphovascular\s+invasion|\bLVI\b", re.I)),
     ],
     "testicular": [
-        ("germ-cell histology (seminoma vs NSGCT components)",
+        ("germ-cell histology (seminoma vs NSGCT)",
          re.compile(r"seminoma|embryonal|yolk\s+sac|choriocarcinoma|teratoma|"
                     r"mixed\s+germ\s+cell|non[\s-]?seminomatous", re.I)),
-        ("serum tumor markers (AFP, β-hCG, LDH)",
-         re.compile(r"\bAFP\b|alpha[\s-]?fetoprotein|beta[\s-]?hCG|\bhCG\b|\bLDH\b", re.I)),
-        ("stage / invasion (pT, LVI, rete testis)",
-         re.compile(r"\bpT[1-4]|lymphovascular\s+invasion|\bLVI\b|rete\s+testis", re.I)),
     ],
     "penile": [
         ("grade / differentiation",
          re.compile(r"grade\s*[1-3]\b|well|moderately|poorly\s+differentiated", re.I)),
-        ("stage",
-         re.compile(r"\bpT[1-4][a-b]?", re.I)),
-        ("LVI / PNI / HPV (p16) status",
-         re.compile(r"lymphovascular\s+invasion|perineural\s+invasion|\bLVI\b|\bPNI\b|"
-                    r"\bp16\b|\bHPV\b", re.I)),
     ],
     "adrenal": [
-        ("Weiss score",
-         re.compile(r"Weiss\s+score|Weiss[:\s]+\d", re.I)),
-        ("Ki-67 proliferation index",
-         re.compile(r"Ki[\s-]?67", re.I)),
-        ("stage (ENSAT / pT)",
-         re.compile(r"\bpT[1-4]|ENSAT", re.I)),
+        ("histologic diagnosis",
+         re.compile(r"adrenocortical|adrenal\s+cortical\s+carcinoma", re.I)),
     ],
     "other": [   # paratesticular / retroperitoneal / unclassified — generic
         ("histologic diagnosis",
          re.compile(r"sarcoma|lymphoma|germ\s+cell|carcinoma|liposarcoma|"
                     r"leiomyosarcoma", re.I)),
-        ("grade",
-         re.compile(r"grade\s*[1-3]\b|high[\s-]grade|low[\s-]grade|FNCLCC", re.I)),
-        ("stage",
-         re.compile(r"\bpT[1-4]|stage\s+(?:I|II|III|IV)\b", re.I)),
     ],
 }
 
