@@ -132,10 +132,12 @@ _FINITE_PLANNED_RE = re.compile(
     r"(?:adt|androgen|eligard|lupron|leuprolide|radiation|hormon)|"
     r"(?:adt|androgen\s+deprivation|eligard|lupron|leuprolide)[^.\n]{0,25}?"
     r"(?:for|x)\s*(\d{1,2})\s*(?:month|year)s?", re.I)
-# "injection 3 of 6" / "3rd of 6 injections" / "dose 2/4" — X of Y course.
+# "injection 3 of 6" / "3rd of 6 injections" — X of Y course. WORD form only:
+# the bare "2/6" slash form collides with dates ("injection 2/28/24" -> "2 of 28"),
+# so it is deliberately excluded.
 _DOSE_COUNT_RE = re.compile(
-    r"(?:injection|dose|shot|cycle)\s*(?:#\s*)?(\d{1,2})\s*(?:of|/|out\s+of)\s*(\d{1,2})|"
-    r"(\d{1,2})(?:st|nd|rd|th)\s+(?:of\s+)?(\d{1,2})\s+(?:injection|dose|shot)s?", re.I)
+    r"(?:injection|dose|shot|cycle)\s*(?:#\s*)?(\d{1,2})\s+(?:of|out\s+of)\s+(\d{1,2})\b|"
+    r"(\d{1,2})(?:st|nd|rd|th)\s+of\s+(\d{1,2})\s+(?:injection|dose|shot)s?", re.I)
 
 # A NEW / restarted course — a prior course may be COMPLETED, but recurrence /
 # rising PSA drives a fresh course, which must not be masked by the old
