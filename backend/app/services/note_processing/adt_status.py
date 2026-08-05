@@ -611,6 +611,62 @@ def _cmp(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
     return (a[0] - b[0]) * 360 + (a[1] - b[1]) * 30 + (a[2] - b[2])
 
 
+def adt_plan_directive_from_note(stage1_note: str) -> Optional[str]:
+    """Read the already-rendered (and correct) ADT section from the Stage 1 note
+    and map its determination to an actionable PLAN directive. Parses the section
+    rather than re-extracting, because re-running the extractor on the rendered
+    note misfires (the Assessment/Plan prose says 'completed ADT/radiation')."""
+    m = re.search(r"ANDROGEN DEPRIVATION THERAPY \(ADT\):\s*(.*?)"
+                  r"(?=\n\s*\n|\n=|\n[A-Z][A-Z /()]{3,}:)", stage1_note or "", re.S)
+    if not m:
+        return None
+    block = m.group(1)
+
+    def _field(label: str) -> str:
+        fm = re.search(rf"{label}:\s*(.+)", block)
+        return fm.group(1).strip() if fm else ""
+
+    det = _field("This visit")
+    if not det:
+        return None
+    agent = (_field("Agent").split(",")[0].strip() or "ADT")
+    d = det.lower()
+    # NOT-due / status-specific cases FIRST — many share the "No injection due"
+    # prefix, so the affirmative "injection due" check must come last and exclude
+    # "no injection due".
+    if "deferred" in d:
+        return ("ADT depot injection deferred this visit per patient preference; "
+                "continue PSA surveillance and reassess at follow-up.")
+    if "given today" in d:
+        return (f"{agent} administered today; schedule the next depot injection per "
+                f"the dosing interval and continue PSA/testosterone monitoring.")
+    if "confirm whether the order is stale" in d:
+        return (f"Clarify ADT intent before dosing — a completed short course but a "
+                f"pending {agent} depot order exists; confirm a stale order vs. an "
+                f"intended new course.")
+    if "discontinued" in d:
+        return ("ADT remains discontinued; continue PSA surveillance and manage per "
+                "shared decision-making.")
+    if "off-cycle" in d or "intermittent" in d:
+        return (f"Continue the intermittent ADT holiday ({agent}); monitor PSA and "
+                f"testosterone, resume ADT per the PSA threshold.")
+    if "course completed" in d:
+        return "ADT course completed; monitor PSA and testosterone recovery."
+    if "being initiated" in d or "first injection scheduled" in d or "initiat" in d:
+        return (f"Initiate ADT ({agent}); counsel on side effects and obtain baseline "
+                f"bone-health monitoring (DEXA, calcium/vitamin D).")
+    if "next due" in d:
+        nd = re.search(r"next due (\d{1,2}/\d{1,2}/\d{4}|\d{1,2}/\d{4})", det)
+        return f"{agent} up to date; next depot injection due {nd.group(1) if nd else 'per interval'}."
+    if "indeterminate" in d or "confirm regimen" in d or "confirm agent" in d:
+        return (f"Confirm the ADT regimen ({agent}: agent/dose/interval) and the next "
+                f"injection timing.")
+    if "injection ordered" in d or ("injection due" in d and "no injection due" not in d):
+        return (f"Administer {agent} depot today (pharmacy order pending); confirm "
+                f"dose/route/interval.")
+    return f"ADT — {det}"
+
+
 def render_adt_section(st: ADTStatus) -> str:
     if not st or not st.present:
         return ""

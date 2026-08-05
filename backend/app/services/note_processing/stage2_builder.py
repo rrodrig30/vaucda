@@ -726,6 +726,25 @@ def build_stage2_note(
     else:
         print(f"      ✓ Assessment verified (confidence: {assessment_verification['confidence_score']}%)")
 
+    # Wire the deterministic ADT determination into the Plan (VAUCDA_ADT_PLAN).
+    # Parse the already-correct ADT section from the Stage 1 note, map it to an
+    # actionable directive, and feed it to the Plan LLM as authoritative context
+    # (a deterministic backstop below guarantees it lands even if the LLM omits it).
+    import os as _os_adt
+    _adt_directive = None
+    _plan_facts = authoritative_facts
+    if _os_adt.environ.get("VAUCDA_ADT_PLAN", "1") == "1":
+        try:
+            from .adt_status import adt_plan_directive_from_note
+            _adt_directive = adt_plan_directive_from_note(stage1_note)
+            if _adt_directive:
+                _plan_facts = ((authoritative_facts or "")
+                               + "\n\nADT — PLAN DIRECTIVE (deterministic ADT scheduler; "
+                               "reflect this action in the Plan and do not contradict it):\n- "
+                               + _adt_directive + "\n")
+        except Exception as _ade:  # noqa: BLE001
+            logger.warning(f"ADT plan directive skipped: {_ade}")
+
     # Step 4: Synthesize Plan
     print("\n[4/6] Synthesizing Plan (treatment plan)...")
     plan = synthesize_plan(
@@ -739,7 +758,7 @@ def build_stage2_note(
         visit_progression=visit_progression,
         cross_specialty_context=cross_specialty_context,
         prior_ap_context=prior_ap_context_for_plan,
-        authoritative_facts=authoritative_facts,
+        authoritative_facts=_plan_facts,
         # Pass the just-generated Assessment so the Plan can be congruent
         # with the recommendations the Assessment narrative makes. Without
         # this the two sections drift (e.g. Assessment says "MRI 6-12
@@ -777,6 +796,15 @@ def build_stage2_note(
             plan = _scrub_unproductive_plan(plan)
         except Exception:  # noqa: BLE001
             pass
+
+    # Deterministic ADT backstop: guarantee the ADT action lands in the Plan. If
+    # the LLM plan doesn't already address ADT / the depot agent, append the
+    # deterministic directive as its own bullet so the injection decision is never
+    # silently dropped (mirrors the pathology / weight-anchor pattern).
+    if _adt_directive and plan and not re.search(
+            r"\b(?:ADT|androgen\s+deprivation|eligard|lupron|leuprolide|degarelix|"
+            r"goserelin|firmagon|orgovyx|relugolix|depot\s+injection)\b", plan, re.I):
+        plan = plan.rstrip() + "\n- " + _adt_directive
 
     # Step 5: Verify Plan
     print("\n[5/6] Verifying Plan against source data...")
