@@ -122,6 +122,19 @@ _DISCONTINUED_TOX_RE = re.compile(
     r"discontinu\w+[^.\n]{0,40}?(?:due\s+to|because|for|secondary\s+to)|"
     r"stopped[^.\n]{0,30}?(?:due\s+to|because|side\s+effect|intoler)|"
     r"(?:tolerated|received)[^.\n]{0,20}?\d+\s*years?[^.\n]{0,25}?discontinu", re.I)
+# A SHORT / single-dose course (neoadjuvant/concurrent with radiation) — the
+# course is effectively done after one or a few doses.
+_SHORT_COURSE_RE = re.compile(
+    r"(?:single|one|1)\s+(?:dose|injection|shot)\s+of\s+(?:adt|androgen|eligard|"
+    r"lupron|leuprolide)|(?:adt|eligard|lupron|leuprolide)\s+x\s*1\b|"
+    r"short\s+course\s+(?:of\s+)?adt[^.\n]{0,40}?complet|"
+    r"complet\w*[^.\n]{0,25}?short\s+course\s+(?:of\s+)?adt", re.I)
+# Testosterone recovering — for an ADT patient this means the drug effect is
+# wearing off (the course has ended / is over).
+_T_RECOVERY_RE = re.compile(
+    r"testosterone[^.\n]{0,25}?(?:rising|recover\w*|returning|normaliz\w*|"
+    r"back\s+to\s+normal)|(?:recover\w*|rising|returning)[^.\n]{0,20}?testosterone",
+    re.I)
 
 # A PLANNED FINITE course (defined duration or dose count) — adjuvant/neoadjuvant
 # ADT with radiation, e.g. "18 months of ADT", "planned 24-month course",
@@ -414,6 +427,23 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     planned_start = bool(_PLANNED_START_RE.search(raw_text))
     not_candidate = bool(_NOT_CANDIDATE_RE.search(raw_text))
     ever_used = bool(st.last_injection_ymd) or given_today or _has_order
+    single_inj = len({(d[0], d[1], d[2]) for d in dates}) <= 1
+    # A COMPLETED short course requires COMPLETION corroboration — an explicit
+    # "completed short course", or a single/one dose alongside testosterone
+    # recovery OR completed radiation (neoadjuvant/concurrent done) — plus a
+    # single injection and NON-metastatic disease. Bare "single dose of ADT"
+    # alone is ambiguous (could be just-started for metastatic disease), so it
+    # does NOT qualify — this is why MARTINEZ (metastatic) and LAWRENCE (one
+    # injection, no completion signal) must not flag.
+    _short_completion = (
+        bool(re.search(r"complet\w*[^.\n]{0,25}short\s+course|"
+                       r"short\s+course[^.\n]{0,30}complet", raw_text, re.I))
+        or (bool(_SHORT_COURSE_RE.search(raw_text)) and (
+            bool(_T_RECOVERY_RE.search(raw_text))
+            or bool(re.search(r"complet\w+[^.\n]{0,25}(?:xrt|radiation|\brt\b|brachy)",
+                              raw_text, re.I)))))
+    short_course_done = _short_completion and single_inj and not metastatic
+    short_conflict = False
 
     # Suppress the section entirely when the injectable agent is named ONLY as a
     # non-candidate / contraindication and there is no order, injection, or
@@ -439,6 +469,18 @@ def build_adt_status(raw_text: str, visit_date: str = "",
             st.status = "CONTINUOUS"
         else:
             st.status = "ACTIVE"
+    # 1b) A completed SHORT / single-dose course (neoadjuvant/concurrent with RT).
+    #     Reads as COMPLETED — but if a depot order is still PENDING it is a
+    #     CONFLICT (stale order vs an intended new course): flag, don't guess.
+    elif short_course_done and not off_now and not given_today:
+        st.status = "COMPLETED"
+        if pending:
+            short_conflict = True
+            st.evidence.append("completed short/single-dose ADT course, but a PENDING "
+                               "order exists — confirm stale order vs. intended new course")
+        else:
+            st.evidence.append("completed short/single-dose ADT course "
+                               "(testosterone recovering)")
     # 2) Finite course finished (and not restarting).
     elif (finite_done or dc_done) and not active_order:
         st.status = "COMPLETED"
@@ -481,7 +523,13 @@ def build_adt_status(raw_text: str, visit_date: str = "",
 
     # ---- injection-due determination (priority-ordered) ----
     vdt = _parse_visit_ymd(visit_date) or _latest_note_date(raw_text)
-    if st.status == "INITIATING":
+    if short_conflict:
+        st.injection = "CONFLICT"
+        st.determination = ("Likely COMPLETED short ADT course (single dose / "
+                            "testosterone recovering) — but a PENDING depot order "
+                            "exists; CONFIRM whether the order is stale or a new "
+                            "course is intended before administering.")
+    elif st.status == "INITIATING":
         st.injection = "SCHEDULED"
         _sm = _SCHED_DATE_RE.search(raw_text)
         _sd = None
