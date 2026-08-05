@@ -472,9 +472,9 @@ def build_stage2_note(
         prior_ap_context_for_assessment = format_prior_ap_for_assessment(prior_ap_context)
         prior_ap_context_for_plan = format_prior_ap_for_plan(prior_ap_context)
         print(f"      Prior A&P context synthesized:")
-        print(f"        - Key diagnoses: {prior_ap_context.get('key_diagnoses', [])}")
+        print(f"        - Key diagnoses: {len(prior_ap_context.get('key_diagnoses', []))} found")
         print(f"        - Prior interventions: {len(prior_ap_context.get('prior_interventions', []))} found")
-        print(f"        - Patient decisions: {prior_ap_context.get('patient_decisions', {})}")
+        print(f"        - Patient decisions: {len(prior_ap_context.get('patient_decisions', {}))} found")
         print(f"        - Resolved issues: {len(prior_ap_context.get('resolved_issues', []))}")
         print(f"        - Outstanding issues: {len(prior_ap_context.get('outstanding_issues', []))}")
     else:
@@ -601,7 +601,7 @@ def build_stage2_note(
         print(f"      Confirmed Tx:     "
               f"{patient_facts.confirmed_urologic_treatments[:3]}")
     if patient_facts.cancer_evidence:
-        print(f"      Cancer evidence: {patient_facts.cancer_evidence[:3]}")
+        print(f"      Cancer evidence: {len(patient_facts.cancer_evidence)} item(s)")
     if patient_facts.inconsistencies:
         for inc in patient_facts.inconsistencies:
             print(f"      ⚠ INCONSISTENCY: {inc}")
@@ -661,8 +661,7 @@ def build_stage2_note(
     if patient_facts is not None and assessment:
         assessment, _asmt_dropped = sanitize_context_against_facts(assessment, patient_facts)
         if _asmt_dropped:
-            logger.info("Assessment fact-guard dropped %d sentence(s): %s",
-                        len(_asmt_dropped), _asmt_dropped)
+            logger.info("Assessment fact-guard dropped %d sentence(s)", len(_asmt_dropped))
             print(f"      Fact-guard: dropped {len(_asmt_dropped)} contradicting sentence(s) from Assessment")
 
     # Finalize: strip hallucinated scanner/metadata garbage + completeness-repair
@@ -771,8 +770,7 @@ def build_stage2_note(
     if patient_facts is not None and plan:
         plan, _plan_dropped = sanitize_context_against_facts(plan, patient_facts)
         if _plan_dropped:
-            logger.info("Plan fact-guard dropped %d sentence(s): %s",
-                        len(_plan_dropped), _plan_dropped)
+            logger.info("Plan fact-guard dropped %d sentence(s)", len(_plan_dropped))
             print(f"      Fact-guard: dropped {len(_plan_dropped)} contradicting sentence(s) from Plan")
 
     # Strip hallucinated scanner/CPT-metadata plan bullets (congruent with the

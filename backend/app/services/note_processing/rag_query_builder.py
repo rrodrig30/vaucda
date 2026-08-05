@@ -248,7 +248,7 @@ def extract_active_problem_list(preliminary_note: str) -> List[str]:
     cc = extract_chief_complaint(preliminary_note)
     if cc:
         problems.append(cc)
-        logger.info(f"Problem 1 (CC): {cc}")
+        logger.info("Built RAG query for primary problem")
 
     # Step 2: Look for explicitly documented problems/assessment section
     # Pattern: "ASSESSMENT:" or "Active Problems:" sections
@@ -437,7 +437,7 @@ def build_targeted_rag_queries(
 
     # Step 2: Build patient context from Stage 1 note
     patient_context = build_patient_context(source_text)
-    logger.info(f"Patient context: {patient_context}")
+    logger.info("Built patient RAG context")
 
     # Step 2.5: Extract patient race for race-aware queries
     patient_race = extract_patient_race(source_text)
@@ -468,7 +468,7 @@ def build_targeted_rag_queries(
             if race_specific_key in CONDITION_RAG_QUERIES:
                 race_query = CONDITION_RAG_QUERIES[race_specific_key][0]
                 queries.append(race_query)
-                logger.info(f"Added race-aware RAG query for African American patient: {race_query}")
+                logger.info("Added race-aware RAG query")
             else:
                 # Fallback race-aware query
                 race_query = f"African American prostate cancer screening PSA guidelines {problem}"

@@ -656,7 +656,7 @@ def build_urology_note(
         if patient_name:
             _parts = [p for p in re.split(r"[\s,]+", str(patient_name).strip()) if p]
             _name_disp = "".join(p[0].upper() for p in _parts if p[:1].isalpha())[:4] or "?"
-        print(f"      Patient: {_name_disp} (SSN: {_ssn_disp}, Age: {patient_age}, Sex: {patient_sex}, Race: {patient_race})")
+        print(f"      Patient record loaded (Age: {patient_age}, Sex: {patient_sex})")
     else:
         print(f"      Patient demographics: Not found in document")
 
@@ -1376,8 +1376,7 @@ def build_urology_note(
     if hpi and _hpi_pf is not None:
         hpi, _hpi_dropped = sanitize_context_against_facts(hpi, _hpi_pf)
         if _hpi_dropped:
-            print(f"      ✂ HPI fact-guard dropped {len(_hpi_dropped)} "
-                  f"contradicting sentence(s): {[s[:80] for s in _hpi_dropped]}")
+            print(f"      ✂ HPI fact-guard dropped {len(_hpi_dropped)} contradicting sentence(s)")
     # Temporal-validity repair on the HPI (symmetry with the Stage-2
     # Assessment/Plan pass): latest-wins / staleness / vague-recency. Catches a
     # current recurrence/rising-PSA claim contradicted by an undetectable PSA
