@@ -1244,6 +1244,26 @@ def build_urology_note(
 
     synthesis_tasks['testosterone'] = lambda: synthesize_testosterone(gu_notes)
 
+    # ADT status + injection scheduler (deterministic, prostate-only). Standalone
+    # section: classifies the ADT course (completed / finite-in-progress /
+    # continuous / intermittent-on / intermittent-holding / discontinued / new
+    # course for recurrence) and determines whether a depot injection is due at
+    # THIS visit — with the agent, dose, route, interval, and the evidence.
+    def _adt_task():
+        import os as _os_adt
+        if _os_adt.environ.get("VAUCDA_ADT_SECTION", "1") != "1":
+            return ""
+        try:
+            from .adt_status import build_adt_status, render_adt_section
+            _st = build_adt_status(_raw_clinical_text or clinical_document or "",
+                                   visit_date=_visit_date, psa_data=_doc_psa or "",
+                                   facts=_hpi_pf)
+            return render_adt_section(_st) if _st.present else ""
+        except Exception as _ae:  # noqa: BLE001
+            logger.warning(f"ADT section skipped: {_ae}")
+            return ""
+    synthesis_tasks['adt'] = _adt_task
+
     # Capture document_medications in closure
     _doc_meds = document_medications
     synthesis_tasks['medications'] = lambda: synthesize_medications(_doc_meds, gu_notes)
@@ -1418,6 +1438,7 @@ def build_urology_note(
     sexual = results.get('sexual', '')
     pathology = results.get('pathology', '')
     testosterone = results.get('testosterone', '')
+    adt = results.get('adt', '')
     medications = results.get('medications', '')
     allergies = results.get('allergies', '')
     imaging = results.get('imaging', '')
@@ -1447,6 +1468,7 @@ def build_urology_note(
         family=family,
         sexual=sexual,
         psa=psa,
+        adt=adt,
         pathology=pathology,
         testosterone=testosterone,
         medications=medications,
@@ -1725,6 +1747,10 @@ def assemble_note(**sections) -> str:
     # PSA Curve - MALE ONLY (females do not have prostate, no PSA screening)
     if not is_female and sections.get("psa"):
         note_parts.append(f"PSA CURVE:\n{sections['psa']}\n")
+
+    # ADT status + injection scheduler (prostate cancer on hormone therapy)
+    if not is_female and sections.get("adt"):
+        note_parts.append(f"\n{'='*74}\nANDROGEN DEPRIVATION THERAPY (ADT):\n{sections['adt']}\n")
 
     # Medications
     if sections.get("medications"):
