@@ -292,6 +292,51 @@ def _is_unproductive_segment(seg: str) -> bool:
     return bool(contingency or neg_rec)
 
 
+# Bracket date/service placeholders the LLM leaves ("injection given on
+# [date of service]") -> "today" (the note is written at the visit).
+_AP_DATE_PLACEHOLDER = re.compile(
+    r"(?:\s+(?:on|by|as\s+of|dated))?\s*\[\s*(?:date\s+of\s+service|service\s+date|"
+    r"current\s+date|today'?s?\s+date|visit\s+date|date|dos)\s*\]", re.I)
+# Generic bracket placeholders ("[value]", "[insert ...]", "[XX]", "[TBD]").
+_AP_BRACKET_PLACEHOLDER = re.compile(
+    r"\s*\[\s*(?:insert|enter|specify|provide|tbd|x{2,}|placeholder|value|name|"
+    r"number|dose|age|result|time|to\s+be\s+[a-z]+)[^\]]*\]", re.I)
+# A sentence asserting a Charlson Comorbidity Index / 10-year-survival figure —
+# stripped when NO CCI calculator was actually run (the LLM otherwise fabricates
+# a score, e.g. "CCI 17 / 2% 10-year survival" in express mode).
+_CCI_SENTENCE = re.compile(
+    r"[^.]*\b(?:charlson\s+comorbidity\s+index|comorbidity\s+index\s+score|\bCCI\b|"
+    r"estimated\s+\d+[\s-]year\s+survival)[^.]*\.\s*", re.I)
+
+
+def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
+    """Deterministic Assessment/Plan cleanup: resolve date-placeholders to
+    'today', drop generic bracket placeholders, remove a FABRICATED Charlson
+    score when no CCI calculator was run, and strip a duplicated leading section
+    header."""
+    if not text:
+        return text
+    text = _AP_DATE_PLACEHOLDER.sub(" today", text)
+    text = _AP_BRACKET_PLACEHOLDER.sub("", text)
+    if not has_cci:
+        text = _CCI_SENTENCE.sub("", text)
+    # tidy whitespace/punctuation left by removals
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\s+([.,;])", r"\1", text)
+    text = re.sub(r"([a-z])\.([A-Z])", r"\1. \2", text)   # restore lost sentence space
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _strip_leading_header(text: str, header: str) -> str:
+    """Remove a duplicated leading 'ASSESSMENT:' / 'PLAN:' the LLM emitted (the
+    assembler adds its own)."""
+    if not text:
+        return text
+    return re.sub(rf"^\s*{header}\s*:?\s*\n?", "", text, count=1, flags=re.IGNORECASE)
+
+
 def _scrub_unproductive_plan(plan: str) -> str:
     """Drop unproductive dash-bullets from the Plan (keeps PROBLEM headers and
     every affirmative bullet)."""
@@ -873,6 +918,18 @@ def assemble_complete_note(
 
     # Add Stage 1 note
     note_parts.append(stage1_note)
+
+    # Deterministic A&P finishing: resolve "[date of service]" placeholders,
+    # drop a fabricated Charlson score when no CCI calculator was run, and remove
+    # any duplicated leading section header the LLM emitted.
+    _has_cci = bool(calculator_results) and any(
+        ('cci' in str(k).lower() or 'charlson' in str(k).lower())
+        for k in (calculator_results or {}).keys())
+    if assessment:
+        assessment = _scrub_ap_artifacts(_strip_leading_header(assessment, "ASSESSMENT"),
+                                         _has_cci)
+    if plan:
+        plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), _has_cci)
 
     # Add Assessment
     if assessment and assessment.strip():
