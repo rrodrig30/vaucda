@@ -152,6 +152,30 @@ _NEW_COURSE_RE = re.compile(
     r"re-?challenge)[^.\n]{0,20}?(?:adt|eligard|lupron|leuprolide|androgen)",
     re.I)
 
+# Agent named only to say the patient is NOT getting it — must not render as
+# on-therapy ("not a candidate for Eligard", "Eligard contraindicated").
+_NOT_CANDIDATE_RE = re.compile(
+    r"not\s+a\s+candidate\s+for\s+[^.\n]{0,15}?(?:eligard|lupron|leuprolide|adt|"
+    r"androgen)|(?:eligard|lupron|leuprolide|adt|androgen\s+deprivation)"
+    r"[^.\n]{0,20}?(?:contraindicated|not\s+(?:a\s+candidate|recommended|indicated))",
+    re.I)
+# ADT being INITIATED — a first injection scheduled/planned but not yet given.
+_PLANNED_START_RE = re.compile(
+    r"(?:scheduled\s+to\s+(?:receive|start|begin)|plan(?:s|ned)?\s+to\s+(?:start|"
+    r"begin|initiate)|will\s+(?:start|begin|receive)|to\s+(?:start|begin|initiate|"
+    r"receive|obtain)|rtc[^.\n]{0,15}?for)[^.\n]{0,25}?"
+    r"(?:eligard|lupron|leuprolide|adt|androgen)|"
+    r"(?:eligard|lupron|leuprolide)\s+(?:shot|injection)\s*#?\s*1\b|"
+    r"(?:appointment|appt|\balm\b)[^.\n]{0,40}?(?:for\s+)?(?:eligard|lupron|leuprolide)",
+    re.I)
+# A scheduled first-injection date ("shot #1 on 4/27/22", "start … on <date>").
+_SCHED_DATE_RE = re.compile(
+    r"(?:eligard|lupron|leuprolide)\s+(?:shot|injection)\s*#?\s*1\b[^.\n]{0,12}?"
+    r"(?:on\s+)?(\d{1,2})[/\-](?:(\d{1,2})[/\-])?(\d{2,4})|"
+    r"(?:scheduled|start\w*|begin\w*|receive|obtain)[^.\n]{0,25}?"
+    r"(?:eligard|lupron|leuprolide|adt)[^.\n]{0,15}?(?:on\s+)"
+    r"(\d{1,2})[/\-](?:(\d{1,2})[/\-])?(\d{2,4})", re.I)
+
 _DATE = r"(\d{1,2})[/\-](?:(\d{1,2})[/\-])?(\d{2,4})"
 # Reject a date that is really a lab / appointment / PSA / entry date, not an
 # injection date, when it sits between the anchor and the number.
@@ -207,6 +231,7 @@ class ADTStatus:
 
 
 _STATUS_DISPLAY = {
+    "INITIATING": "Initiating — starting ADT (first injection scheduled/planned)",
     "COMPLETED": "Completed (finite course finished)",
     "FINITE_IN_PROGRESS": "Finite course — in progress (not yet completed)",
     "CONTINUOUS": "Continuous / indefinite",
@@ -384,10 +409,27 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     planned_n = None
     if finite_planned:
         planned_n = next((g for g in finite_planned.groups() if g), None)
+    planned_start = bool(_PLANNED_START_RE.search(raw_text))
+    not_candidate = bool(_NOT_CANDIDATE_RE.search(raw_text))
+    ever_used = bool(st.last_injection_ymd) or given_today or _has_order
+
+    # Suppress the section entirely when the injectable agent is named ONLY as a
+    # non-candidate / contraindication and there is no order, injection, or
+    # planned start (e.g. "not a candidate for Eligard").
+    if not_candidate and not ever_used and not planned_start:
+        st.present = False
+        return st
 
     # ---- status classification (order matters) ----
+    # 0) ADT being INITIATED — a first injection scheduled/planned, none yet given.
+    #    Only a REAL depot order or a today-administration blocks this; a captured
+    #    date in a "shot #1 scheduled on <date>" phrase is the SCHEDULED first
+    #    dose, not proof of prior therapy.
+    if planned_start and not (given_today or _has_order) and not off_now:
+        st.status = "INITIATING"
+        st.evidence.append("ADT being initiated — first injection scheduled/planned")
     # 1) A NEW / restarted course for recurrence overrides a stale completion.
-    if new_course and not off_now:
+    elif new_course and not off_now:
         st.evidence.append("new/restarted ADT course (recurrence / rising PSA)")
         if finite_planned or dc_progress:
             st.status = "FINITE_IN_PROGRESS"
@@ -437,7 +479,21 @@ def build_adt_status(raw_text: str, visit_date: str = "",
 
     # ---- injection-due determination (priority-ordered) ----
     vdt = _parse_visit_ymd(visit_date) or _latest_note_date(raw_text)
-    if deferred_today:
+    if st.status == "INITIATING":
+        st.injection = "SCHEDULED"
+        _sm = _SCHED_DATE_RE.search(raw_text)
+        _sd = None
+        if _sm:
+            gs = [g for g in _sm.groups() if g]
+            if len(gs) == 3:
+                _sd = _parse_date(gs[0], gs[1], gs[2])
+            elif len(gs) == 2:
+                _sd = _parse_date(gs[0], None, gs[1])
+        when = f" on {_sd[3]}" if _sd else ""
+        reg = _regimen(st)
+        st.determination = ("ADT being initiated — first injection scheduled" + when
+                            + (f"; {reg}" if reg.strip() else "; confirm agent/dose/interval."))
+    elif deferred_today:
         st.injection = "NOT_DUE"
         st.determination = f"Injection DEFERRED this visit (per chart) — {_regimen(st)}."
     elif given_today:
