@@ -72,8 +72,23 @@ _INJECTABLE_TOKENS = tuple(t for t, v in _AGENTS.items() if v[1] in _INJECTABLE)
 _ORAL_TOKENS = tuple(t for t, v in _AGENTS.items() if v[1] not in _INJECTABLE)
 
 _METASTATIC_RE = re.compile(
-    r"\bmetasta|\bmets\b|\bmHSPC\b|\bmCRPC\b|\bM1\b|osseous\s+(?:disease|metasta)|"
+    r"\bmetasta\w*|\bmets\b|\bmHSPC\b|\bmCRPC\b|\bM1\b|osseous\s+(?:disease|metasta)|"
     r"bone\s+metasta|widespread\s+disease|visceral\s+metasta", re.I)
+# Negation cue in the ~35 chars BEFORE a metastatic token — "no evidence of
+# metastatic disease", "negative for metastasis", "no convincing … metastatic".
+_META_NEG = re.compile(
+    r"(?:\bno\b|without|negative\s+for|free\s+of|ruled?\s+out|denies|resolved|"
+    r"no\s+evidence\s+of|no\s+convincing|not\b|\bnon-)[^.\n]{0,30}$", re.I)
+
+
+def _is_metastatic(text: str) -> bool:
+    """True only when a metastatic mention appears NON-negated somewhere — so
+    'metastatic castration-resistant …' (mCRPC) counts, but a chart whose only
+    metastatic word is 'no evidence of metastatic disease' does not."""
+    for m in _METASTATIC_RE.finditer(text):
+        if not _META_NEG.search(text[max(0, m.start() - 35):m.start()]):
+            return True
+    return False
 _INTERMITTENT_RE = re.compile(r"intermittent\s+(?:adt|androgen|hormon|therapy)", re.I)
 _HOLDING_RE = re.compile(
     r"currently\s+off\s+(?:therapy|adt)|off\s+therapy|hormone\s+holiday|adt\s+holiday|"
@@ -315,7 +330,7 @@ def build_adt_status(raw_text: str, visit_date: str = "",
             st.present = True
             st.agent = st.oral_agents[0]
             st.injection = "NOT_APPLICABLE"
-            st.status = "CONTINUOUS" if _METASTATIC_RE.search(raw_text) else "ACTIVE"
+            st.status = "CONTINUOUS" if _is_metastatic(raw_text) else "ACTIVE"
             st.determination = "No depot injection — oral agent(s) only."
             st.evidence.append(f"oral ADT documented: {', '.join(st.oral_agents)}")
         return st
@@ -344,7 +359,7 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.last_injection_ymd = (last[0], last[1], last[2])
 
     # ---- signals ----
-    metastatic = bool(_METASTATIC_RE.search(raw_text))
+    metastatic = _is_metastatic(raw_text)
     intermittent = bool(_INTERMITTENT_RE.search(raw_text))
     holding = bool(_HOLDING_RE.search(raw_text))
     deferred_today = bool(_DEFER_TODAY_RE.search(raw_text))
