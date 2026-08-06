@@ -131,6 +131,7 @@ _REPORT_BOILERPLATE = [
     re.compile(r"\s*Up-to-date\s+CT\s+equipment[^\n]*", re.I),
     re.compile(r"\s*CTDIvol:[^\n]*", re.I),
     re.compile(r"\s*DLP:\s*[\d.]+\s*mGy[- ]?cm\.?", re.I),
+    re.compile(r"\s*(?:NOTE\s+)?The\s+total\s+dose[- ]length\s+product[^\n]*", re.I),
     re.compile(r"\s*This\s+(?:CT\s+)?exam\s+was\s+performed\s+using[^\n]*", re.I),
     re.compile(r"\s*(?:Radiation\s+)?dose\s+reduction\s+techniques[^\n]*", re.I),
     # journal citation footnote: "* Silverman, S. et al. ... Radiology 2019; 292:475-488."

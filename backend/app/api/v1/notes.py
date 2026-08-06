@@ -1937,6 +1937,12 @@ async def batch_upload_and_process(
                         gen_time = round(time.time() - file_start, 2)
                         success = True
 
+                        # Embed the SOURCE CHART filename at the top of the note so
+                        # the note is self-identifying regardless of how the saved
+                        # file gets named — prevents using the wrong chart.
+                        if not final_note.lstrip().upper().startswith("SOURCE CHART:"):
+                            final_note = f"Source Chart: {filename}\n{final_note}"
+
                         # Stream the completed note immediately
                         completed_notes.append((output_name, final_note))
                         yield _sse_event('file_complete', {'filename': filename, 'output_filename': output_name, 'note_type': note_type, 'current_index': idx + 1, 'total_files': len(saved_files), 'attempts': attempt, 'generation_time_seconds': gen_time, 'note_content': final_note})
@@ -2497,6 +2503,10 @@ async def batch_process_folder_stream(
                             ),
                             timeout=file_timeout,
                         )
+
+                        # Self-identifying note: embed the source chart filename.
+                        if not final_note.lstrip().upper().startswith("SOURCE CHART:"):
+                            final_note = f"Source Chart: {file_path.name}\n{final_note}"
 
                         output_path = output_folder / output_filename
                         output_path.write_text(final_note, encoding='utf-8')
