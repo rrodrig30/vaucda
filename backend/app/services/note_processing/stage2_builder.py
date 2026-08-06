@@ -866,13 +866,17 @@ def build_stage2_note(
 
     # Step 6: Assemble complete note
     print("\n[6/6] Assembling complete clinical note (with temporal awareness and cross-specialty integration)...")
+    _has_cci = bool(calculator_results) and any(
+        ('cci' in str(k).lower() or 'charlson' in str(k).lower())
+        for k in (calculator_results or {}).keys())
     complete_note = assemble_complete_note(
         stage1_note=stage1_note,
         assessment=assessment,
         plan=plan,
         note_type=note_type,
         patient_name=patient_name,
-        ssn_last4=ssn_last4
+        ssn_last4=ssn_last4,
+        has_cci=_has_cci
     )
 
     print(f"      Complete note: {len(complete_note)} characters")
@@ -891,7 +895,8 @@ def assemble_complete_note(
     plan: str,
     note_type: str = "clinic_note",
     patient_name: Optional[str] = None,
-    ssn_last4: Optional[str] = None
+    ssn_last4: Optional[str] = None,
+    has_cci: bool = False
 ) -> str:
     """
     Combine Stage 1 note with Assessment and Plan sections.
@@ -921,15 +926,13 @@ def assemble_complete_note(
 
     # Deterministic A&P finishing: resolve "[date of service]" placeholders,
     # drop a fabricated Charlson score when no CCI calculator was run, and remove
-    # any duplicated leading section header the LLM emitted.
-    _has_cci = bool(calculator_results) and any(
-        ('cci' in str(k).lower() or 'charlson' in str(k).lower())
-        for k in (calculator_results or {}).keys())
+    # any duplicated leading section header the LLM emitted. (has_cci is passed in
+    # from build_stage2_note, which holds calculator_results.)
     if assessment:
         assessment = _scrub_ap_artifacts(_strip_leading_header(assessment, "ASSESSMENT"),
-                                         _has_cci)
+                                         has_cci)
     if plan:
-        plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), _has_cci)
+        plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), has_cci)
 
     # Add Assessment
     if assessment and assessment.strip():
