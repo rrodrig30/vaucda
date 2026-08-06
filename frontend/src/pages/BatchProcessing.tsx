@@ -57,6 +57,34 @@ function triggerDownload(filename: string, content: string) {
   URL.revokeObjectURL(url)
 }
 
+// Save a single file, letting the user CHOOSE the destination via the File
+// System Access "Save As" dialog (Chrome/Edge/Opera). Falls back to a plain
+// browser download into the default download folder on Firefox/Safari.
+// Returns false only on a real error (AbortError = user cancelled, treated as
+// a no-op success). Never throws.
+async function saveFileWithPicker(filename: string, content: string): Promise<boolean> {
+  if (typeof (window as any).showSaveFilePicker === 'function') {
+    try {
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName: filename,
+        types: [{
+          description: 'VAUCDA note',
+          accept: { 'text/plain': ['.vaucda', '.txt'] },
+        }],
+      })
+      const writable = await handle.createWritable()
+      await writable.write(content)
+      await writable.close()
+      return true
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return true // user cancelled — no-op
+      // Any other error (e.g. permission) → fall back to a normal download.
+    }
+  }
+  triggerDownload(filename, content)
+  return true
+}
+
 // File System Access API: returns true on browsers (Chrome/Edge/Opera)
 // where we can request a writable directory handle and stream `.vaucda`
 // files into an `output/` subfolder of the user's chosen input folder.
@@ -390,6 +418,54 @@ export const BatchProcessing: React.FC = () => {
     }
   }, [dirHandle, completedFiles, totalContent])
 
+  // Download ALL completed notes (+ combined total.vaucda) to a folder the
+  // user picks on the spot — independent of how the input was selected. On
+  // Chrome/Edge/Opera one folder prompt writes every file directly; on other
+  // browsers it falls back to sequential downloads into the default folder.
+  const handleDownloadAllToFolder = useCallback(async () => {
+    const files = completedFiles.filter(cf => cf.status === 'completed' && cf.noteContent)
+    if (files.length === 0) return
+    setFolderSaveError(null)
+    if (typeof (window as any).showDirectoryPicker === 'function') {
+      let handle: any
+      try {
+        handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' })
+      } catch (err: any) {
+        if (err?.name !== 'AbortError') {
+          setFolderSaveError(`Could not open folder: ${err?.message || String(err)}`)
+        }
+        return
+      }
+      let written = 0
+      const errors: string[] = []
+      for (const cf of files) {
+        try {
+          await writeFileToDir(handle, cf.outputFilename, cf.noteContent!)
+          written++
+        } catch (err: any) {
+          errors.push(`${cf.outputFilename}: ${err?.message || String(err)}`)
+        }
+      }
+      if (totalContent) {
+        try {
+          await writeFileToDir(handle, 'total.vaucda', totalContent)
+          written++
+        } catch (err: any) {
+          errors.push(`total.vaucda: ${err?.message || String(err)}`)
+        }
+      }
+      setCompletedFiles(prev => prev.map(cf =>
+        cf.status === 'completed' ? { ...cf, savedToFolder: true } : cf))
+      setFolderSaveError(errors.length > 0
+        ? `Wrote ${written} to ${handle.name}; failed: ${errors.join('; ')}`
+        : `Saved ${written} file(s) to ${handle.name}.`)
+      return
+    }
+    // Fallback: sequential browser downloads.
+    for (const cf of files) triggerDownload(cf.outputFilename, cf.noteContent!)
+    if (totalContent) triggerDownload('total.vaucda', totalContent)
+  }, [completedFiles, totalContent])
+
   const handleCancelBatch = useCallback(() => {
     if (abortRef.current) {
       abortRef.current.abort()
@@ -703,8 +779,17 @@ export const BatchProcessing: React.FC = () => {
                       Save all to {folderName}/output/
                     </Button>
                   )}
+                  {completedFiles.some(cf => cf.status === 'completed' && cf.noteContent) && (
+                    <Button
+                      onClick={handleDownloadAllToFolder}
+                      className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 w-fit"
+                      aria-label="Download all processed files to a folder you choose"
+                    >
+                      <FiFolder className="w-4 h-4" aria-hidden="true" /> Download all to folder…
+                    </Button>
+                  )}
                   {totalContent && (
-                    <Button onClick={() => triggerDownload('total.vaucda', totalContent)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 w-fit" aria-label="Download total.vaucda (all notes combined)">
+                    <Button onClick={() => saveFileWithPicker('total.vaucda', totalContent)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 w-fit" aria-label="Download total.vaucda (all notes combined) — choose where to save">
                       <FiDownload className="w-4 h-4" aria-hidden="true" /> Download total.vaucda (all notes combined)
                     </Button>
                   )}
@@ -716,8 +801,8 @@ export const BatchProcessing: React.FC = () => {
                 )}
                 <p className="text-xs text-gray-500 dark:text-gray-400">
                   {dirHandle
-                    ? `Files were written to ${folderName}/output/ as each completed. Re-save anytime with the button above.`
-                    : 'Use the download buttons in the table below for individual files.'}
+                    ? `Files were written to ${folderName}/output/ as each completed. Use “Download all to folder…” to save everywhere else, or the per-row button to save one file where you choose.`
+                    : 'Use “Download all to folder…” to save every note to a folder you pick, or the per-row button to save one file where you choose.'}
                 </p>
               </div>
             )}
@@ -732,7 +817,7 @@ export const BatchProcessing: React.FC = () => {
                       <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">File</th>
                       <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Type</th>
                       <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Time</th>
-                      <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Re-download</th>
+                      <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Download</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -750,7 +835,7 @@ export const BatchProcessing: React.FC = () => {
                         </td>
                         <td className="py-2 px-3">
                           {cf.status === 'completed' && cf.noteContent && (
-                            <button onClick={() => triggerDownload(cf.outputFilename, cf.noteContent!)} className="text-blue-600 hover:text-blue-800 dark:text-blue-400" aria-label={`Re-download ${cf.outputFilename}`}>
+                            <button onClick={() => saveFileWithPicker(cf.outputFilename, cf.noteContent!)} className="text-blue-600 hover:text-blue-800 dark:text-blue-400" aria-label={`Download ${cf.outputFilename} — choose where to save`}>
                               <FiDownload className="w-4 h-4" />
                             </button>
                           )}

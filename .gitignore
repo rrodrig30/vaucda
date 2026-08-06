@@ -149,3 +149,11 @@ backend/venv
 backend/database/run_graphrag_migration.py
 docker-compose.dev.yml
 md_docs/ADDENDUM_CROSS_SPECIALTY_AND_TEMPORAL_PROGRESSION.md
+
+# HIPAA: never track tests or test data in the repo — they embed patient charts
+# (real PHI: SSN/DOB/names). Kept locally, ignored by git. See scripts/purge_phi.sh.
+/tests/
+backend/tests/
+backend/test_data/
+backend/test_*.py
+backend/debug_*.py
