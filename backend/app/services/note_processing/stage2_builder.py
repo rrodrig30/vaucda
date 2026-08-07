@@ -316,6 +316,10 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     header."""
     if not text:
         return text
+    # Strip LLM meta-preamble the rewrite loops prepend ("Here is the rewritten
+    # treatment plan ...:", "Below is the updated assessment:").
+    text = re.sub(r"^\s*(?:here\s+is|here'?s|below\s+is|the\s+following\s+is|"
+                  r"sure[,!]?\s+here)\b[^\n:]{0,90}:\s*\n?", "", text, count=1, flags=re.I)
     text = _AP_DATE_PLACEHOLDER.sub(" today", text)
     text = _AP_BRACKET_PLACEHOLDER.sub("", text)
     if not has_cci:
