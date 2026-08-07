@@ -1326,6 +1326,19 @@ def build_urology_note(
 
     synthesis_tasks['psma_table'] = _psma_table_task
 
+    # Deterministic PSA doubling-time table (VAUCDA_PSADT). One row per
+    # continuously-rising phase (nadir -> highest PSA), so a post-prostatectomy
+    # biochemical recurrence and a later post-salvage-radiation rise each get
+    # their own dated PSADT. Parses the authoritative PSA curve; LLM-free.
+    def _psadt_task():
+        try:
+            from .psa_doubling_time import build_psadt_section
+            return build_psadt_section(_doc_psa or "")
+        except Exception as _pe:  # noqa: BLE001
+            logger.warning(f"PSADT section skipped: {_pe}")
+            return ""
+    synthesis_tasks['psadt_table'] = _psadt_task
+
     synthesis_tasks['ros'] = lambda: synthesize_ros(gu_notes, non_gu_notes)
 
     # Capture patient_sex in closure
@@ -1443,6 +1456,7 @@ def build_urology_note(
     imaging = results.get('imaging', '')
     lesion_table = results.get('lesion_table', '')
     psma_table = results.get('psma_table', '')
+    psadt_table = results.get('psadt_table', '')
     ros = results.get('ros', '')
     pe = results.get('pe', '')
 
@@ -1478,6 +1492,7 @@ def build_urology_note(
         imaging=imaging,
         lesion_table=lesion_table,
         psma_table=psma_table,
+        psadt_table=psadt_table,
         ros=ros,
         pe=pe,
         is_consult=is_consult,
@@ -1746,6 +1761,10 @@ def assemble_note(**sections) -> str:
     # PSA Curve - MALE ONLY (females do not have prostate, no PSA screening)
     if not is_female and sections.get("psa"):
         note_parts.append(f"PSA CURVE:\n{sections['psa']}\n")
+
+    # PSA doubling time — one dated interval per continuously-rising phase
+    if not is_female and sections.get("psadt_table"):
+        note_parts.append(f"\n{sections['psadt_table']}\n")
 
     # ADT status + injection scheduler (prostate cancer on hormone therapy)
     if not is_female and sections.get("adt"):
