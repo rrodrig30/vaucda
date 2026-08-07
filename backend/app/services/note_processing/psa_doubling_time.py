@@ -72,22 +72,84 @@ def _days_between(a: Ymd, b: Ymd) -> int:
     return (date(*b) - date(*a)).days
 
 
+def _allowed_drop(prev_v: float) -> float:
+    """Largest drop from prev_v that is still 'natural variability' (stays in the
+    group). LOW RANGE (<1.0 ng/mL) is intentionally more forgiving — a 10% swing
+    there is a tiny absolute change / assay noise — so a minor low fluctuation
+    can't fragment a rising trend: up to 20% or an absolute floor of 0.05 ng/mL.
+    At/above 1.0 the standard 10% applies."""
+    if prev_v < 1.0:
+        return max(0.20 * prev_v, 0.05)
+    return 0.10 * prev_v
+
+
 def _rising_groups(series: List[Tuple[Ymd, float]]) -> List[List[Tuple[Ymd, float]]]:
-    """Segment into runs separated by a >=10% drop. Within a run, rising / equal /
-    <10% dips are all kept (natural variability)."""
+    """Segment into runs separated by a SIGNIFICANT drop. Within a run, rising,
+    equal, and minor dips (per _allowed_drop) are kept."""
     if not series:
         return []
     groups, cur = [], [series[0]]
     for i in range(1, len(series)):
         prev_v, cur_v = series[i - 1][1], series[i][1]
-        # a drop of <10% (or any rise / equality) keeps the group going
-        if cur_v > prev_v * 0.90:
+        if cur_v >= prev_v - _allowed_drop(prev_v):
             cur.append(series[i])
         else:
             groups.append(cur)
             cur = [series[i]]
     groups.append(cur)
     return groups
+
+
+# STRONG definitive-treatment phrases only (bare "RP"/"radiation" match note
+# headers and generic prose, so they are excluded) with a TIGHTLY-adjacent date.
+_TX_KW = re.compile(
+    r"(?:radical\s+prostatectomy|prostatectom\w*|\bRRP\b|\bRALP\b|"
+    r"\bEBRT\b|\bXRT\b|\bIMRT\b|\bVMAT\b|brachytherap\w*|\bSBRT\b|"
+    r"salvage\s+(?:radiation|radiotherapy|rt)|external\s+beam(?:\s+radiation)?|"
+    r"radiation\s+therapy|radiotherapy)", re.I)
+# date must sit within ~30 chars AFTER the treatment phrase (or ~10 before) —
+# "s/p RRP 2018", "prostatectomy 1/2022", "completion of XRT 6/2025"
+_DATE_TOK = re.compile(r"(\d{1,2})[/-](?:(\d{1,2})[/-])?((?:19|20)\d{2})|\b((?:19|20)\d{2})\b")
+
+
+def _treatment_dates(chart: str) -> List[Ymd]:
+    """Dates of documented definitive treatments (RP / radiation / salvage) for
+    treatment-aware nadir detection. Deliberately conservative — a missed date is
+    fine (the >=50% drop test carries the common case); a false one is not."""
+    out: List[Ymd] = []
+    if not chart:
+        return out
+    for km in _TX_KW.finditer(chart):
+        window = chart[km.start():km.end() + 30]        # forward-adjacent only
+        dm = _DATE_TOK.search(window)
+        if not dm:
+            continue
+        if dm.group(4):                                 # bare 4-digit year
+            y, mm, dd = int(dm.group(4)), 6, 15
+        else:
+            mm = int(dm.group(1))
+            y = int(dm.group(3))
+            dd = int(dm.group(2)) if dm.group(2) and 1 <= int(dm.group(2)) <= 31 else 15
+            if not (1 <= mm <= 12):
+                continue
+        if 1990 <= y <= 2100:
+            out.append((y, mm, dd))
+    return out
+
+
+def _is_real_nadir(nadir_ymd: Ymd, nadir_val: float,
+                   series: List[Tuple[Ymd, float]], tx_dates: List[Ymd]) -> bool:
+    """A REAL nadir is a genuine treatment-response trough, not a minor dip.
+    When earlier PSA exists, require a >=50% drop from the highest prior PSA — the
+    treatment-induced fall is itself the treatment signal, so this is robust to
+    noisy treatment-date parsing. Only when the record STARTS at this nadir (no
+    earlier PSA) do we fall back to documented treatment, and only for a clearly
+    post-treatment low (<0.5 ng/mL) so a pre-diagnosis opening value can't slip
+    through on a stray date."""
+    prior = [v for (d, v) in series if d < nadir_ymd]
+    if prior:
+        return nadir_val <= max(prior) * 0.5
+    return nadir_val < 0.5 and any(td < nadir_ymd for td in tx_dates)
 
 
 def _psadt_for_group(group: List[Tuple[Ymd, float]]) -> Optional[PSADTResult]:
@@ -112,22 +174,18 @@ def _psadt_for_group(group: List[Tuple[Ymd, float]]) -> Optional[PSADTResult]:
     return PSADTResult(nadir[0], nadir[1], peak[0], peak[1], n, psadt)
 
 
-def compute_psadt(psa_data: str) -> List[PSADTResult]:
-    """PSADT intervals for the chart's PSA series, chronological. A true nadir is
-    a TROUGH — every group after the first begins after a >=10% drop, so its start
-    is a genuine post-decline nadir. The FIRST group is the record's opening phase;
-    it is a real nadir only when the record itself starts at a (low) post-treatment
-    nadir — so it is skipped when it opens from a higher pre-treatment baseline
-    (>=0.5 ng/mL), which would otherwise lump the lifetime diagnostic rise into one
-    bogus interval."""
+def compute_psadt(psa_data: str, chart_text: str = "") -> List[PSADTResult]:
+    """PSADT intervals for the chart's PSA series, chronological. A rising phase
+    is reported ONLY when it starts from a REAL nadir — a genuine treatment-
+    response trough (>=50% drop from a prior peak) or a nadir that follows a
+    documented definitive treatment — so pre-diagnosis rises and minor
+    fluctuations are not reported as spurious doubling times."""
     series = _parse_psa(psa_data)
-    groups = _rising_groups(series)
+    tx_dates = _treatment_dates(chart_text)
     results = []
-    for gi, g in enumerate(groups):
-        if gi == 0 and min(p[1] for p in g) >= 0.5:
-            continue
+    for g in _rising_groups(series):
         r = _psadt_for_group(g)
-        if r is not None:
+        if r is not None and _is_real_nadir(r.nadir_ymd, r.nadir_val, series, tx_dates):
             results.append(r)
     return results
 
@@ -169,11 +227,12 @@ def render_psadt_table(results: List[PSADTResult]) -> str:
     return "\n".join(out)
 
 
-def build_psadt_section(psa_data: str) -> str:
-    """Gated (VAUCDA_PSADT, default on) rendered PSADT table, or '' if none."""
+def build_psadt_section(psa_data: str, chart_text: str = "") -> str:
+    """Gated (VAUCDA_PSADT, default on) rendered PSADT table, or '' if none.
+    chart_text supplies treatment context for treatment-aware nadir detection."""
     if os.environ.get("VAUCDA_PSADT", "1") != "1":
         return ""
     try:
-        return render_psadt_table(compute_psadt(psa_data))
+        return render_psadt_table(compute_psadt(psa_data, chart_text))
     except Exception:  # never break note assembly
         return ""

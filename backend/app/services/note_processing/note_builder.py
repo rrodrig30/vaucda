@@ -1333,7 +1333,7 @@ def build_urology_note(
     def _psadt_task():
         try:
             from .psa_doubling_time import build_psadt_section
-            return build_psadt_section(_doc_psa or "")
+            return build_psadt_section(_doc_psa or "", _raw_clinical_text or "")
         except Exception as _pe:  # noqa: BLE001
             logger.warning(f"PSADT section skipped: {_pe}")
             return ""
