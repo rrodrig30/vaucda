@@ -78,15 +78,25 @@ _METASTATIC_RE = re.compile(
 # metastatic disease", "negative for metastasis", "no convincing … metastatic".
 _META_NEG = re.compile(
     r"(?:\bno\b|without|negative\s+for|free\s+of|ruled?\s+out|denies|resolved|"
-    r"no\s+evidence\s+of|no\s+convincing|not\b|\bnon-)[^.\n]{0,30}$", re.I)
+    r"no\s+evidence\s+of|no\s+convincing|not\b|\bnon-)[^.\n]{0,40}$", re.I)
+# EQUIVOCAL / hedged metastatic mention — a radiology "may represent early nodal
+# metastasis" is NOT confirmed metastatic disease and must not drive continuous
+# ADT. Skipped like a negation.
+_META_EQUIVOCAL = re.compile(
+    r"(?:may\s+(?:represent|be)|might\s+(?:represent|be)|possibl\w+|"
+    r"suspicious\s+for|concerning\s+for|worrisome\s+for|question\w+|"
+    r"cannot\s+(?:be\s+)?exclud\w+|suggestive\s+of|could\s+(?:represent|be)|"
+    r"equivocal|indeterminate|early\s+nodal|favor\w*|versus|vs\.?)"
+    r"[^.\n]{0,40}$", re.I)
 
 
 def _is_metastatic(text: str) -> bool:
-    """True only when a metastatic mention appears NON-negated somewhere — so
-    'metastatic castration-resistant …' (mCRPC) counts, but a chart whose only
-    metastatic word is 'no evidence of metastatic disease' does not."""
+    """True only when a metastatic mention appears NON-negated AND NON-equivocal —
+    so 'metastatic castration-resistant …' (mCRPC) counts, but 'no evidence of
+    metastatic disease' and 'may represent early nodal metastasis' do not."""
     for m in _METASTATIC_RE.finditer(text):
-        if not _META_NEG.search(text[max(0, m.start() - 35):m.start()]):
+        ctx = text[max(0, m.start() - 40):m.start()]
+        if not _META_NEG.search(ctx) and not _META_EQUIVOCAL.search(ctx):
             return True
     return False
 _INTERMITTENT_RE = re.compile(r"intermittent\s+(?:adt|androgen|hormon|therapy)", re.I)
