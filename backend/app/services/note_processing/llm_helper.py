@@ -139,6 +139,22 @@ class LLMProviderError(Exception):
     pass
 
 
+def _infer_provider_from_model(model: Optional[str]) -> str:
+    """Best-effort provider for a bare model name, so a cloud-provider model that
+    reaches the legacy path (no task_config in scope — e.g. a worker thread where
+    the thread-local config didn't propagate) is NOT POSTed to Ollama (which 404s
+    on 'claude-opus-5'). Ollama models carry a ':tag' (llama3.1:8b,
+    gpt-oss:120b-cloud, deepseek-v4-pro:cloud) and stay local regardless of family."""
+    m = (model or "").strip().lower()
+    if not m or ":" in m:
+        return "ollama"
+    if m.startswith("claude") or m.startswith("anthropic"):
+        return "anthropic"
+    if m.startswith(("gpt-", "gpt4", "chatgpt", "o1", "o3", "o4")):
+        return "openai"
+    return "ollama"
+
+
 def synthesize_with_llm(
     prompt: str,
     model: Optional[str] = None,
@@ -178,9 +194,27 @@ def synthesize_with_llm(
     if current_config is not None:
         return _synthesize_with_config(prompt, current_config, system_prompt)
 
-    # Legacy behavior: use Ollama directly
+    # Legacy behavior: no task_config in scope.
     if model is None:
         model = settings.OLLAMA_DEFAULT_MODEL
+
+    # A caller may pass the user's configured Anthropic/OpenAI model here without a
+    # task_config (e.g. from a worker thread where the thread-local config didn't
+    # propagate). Route by the model name so a Claude/GPT model isn't mis-sent to
+    # Ollama (404). Ollama-tagged models (':') stay on the local path below.
+    _inferred = _infer_provider_from_model(model)
+    if _inferred != "ollama":
+        from app.services.llm_config_manager import LLMTaskConfig
+        _cfg = LLMTaskConfig(
+            provider=_inferred,
+            model=model,
+            temperature=temperature,
+            max_tokens=(max_tokens if max_tokens is not None else
+                        settings.ANTHROPIC_MAX_TOKENS if _inferred == "anthropic"
+                        else settings.OPENAI_MAX_TOKENS),
+        )
+        logger.info(f"Legacy path routing '{model}' to {_inferred} (no task_config in scope)")
+        return _synthesize_with_config(prompt, _cfg, system_prompt)
 
     if max_tokens is None:
         max_tokens = settings.OLLAMA_MAX_TOKENS
