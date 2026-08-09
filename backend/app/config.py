@@ -136,7 +136,7 @@ class Settings(BaseSettings):
 
     # LLM - Anthropic (Optional)
     ANTHROPIC_API_KEY: Optional[str] = None
-    ANTHROPIC_DEFAULT_MODEL: str = "claude-3-5-sonnet-20250101"
+    ANTHROPIC_DEFAULT_MODEL: str = "claude-opus-5"
     ANTHROPIC_MAX_TOKENS: int = 8096
     ANTHROPIC_TIMEOUT: int = 3600  # 1 hour timeout for complex note generation
 
