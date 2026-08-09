@@ -448,6 +448,29 @@ async def _call_ollama_async(
     raise LLMProviderError(f"Ollama overloaded after {max_retries} retries")
 
 
+# Newer Claude models (and OpenAI reasoning models like o1/o3) have DEPRECATED
+# the `temperature` parameter and reject any request that includes it with a 400
+# ("`temperature` is deprecated for this model."). We can't know per-model up
+# front, so learn on first rejection and omit `temperature` proactively for that
+# model thereafter — avoiding a wasted 400 on each of the ~20 per-note agents.
+_TEMP_UNSUPPORTED_MODELS: set = set()
+
+
+def _strip_unsupported_temperature(payload: dict) -> None:
+    if payload.get("model") in _TEMP_UNSUPPORTED_MODELS:
+        payload.pop("temperature", None)
+
+
+def _is_temperature_rejection(status_code: int, body: str) -> bool:
+    return status_code == 400 and "temperature" in (body or "").lower()
+
+
+def _note_temperature_unsupported(model: str) -> None:
+    if model and model not in _TEMP_UNSUPPORTED_MODELS:
+        _TEMP_UNSUPPORTED_MODELS.add(model)
+        logger.info("Model %s rejects 'temperature'; omitting it going forward", model)
+
+
 def _call_anthropic_sync(
     prompt: str,
     config: "LLMTaskConfig",
@@ -476,12 +499,20 @@ def _call_anthropic_sync(
         payload["system"] = system_prompt
 
     try:
+        _strip_unsupported_temperature(payload)
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers,
             json=payload,
             timeout=settings.ANTHROPIC_TIMEOUT
         )
+        if _is_temperature_rejection(response.status_code, response.text):
+            _note_temperature_unsupported(config.model)
+            payload.pop("temperature", None)
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers, json=payload, timeout=settings.ANTHROPIC_TIMEOUT,
+            )
         response.raise_for_status()
 
         result = response.json()
@@ -492,6 +523,10 @@ def _call_anthropic_sync(
     except requests.exceptions.Timeout:
         logger.error(f"Anthropic timeout after {settings.ANTHROPIC_TIMEOUT}s")
         raise LLMProviderError(f"Anthropic timeout for model {config.model}")
+    except requests.exceptions.HTTPError as e:
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        logger.error(f"Anthropic call failed: {e} | {body[:300]}")
+        raise LLMProviderError(f"Anthropic call failed: {e}: {body[:200]}")
     except Exception as e:
         logger.error(f"Anthropic call failed: {e}")
         raise LLMProviderError(f"Anthropic call failed: {e}")
@@ -524,12 +559,20 @@ def _call_openai_sync(
     }
 
     try:
+        _strip_unsupported_temperature(payload)
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=settings.OPENAI_TIMEOUT
         )
+        if _is_temperature_rejection(response.status_code, response.text):
+            _note_temperature_unsupported(config.model)
+            payload.pop("temperature", None)
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers, json=payload, timeout=settings.OPENAI_TIMEOUT,
+            )
         response.raise_for_status()
 
         result = response.json()
@@ -541,6 +584,10 @@ def _call_openai_sync(
     except requests.exceptions.Timeout:
         logger.error(f"OpenAI timeout after {settings.OPENAI_TIMEOUT}s")
         raise LLMProviderError(f"OpenAI timeout for model {config.model}")
+    except requests.exceptions.HTTPError as e:
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        logger.error(f"OpenAI call failed: {e} | {body[:300]}")
+        raise LLMProviderError(f"OpenAI call failed: {e}: {body[:200]}")
     except Exception as e:
         logger.error(f"OpenAI call failed: {e}")
         raise LLMProviderError(f"OpenAI call failed: {e}")
@@ -640,12 +687,20 @@ async def _call_anthropic_async(
         payload["system"] = system_prompt
 
     try:
+        _strip_unsupported_temperature(payload)
         async with httpx.AsyncClient(timeout=settings.ANTHROPIC_TIMEOUT) as client:
             response = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=headers,
                 json=payload
             )
+            if _is_temperature_rejection(response.status_code, response.text):
+                _note_temperature_unsupported(config.model)
+                payload.pop("temperature", None)
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers, json=payload,
+                )
             response.raise_for_status()
 
             result = response.json()
@@ -688,12 +743,20 @@ async def _call_openai_async(
     }
 
     try:
+        _strip_unsupported_temperature(payload)
         async with httpx.AsyncClient(timeout=settings.OPENAI_TIMEOUT) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
                 json=payload
             )
+            if _is_temperature_rejection(response.status_code, response.text):
+                _note_temperature_unsupported(config.model)
+                payload.pop("temperature", None)
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers, json=payload,
+                )
             response.raise_for_status()
 
             result = response.json()
