@@ -627,6 +627,48 @@ class ClinicalEntityExtractor:
         logger.debug(f"Extracted comorbidities from PMH (grounded): {comorbidities}")
         return comorbidities
 
+    async def _generate_extraction(self, prompt: str) -> str:
+        """Run the extraction LLM call through the note-synthesis router when a
+        provider/model is known (unifying provider routing + temperature handling
+        with the rest of the pipeline). Falls back to the high-availability manager
+        only when no provider/model can be resolved (e.g. ad-hoc API endpoints)."""
+        import asyncio
+        provider = getattr(self, '_provider', None)
+        model = getattr(self, '_model', None)
+        try:
+            from app.services.note_processing.llm_helper import (
+                synthesize_with_llm,
+                get_current_task_config,
+                _infer_provider_from_model,
+            )
+            if not model:
+                cfg = get_current_task_config()
+                if cfg is not None:
+                    provider, model = cfg.provider, cfg.model
+            if model:
+                from app.services.llm_config_manager import LLMTaskConfig
+                task_cfg = LLMTaskConfig(
+                    provider=(provider or _infer_provider_from_model(model)),
+                    model=model,
+                    temperature=0.0,   # deterministic extraction
+                    max_tokens=500,
+                )
+                return await asyncio.to_thread(
+                    synthesize_with_llm, prompt, task_config=task_cfg
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Unified extraction routing unavailable ({e}); using HA manager")
+
+        # Fallback: high-availability multi-provider manager.
+        response = await self.llm_manager.generate(
+            prompt=prompt,
+            provider=provider,
+            model=model,
+            temperature=0.0,
+            max_tokens=500,
+        )
+        return response.content if hasattr(response, 'content') else str(response)
+
     async def _extract_with_llm(self, text: str, existing_entities: List[Dict]) -> List[Dict[str, Any]]:
         """Use LLM to extract entities that regex might miss."""
 
@@ -690,19 +732,11 @@ If a value is not mentioned or unclear, do not include it in the JSON.
 Return ONLY the JSON object, no additional text."""
 
         try:
-            # Use the configured extraction model
-            # Default uses LLM Manager's primary provider. Can be overridden
-            # by passing provider/model to the constructor or via task_config.
-            response = await self.llm_manager.generate(
-                prompt=prompt,
-                provider=getattr(self, '_provider', None),
-                model=getattr(self, '_model', None),
-                temperature=0.0,  # Deterministic
-                max_tokens=500
-            )
-
-            # Parse JSON response - extract content from LLMResponse object
-            response_text = response.content if hasattr(response, 'content') else str(response)
+            # Route through the SAME provider router the note pipeline uses, so
+            # entity extraction honors the configured provider (Anthropic/OpenAI/
+            # Ollama) with identical temperature-deprecation handling — instead of
+            # the separate HA fallback chain that doesn't see UI-managed keys.
+            response_text = await self._generate_extraction(prompt)
             json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
             if json_match:
                 extracted_data = json.loads(json_match.group(0))
