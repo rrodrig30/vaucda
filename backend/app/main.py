@@ -58,6 +58,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
 
+    # Apply any UI-managed LLM provider API keys to the live settings object so
+    # the note-generation pipeline picks them up (stored keys override env).
+    try:
+        from app.core.api_key_store import apply_to_settings as _apply_llm_keys
+        _apply_llm_keys()
+    except Exception as e:
+        logger.error(f"Failed to apply stored LLM API keys: {e}")
+
     # Initialize SQLite database
     try:
         await init_db()

@@ -12,6 +12,7 @@ from app.core.security import get_optional_user, get_current_user
 from app.database.sqlite_models import User, UserPreferences, UserRule
 from app.database.sqlite_session import get_db
 from app.config import settings
+from app.core.api_key_store import key_hint, set_key
 from cryptography.fernet import Fernet
 from datetime import datetime
 import logging
@@ -60,6 +61,13 @@ class UserSettingsResponse(BaseModel):
     module_defaults: Optional[Dict[str, Any]] = Field(None, description="Default modules configuration")
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
     openevidence_configured: bool = Field(False, description="Whether OpenEvidence is configured")
+
+    # LLM provider API keys — never return the key itself, only whether one is
+    # configured plus a masked last-4 hint for display.
+    anthropic_configured: bool = Field(False, description="Whether an Anthropic API key is set")
+    openai_configured: bool = Field(False, description="Whether an OpenAI API key is set")
+    anthropic_key_hint: Optional[str] = Field(None, description="Masked hint (last 4) for the Anthropic key")
+    openai_key_hint: Optional[str] = Field(None, description="Masked hint (last 4) for the OpenAI key")
 
     source_format: str = Field(
         "cprs",
@@ -115,6 +123,10 @@ class UserSettingsUpdate(BaseModel):
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
     openevidence_username: Optional[str] = Field(None, description="OpenEvidence username")
     openevidence_password: Optional[str] = Field(None, description="OpenEvidence password")
+    # LLM provider API keys (system-wide). Send a value to set, "" to clear,
+    # omit/None to leave unchanged.
+    anthropic_api_key: Optional[str] = Field(None, description="Anthropic API key")
+    openai_api_key: Optional[str] = Field(None, description="OpenAI API key")
     source_format: Optional[str] = Field(
         None, description="Source EHR format: 'cprs' or 'vista'",
     )
@@ -187,6 +199,10 @@ async def get_settings(
                 module_defaults={},
                 display_preferences={},
                 openevidence_configured=False,
+                anthropic_configured=bool(settings.ANTHROPIC_API_KEY),
+                openai_configured=bool(settings.OPENAI_API_KEY),
+                anthropic_key_hint=key_hint("anthropic"),
+                openai_key_hint=key_hint("openai"),
                 source_format="cprs",
             )
 
@@ -257,6 +273,10 @@ async def get_settings(
             module_defaults=prefs.module_defaults,
             display_preferences=prefs.display_preferences,
             openevidence_configured=bool(current_user.openevidence_username),
+            anthropic_configured=bool(settings.ANTHROPIC_API_KEY),
+            openai_configured=bool(settings.OPENAI_API_KEY),
+            anthropic_key_hint=key_hint("anthropic"),
+            openai_key_hint=key_hint("openai"),
             source_format=(prefs.source_format or "cprs"),
         )
 
@@ -399,6 +419,13 @@ async def update_settings(
             encrypted = fernet.encrypt(settings_update.openevidence_password.encode())
             current_user.openevidence_password_encrypted = encrypted.decode()
 
+        # Update LLM provider API keys (system-wide, encrypted at rest, applied
+        # to the live settings object immediately). "" clears; None leaves as-is.
+        if settings_update.anthropic_api_key is not None:
+            set_key("anthropic", settings_update.anthropic_api_key)
+        if settings_update.openai_api_key is not None:
+            set_key("openai", settings_update.openai_api_key)
+
         # Commit changes
         await db.commit()
         await db.refresh(prefs)
@@ -452,6 +479,10 @@ async def update_settings(
             module_defaults=prefs.module_defaults,
             display_preferences=prefs.display_preferences,
             openevidence_configured=bool(current_user.openevidence_username),
+            anthropic_configured=bool(settings.ANTHROPIC_API_KEY),
+            openai_configured=bool(settings.OPENAI_API_KEY),
+            anthropic_key_hint=key_hint("anthropic"),
+            openai_key_hint=key_hint("openai"),
             source_format=(prefs.source_format or "cprs"),
         )
 

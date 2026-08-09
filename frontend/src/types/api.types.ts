@@ -231,6 +231,12 @@ export interface UserSettings {
   stage2_llm?: Stage2LLMConfig
   // Source EHR format of pasted/uploaded charts: 'cprs' (default) or 'vista'.
   source_format?: 'cprs' | 'vista'
+  // LLM provider API keys — server never returns the key itself, only whether
+  // one is configured plus a masked last-4 hint.
+  anthropic_configured?: boolean
+  openai_configured?: boolean
+  anthropic_key_hint?: string | null
+  openai_key_hint?: string | null
 }
 
 export interface ModuleDefaults {
@@ -286,6 +292,9 @@ export interface UpdateSettingsRequest {
   stage2_use_graphrag?: boolean
   stage2_rag_top_k?: number
   source_format?: 'cprs' | 'vista'
+  // LLM provider API keys: send a value to set, '' to clear, omit to leave as-is.
+  anthropic_api_key?: string
+  openai_api_key?: string
 }
 
 // Task-Specific LLM Configuration
