@@ -37,6 +37,11 @@ _SETTINGS_ATTR = {
     "openai": "OPENAI_API_KEY",
 }
 
+# The deployment's original .env-provided keys, captured at import BEFORE any
+# UI-managed override is applied. Clearing a UI key reverts to this value rather
+# than nulling a key the deployment configured via environment.
+_ENV_KEYS = {p: getattr(settings, _SETTINGS_ATTR[p], None) for p in PROVIDERS}
+
 
 def _fernet() -> Fernet:
     """Fernet built from OPENEVIDENCE_ENCRYPTION_KEY (already a valid Fernet key
@@ -93,8 +98,8 @@ def set_key(provider: str, key: Optional[str]) -> None:
     else:
         keys.pop(provider, None)
     _write_keys(keys)
-    # Reflect immediately into runtime settings.
-    setattr(settings, _SETTINGS_ATTR[provider], key or None)
+    # Reflect immediately into runtime settings; clearing reverts to the env key.
+    setattr(settings, _SETTINGS_ATTR[provider], key or _ENV_KEYS.get(provider))
     logger.info("LLM API key for %s %s", provider, "set" if key else "cleared")
 
 
