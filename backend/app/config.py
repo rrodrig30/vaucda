@@ -247,11 +247,14 @@ class Settings(BaseSettings):
     BATCH_MAX_FILES: int = 200  # maximum files in a single batch
     # Reject only ABSURDLY oversized charts before the pipeline. These VistA
     # exports are routinely 150-240K chars (copy-forward bloat) and process fine,
-    # so the guard must clear them — it only blocks the rare monster (400K+) that
-    # would peg the server. The 10-min per-note timeout is the backstop for merely
-    # slow files. (Was 120000, which wrongly rejected normal large charts.)
+    # so the guard must clear them — it only blocks the rare monster that would
+    # peg the server. The 10-min per-note timeout is the backstop for merely slow
+    # files. (Was 120000, which wrongly rejected normal large charts.) Oversized
+    # charts are first passed through copy-forward de-duplication in
+    # batch_processor; the guard applies to the DEDUPED size, so this ceiling only
+    # rejects charts that are genuinely huge even after trimming duplication.
     # 0 disables the guard.
-    BATCH_MAX_FILE_CHARS: int = 350000
+    BATCH_MAX_FILE_CHARS: int = 400000
 
     @property
     def batch_allowed_dirs_list(self) -> List[str]:

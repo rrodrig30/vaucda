@@ -110,6 +110,26 @@ def get_processable_files(folder_path: str) -> List[Path]:
     return files
 
 
+def dedupe_copy_forward(text: str) -> str:
+    """Collapse verbatim copy-forward duplication. VistA/CPRS charts paste whole
+    notes and boilerplate (radiology footers, physical-exam templates, med lists)
+    forward across visits, inflating a chart many-fold. Keep the FIRST occurrence
+    of each unique multi-line block; unique clinical content (PSA values,
+    pathology, medications) is preserved because those blocks differ. Short blocks
+    (<40 chars) are always kept so shared headings/labels aren't collapsed."""
+    blocks = re.split(r'\n[ \t]*\n', text)
+    seen: set = set()
+    out = []
+    for b in blocks:
+        key = "\n".join(ln.rstrip() for ln in b.splitlines()).strip()
+        if len(key) >= 40:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(b)
+    return "\n\n".join(out)
+
+
 async def process_single_file(
     file_path: Path,
     note_type: str,
@@ -146,10 +166,20 @@ async def process_single_file(
     # BATCH_MAX_FILE_CHARS (0 disables).
     _max_chars = getattr(settings, "BATCH_MAX_FILE_CHARS", 0) or 0
     if _max_chars and len(content) > _max_chars:
-        raise ValueError(
-            f"File too large: {len(content):,} chars (limit {_max_chars:,}). "
-            f"Process this chart separately or trim copy-forward duplication."
-        )
+        # Recover oversized charts that are mostly repeated notes/boilerplate by
+        # trimming verbatim copy-forward duplication BEFORE rejecting.
+        deduped = dedupe_copy_forward(content)
+        if len(deduped) < len(content):
+            logger.info(
+                f"{file_path.name}: copy-forward de-dup "
+                f"{len(content):,} -> {len(deduped):,} chars"
+            )
+            content = deduped
+        if len(content) > _max_chars:
+            raise ValueError(
+                f"File too large: {len(content):,} chars (limit {_max_chars:,}) even "
+                f"after copy-forward de-duplication. Process this chart separately."
+            )
 
     # Prepend visit date so extractors (IPSS, age calculation) can use it
     if visit_date:
