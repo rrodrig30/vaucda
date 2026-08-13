@@ -288,6 +288,10 @@ _DECLINE_TRIGGERS = re.compile(
 
 
 # Procedure vocabulary (cystoscopy, urodynamics, biopsy, etc.)
+# Same-procedure findings whose dates fall within this many days are treated as
+# one clinical event (duplicate/addendum notes with header-date drift), not two.
+_PROC_MERGE_WINDOW_DAYS = 2
+
 _PROCEDURE_VOCAB = (
     (r"\bcystoscop(?:y|ies)\b", "cystoscopy"),
     (r"\bcystourethroscop(?:y|ies)\b", "cystourethroscopy"),
@@ -736,7 +740,58 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
         cur = best.get(k)
         if cur is None or _finding_rank(f.finding) > _finding_rank(cur.finding):
             best[k] = f
-    findings = biopsies + list(best.values())
+
+    # Merge the SAME procedure documented within a couple of days — one visit
+    # re-documented as a duplicate/addendum note (VistA literally emits "This is a
+    # duplicate procedure note from the same ... visit") lands on adjacent header
+    # dates, so a single cystoscopy otherwise appears twice (e.g. Dec 06 + Dec 07).
+    # Keep the EARLIEST date (the original procedure) and the most complete finding.
+    # A genuine repeat of the same procedure is months apart and untouched.
+    from datetime import date as _pydate
+
+    def _to_date(dk: str):
+        try:
+            y, m, d = map(int, dk.split("-"))
+            return _pydate(y, m, d)
+        except Exception:
+            return None
+
+    by_proc: dict = {}
+    for f in best.values():
+        by_proc.setdefault(f.procedure, []).append(f)
+
+    merged: List[ProcedureFinding] = []
+    for proc, fs in by_proc.items():
+        fs = sorted(fs, key=lambda f: f.date_key or "9999")
+        used = [False] * len(fs)
+        for i in range(len(fs)):
+            if used[i]:
+                continue
+            group = [fs[i]]
+            used[i] = True
+            di = _to_date(fs[i].date_key)
+            for j in range(i + 1, len(fs)):
+                if used[j]:
+                    continue
+                dj = _to_date(fs[j].date_key)
+                if di and dj and abs((dj - di).days) <= _PROC_MERGE_WINDOW_DAYS:
+                    group.append(fs[j])
+                    used[j] = True
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
+            dated = [g for g in group if g.date_key]
+            earliest = min(dated, key=lambda g: g.date_key) if dated else group[0]
+            richest = max(group, key=lambda g: _finding_rank(g.finding))
+            merged.append(ProcedureFinding(
+                procedure=proc,
+                date_key=earliest.date_key,
+                date_display=earliest.date_display,
+                finding=richest.finding,
+                source_quote=richest.source_quote,
+            ))
+
+    findings = biopsies + merged
 
     findings.sort(key=lambda f: (f.date_key or "0", f.procedure), reverse=True)
     return findings
