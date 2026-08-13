@@ -703,6 +703,41 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
             collapsed.append(next(f for f in pick_from if f.date_key == best))
         findings = [f for f in findings if f.procedure != "prostate biopsy"] + collapsed
 
+    # Collapse multiple matches of the SAME procedure on the SAME date into one
+    # event. A structured procedure note repeats its keyword (report header, CPT
+    # line, body), so each occurrence otherwise becomes a separate finding — one
+    # cystoscopy -> several "reports", same date, different portions (indication vs
+    # CPT vs the actual findings). Keep the most informative finding: most
+    # anatomical/result content, then longest; a bare indication or CPT-only
+    # fragment loses. Prostate biopsy is already collapsed above (date-anchored).
+    def _finding_rank(finding: str) -> tuple:
+        f = (finding or "").strip().lower()
+        result_kw = (
+            "bladder neck", "urethra", "mucosa", "tumor", "trabecul", "orific",
+            "stricture", "diverticul", "erythema", "lesion", "obstruct", "trigone",
+            "ureteral", "prostatic urethra", "bmd", "t-score", "pdet", "qmax",
+            "booi", "gleason", "resect", "normal bladder", "no tumor",
+        )
+        hits = sum(1 for k in result_kw if k in f)
+        penalty = 0
+        if f.startswith("for further evaluation") or f.startswith("for evaluation"):
+            penalty -= 5  # bare indication, not the findings
+        if re.fullmatch(r"[\s(]*\d{4,5}[)\s]*", f):
+            penalty -= 5  # CPT-only fragment
+        return (hits + penalty, len(f))
+
+    best: dict = {}
+    biopsies: List[ProcedureFinding] = []
+    for f in findings:
+        if f.procedure == "prostate biopsy":
+            biopsies.append(f)
+            continue
+        k = (f.procedure, f.date_key)
+        cur = best.get(k)
+        if cur is None or _finding_rank(f.finding) > _finding_rank(cur.finding):
+            best[k] = f
+    findings = biopsies + list(best.values())
+
     findings.sort(key=lambda f: (f.date_key or "0", f.procedure), reverse=True)
     return findings
 
