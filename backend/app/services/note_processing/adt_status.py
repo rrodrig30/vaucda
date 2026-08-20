@@ -99,6 +99,84 @@ def _is_metastatic(text: str) -> bool:
         if not _META_NEG.search(ctx) and not _META_EQUIVOCAL.search(ctx):
             return True
     return False
+
+
+# Metastatic disease is asserted ONLY when DOCUMENTED. Radiology reports comment
+# on metastasis in nearly every study — usually to NEGATE it ("no evidence of
+# metastatic disease", "bone scan (-) for metastatic disease") — and pathology
+# uses "M1" as a specimen/cassette label ("cassette labeled M1", ICD "M1A.9XX0"),
+# so detection is CLAUSE-scoped with aggressive negation/hedge rejection.
+_STRONG_META_RE = re.compile(r"\bmHSPC\b|\bmCRPC\b", re.I)
+_M1_RE = re.compile(r"\b[cp]?M1[abc]?\b", re.I)
+# 'M1' counts as a STAGE only in a staging/disease clause…
+_M1_STAGE_CTX = re.compile(
+    r"stage|\bdisease\b|crpc|hspc|castrat|metasta|\bmets?\b|prostate\s+cancer|"
+    r"high[\s-]?volume|low[\s-]?volume|oligomet", re.I)
+# …and NEVER in a pathology specimen-label / ICD-code clause.
+_PATH_LABEL_CTX = re.compile(
+    r"cassette|specimen|submitted|labell?ed|\bblock\b|inked|microscop|gross|"
+    r"M1[abc]?\.\d|M1[abc]?\s*[-–]\s*(?:prostate|left|right|apex|base|mid)", re.I)
+_IMAGING_CTX_RE = re.compile(
+    r"bone\s+scan|\bCT\b|CAT\s+scan|\bPSMA\b|\bPET\b|\bMRI\b|\bNaF\b|technetium|"
+    r"\bscan\b|imaging|uptake|\bavid\b|sclerotic|lytic|osseous|scintigraph|"
+    r"radiotracer|\blesion", re.I)
+# Any negation / hedge / future-or-order framing ANYWHERE in the clause blocks the
+# assertion — radiology negatives are the dominant failure mode.
+_META_SENT_BLOCK = re.compile(
+    r"\bno\b|\bnot\b|without|negative|no\s+evidence|no\s+convincing|exclud|"
+    r"neither|unremarkable|applicable|rule\s+out|\br/o\b|\bvs\.?\b|versus|"
+    r"differential|suspicious\s+for|concern|worrisome\s+for|possib|"
+    r"\bmay\b|might|equivocal|indeterminate|to\s+suggest|evaluation|evaluat\w+\s+for|"
+    r"work[\s-]?up|\(-\)|not\s+identified|\bif\b|should\s+(?:he|show)|"
+    r"progress\w*\s+to|risk\s+of|screen|to\s+assess|potential|question|\blikely\b|"
+    r"lack\s+of|chance\s+of|c(?:an|ould)\s+occur|"
+    # family history, not the patient
+    r"family\s+history|\bFHx\b|brothers?\s+had|father\s+had|sibling|"
+    r"(?:brother|father|son|relative|paternal|maternal)",
+    re.I)
+# Affirmative diagnosis / positive-finding phrasing for a metastatic mention.
+_META_POSITIVE = re.compile(
+    r"metasta\w*\s+(?:prostate|castrat|castration|disease|cancer|lesion|deposit)|"
+    r"(?:osteoblastic|osseous|sclerotic|lytic|widespread|visceral|nodal|distant|"
+    r"bone|biopsy[\s-]?proven|known|treating|treatment\s+of)\s+\w{0,12}\s*metasta|"
+    r"metasta\w*\s+to\s+(?:bone|the\s+bone|liver|lung|node)|"
+    r"consistent\s+with\s+metasta|followup\s+of\s+metasta|for\s+metastatic\s+prostate",
+    re.I)
+
+
+def _clause(text: str, s: int, e: int) -> str:
+    """A whitespace-NORMALIZED window around [s:e]. Clinical text is line-wrapped,
+    so a sentence split on '\\n' would sever a negation ('no evidence of\\n
+    metastatic disease') from the token; a flattened window keeps them together.
+    The window is deliberately generous on the left (where negation/hedge sits) so
+    detection errs toward NOT asserting metastasis."""
+    return re.sub(r"\s+", " ", text[max(0, s - 140):min(len(text), e + 50)])
+
+
+def _metastatic_documented(text: str) -> bool:
+    """True only when metastatic prostate cancer is DOCUMENTED — an explicit
+    metastatic stage/state (mCRPC / mHSPC / M1 stage) or an AFFIRMATIVE metastatic
+    finding (imaging-corroborated or a metastatic-diagnosis phrase), with the whole
+    clause free of negation/hedge/order framing. Being on ADT, a bare/negated
+    'metastatic' in a radiology impression, or an 'M1' cassette label do NOT
+    qualify — so a short neoadjuvant/adjuvant course is never mislabeled."""
+    for m in _STRONG_META_RE.finditer(text):
+        if not _META_SENT_BLOCK.search(_clause(text, m.start(), m.end())):
+            return True
+    for m in _M1_RE.finditer(text):
+        cl = _clause(text, m.start(), m.end())
+        if (_M1_STAGE_CTX.search(cl) and not _PATH_LABEL_CTX.search(cl)
+                and not _META_SENT_BLOCK.search(cl)):
+            return True
+    for m in _METASTATIC_RE.finditer(text):
+        cl = _clause(text, m.start(), m.end())
+        if _META_SENT_BLOCK.search(cl):
+            continue
+        if _META_POSITIVE.search(cl) and _IMAGING_CTX_RE.search(cl):
+            return True
+        if _META_POSITIVE.search(cl):
+            return True
+    return False
 _INTERMITTENT_RE = re.compile(r"intermittent\s+(?:adt|androgen|hormon|therapy)", re.I)
 _HOLDING_RE = re.compile(
     r"currently\s+off\s+(?:therapy|adt)|off\s+therapy|hormone\s+holiday|adt\s+holiday|"
@@ -380,7 +458,7 @@ def build_adt_status(raw_text: str, visit_date: str = "",
             st.present = True
             st.agent = st.oral_agents[0]
             st.injection = "NOT_APPLICABLE"
-            st.status = "CONTINUOUS" if _is_metastatic(raw_text) else "ACTIVE"
+            st.status = "CONTINUOUS" if _metastatic_documented(raw_text) else "ACTIVE"
             st.determination = "No depot injection — oral agent(s) only."
             st.evidence.append(f"oral ADT documented: {', '.join(st.oral_agents)}")
         return st
@@ -409,7 +487,9 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.last_injection_ymd = (last[0], last[1], last[2])
 
     # ---- signals ----
-    metastatic = _is_metastatic(raw_text)
+    # Metastatic drives CONTINUOUS and propagates into HPI/Assessment/Plan, so it
+    # must be DOCUMENTED (imaging or explicit M1/mHSPC/mCRPC), not a bare mention.
+    metastatic = _metastatic_documented(raw_text)
     intermittent = bool(_INTERMITTENT_RE.search(raw_text))
     holding = bool(_HOLDING_RE.search(raw_text))
     deferred_today = bool(_DEFER_TODAY_RE.search(raw_text))
@@ -437,7 +517,18 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     planned_start = bool(_PLANNED_START_RE.search(raw_text))
     not_candidate = bool(_NOT_CANDIDATE_RE.search(raw_text))
     ever_used = bool(st.last_injection_ymd) or given_today or _has_order
-    single_inj = len({(d[0], d[1], d[2]) for d in dates}) <= 1
+    n_inj = len({(d[0], d[1], d[2]) for d in dates})
+    single_inj = n_inj <= 1
+    # Injection recency vs the visit — a patient truly on CONTINUOUS ADT has had
+    # many injections AND a recent one (~one dosing interval ago). Depot interval
+    # defaults to 6 months when the order didn't specify it.
+    vdt = _parse_visit_ymd(visit_date) or _latest_note_date(raw_text)
+    gap_days = (-_cmp(st.last_injection_ymd, vdt)
+                if (st.last_injection_ymd and vdt) else None)
+    _interval_days = (st.interval_months or 6) * 30
+    last_recent = gap_days is not None and gap_days <= _interval_days + 90
+    # Confident CONTINUOUS: >4 documented injections and the last one is recent.
+    long_term_continuous = n_inj > 4 and last_recent
     # A COMPLETED short course requires COMPLETION corroboration — an explicit
     # "completed short course", or a single/one dose alongside testosterone
     # recovery OR completed radiation (neoadjuvant/concurrent done) — plus a
@@ -509,21 +600,35 @@ def build_adt_status(raw_text: str, visit_date: str = "",
             st.status = "DISCONTINUED"
             st.evidence.append("ADT discontinued (intolerance / off therapy)")
         else:
-            st.status = "INTERMITTENT_HOLDING"
-            st.evidence.append("off therapy this visit")
+            # Off therapy but NOT documented as intermittent. Intermittent ADT is
+            # uncommon and is clearly marked when present, so do NOT infer an
+            # intermittent 'holiday' here (which would wrongly imply a resume-when-
+            # PSA-rises plan). Treat as off/stopped pending confirmation.
+            st.status = "DISCONTINUED"
+            st.evidence.append("off therapy this visit; not documented as intermittent "
+                               "— confirm whether ADT was stopped")
     # 5) Explicitly intermittent, currently receiving.
     elif intermittent:
         st.status = "INTERMITTENT_ON" if active_order else "INTERMITTENT_HOLDING"
         st.evidence.append("intermittent ADT")
-    # 6) Metastatic / indefinite -> continuous.
+    # 6) CONTINUOUS only on solid evidence: documented metastatic disease on ADT,
+    #    an explicit indefinite/continuous statement, OR a long-term pattern
+    #    (>4 injections with a recent last dose). Otherwise ADT is ACTIVE but its
+    #    continuous-vs-finite nature is NOT established — do not assume continuous.
     elif metastatic and active_order:
         st.status = "CONTINUOUS"
-        st.evidence.append("metastatic disease on active ADT")
+        st.evidence.append("documented metastatic disease (imaging/stage) on active ADT")
     elif bool(_CONTINUE_INDEF_RE.search(raw_text)):
         st.status = "CONTINUOUS"
         st.evidence.append("indefinite/continuous ADT documented")
+    elif long_term_continuous:
+        st.status = "CONTINUOUS"
+        st.evidence.append(f"long-term ADT — {n_inj} injections, last dose "
+                           f"~{round(gap_days / 30)} months ago")
     elif active_order:
-        st.status = "CONTINUOUS" if metastatic else "ACTIVE"
+        st.status = "ACTIVE"
+        st.evidence.append("on ADT — continuous vs. finite course not established; "
+                           "confirm intended duration")
     else:
         st.status = "UNCERTAIN"
 
@@ -532,7 +637,6 @@ def build_adt_status(raw_text: str, visit_date: str = "",
                            "documentation — confirm intent")
 
     # ---- injection-due determination (priority-ordered) ----
-    vdt = _parse_visit_ymd(visit_date) or _latest_note_date(raw_text)
     if short_conflict:
         st.injection = "CONFLICT"
         st.determination = ("Likely COMPLETED short ADT course (single dose / "
@@ -577,7 +681,16 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     elif st.last_injection_ymd and st.interval_months:
         nd = _add_months(st.last_injection_ymd, st.interval_months)
         st.next_due_display = f"{nd[1]:02d}/{nd[2]:02d}/{nd[0]}"
-        if vdt is None or _cmp(vdt, nd) >= -14:   # due within a 2-week grace window
+        if gap_days is not None and gap_days > _interval_days + 120:
+            # Last dose is far past the dosing interval — ADT looks lapsed/stopped,
+            # not simply "due". Do NOT suggest a dose on this basis; flag it.
+            st.injection = "UNKNOWN"
+            st.determination = (
+                f"Last injection {st.last_injection_display} was ~{round(gap_days / 30)} "
+                f"months ago (interval {st.interval_display}) — ADT appears "
+                f"lapsed/discontinued; confirm status before any dose."
+                + _psa_tail(psa_data))
+        elif vdt is None or _cmp(vdt, nd) >= -14:   # due within a 2-week grace window
             st.injection = "DUE"
             st.determination = (f"INJECTION DUE — {_regimen(st)} "
                                 f"(last {st.last_injection_display}, due {st.next_due_display}).")
