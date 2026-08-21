@@ -345,6 +345,13 @@ class ADTStatus:
     determination: str = ""       # the human-facing "this visit" line
     oral_agents: List[str] = field(default_factory=list)
     evidence: List[str] = field(default_factory=list)
+    # Course documentation (output1.txt format): Active vs Inactive, and per-course
+    # Started/Completed dates. A 2nd course adds Restarted/Completed-again. A field
+    # is left blank when that course has not completed (still ongoing).
+    is_active: bool = False
+    completed_display: str = ""
+    restarted_display: str = ""
+    completed_again_display: str = ""
 
 
 _STATUS_DISPLAY = {
@@ -454,6 +461,29 @@ def _latest_note_date(text: str) -> Optional[Tuple[int, int, int]]:
         if best is None or ymd > best:
             best = ymd
     return best
+
+
+def _split_courses(dates, interval_months):
+    """Group injection dates into distinct ADT COURSES. A gap much larger than the
+    dosing interval (> ~2 intervals, min 13 months) marks a completed course
+    followed by a restart. Returns [(start_tuple, last_tuple), ...] where each
+    tuple is (y, m, d, display)."""
+    if not dates:
+        return []
+    seen = {}
+    for d in dates:
+        seen.setdefault((d[0], d[1], d[2]), d)
+    pts = sorted(seen.values(), key=lambda d: (d[0], d[1], d[2]))
+    gap = max((interval_months or 6) * 30 * 2, 400)
+    courses, cur = [], [pts[0]]
+    for i in range(1, len(pts)):
+        if _cmp(pts[i][:3], pts[i - 1][:3]) > gap:
+            courses.append((cur[0], cur[-1]))
+            cur = [pts[i]]
+        else:
+            cur.append(pts[i])
+    courses.append((cur[0], cur[-1]))
+    return courses
 
 
 def build_adt_status(raw_text: str, visit_date: str = "",
@@ -717,6 +747,30 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         miss = "interval" if not st.interval_months else "last-injection date"
         st.determination = (f"Injection timing indeterminate — {miss} not documented; "
                             f"confirm regimen ({_regimen(st)}).")
+
+    # ---- Active/Inactive + per-course Started/Completed (output1.txt format) ----
+    # ACTIVE = currently on ADT (a dose was just given/ordered/scheduled, or an
+    # ongoing continuous/finite/on-cycle course whose last dose isn't lapsed).
+    # A completed / discontinued / off-cycle / lapsed course is INACTIVE.
+    _lapsed = "lapsed" in (st.determination or "").lower()
+    _active_status = st.status in ("CONTINUOUS", "FINITE_IN_PROGRESS",
+                                   "INTERMITTENT_ON", "INITIATING", "ACTIVE")
+    _active_inj = st.injection in ("DUE", "ORDERED_PENDING", "GIVEN_TODAY", "SCHEDULED")
+    _ongoing_inj = st.injection in ("DUE", "NOT_DUE", "ORDERED_PENDING",
+                                    "GIVEN_TODAY", "SCHEDULED", "NOT_APPLICABLE")
+    st.is_active = bool(not _lapsed and (_active_inj or (_active_status and _ongoing_inj)))
+
+    courses = _split_courses(dates, st.interval_months)
+    if courses:
+        st.start_display = courses[0][0][3]
+        if len(courses) == 1:
+            # Completed only when the (single) course is finished; blank if ongoing.
+            st.completed_display = "" if st.is_active else courses[0][1][3]
+        else:
+            # >=2 courses: course 1 is finished (a restart followed).
+            st.completed_display = courses[0][1][3]
+            st.restarted_display = courses[-1][0][3]
+            st.completed_again_display = "" if st.is_active else courses[-1][1][3]
     return st
 
 
@@ -808,14 +862,18 @@ def render_adt_section(st: ADTStatus) -> str:
     if not st or not st.present:
         return ""
     lines = []
-    lines.append(f"  Status:         {_STATUS_DISPLAY.get(st.status, st.status)}")
+    lines.append(f"  Status:         {'Active' if st.is_active else 'Inactive'}")
     reg = _regimen(st)
     if reg.strip():
         lines.append(f"  Agent:          {reg}")
     if st.start_display:
         lines.append(f"  Started:        {st.start_display}")
-    if st.last_injection_display and st.last_injection_display != st.start_display:
-        lines.append(f"  Last injection: {st.last_injection_display}")
+        # Completed is blank while the course is ongoing (not yet completed).
+        lines.append(f"  Completed:      {st.completed_display}")
+    # A second ADT course (recurrence): Restarted / Completed again.
+    if st.restarted_display:
+        lines.append(f"  Restarted:      {st.restarted_display}")
+        lines.append(f"  Completed again: {st.completed_again_display}")
     if st.oral_agents and st.agent not in st.oral_agents:
         # A first-generation antiandrogen (bicalutamide / flutamide / nilutamide)
         # given alongside an LHRH AGONIST is transient flare protection at ADT
