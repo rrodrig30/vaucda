@@ -783,8 +783,17 @@ def build_stage2_note(
     _plan_facts = authoritative_facts
     if _os_adt.environ.get("VAUCDA_ADT_PLAN", "1") == "1":
         try:
-            from .adt_status import adt_plan_directive_from_note
-            _adt_directive = adt_plan_directive_from_note(stage1_note)
+            # Recompute the ADT status from the RAW notes (gu + non-gu content) —
+            # NOT the rendered section (now the clean Status/Started/Completed
+            # format) and NOT the rendered prose (which misfires the extractor).
+            # This preserves the full dosing directive (DUE/ordered/lapsed) for
+            # the Plan even though the visible ADT section is minimal.
+            from .adt_status import build_adt_status, adt_plan_directive
+            _adt_raw = "\n".join(
+                (n.get("content", "") or "")
+                for n in ((gu_notes or []) + (non_gu_notes or []))
+            )
+            _adt_directive = adt_plan_directive(build_adt_status(_adt_raw)) if _adt_raw else None
             if _adt_directive:
                 _plan_facts = ((authoritative_facts or "")
                                + "\n\nADT — PLAN DIRECTIVE (deterministic ADT scheduler; "

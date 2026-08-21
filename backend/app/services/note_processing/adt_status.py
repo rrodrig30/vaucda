@@ -802,25 +802,20 @@ def _cmp(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
     return (a[0] - b[0]) * 360 + (a[1] - b[1]) * 30 + (a[2] - b[2])
 
 
-def adt_plan_directive_from_note(stage1_note: str) -> Optional[str]:
-    """Read the already-rendered (and correct) ADT section from the Stage 1 note
-    and map its determination to an actionable PLAN directive. Parses the section
-    rather than re-extracting, because re-running the extractor on the rendered
-    note misfires (the Assessment/Plan prose says 'completed ADT/radiation')."""
-    m = re.search(r"ANDROGEN DEPRIVATION THERAPY \(ADT\):\s*(.*?)"
-                  r"(?=\n\s*\n|\n=|\n[A-Z][A-Z /()]{3,}:)", stage1_note or "", re.S)
-    if not m:
+def adt_plan_directive(st: "ADTStatus") -> Optional[str]:
+    """Map a computed ADTStatus to an actionable PLAN directive, straight from the
+    status OBJECT (its injection determination) — so the Plan keeps the full
+    dosing guidance (DUE / ordered / given / lapsed / conflict) even though the
+    rendered ADT section itself is the clean Status/Started/Completed format."""
+    if not st or not st.present:
         return None
-    block = m.group(1)
+    return _plan_directive_from_determination(st.determination, st.agent)
 
-    def _field(label: str) -> str:
-        fm = re.search(rf"{label}:\s*(.+)", block)
-        return fm.group(1).strip() if fm else ""
 
-    det = _field("This visit")
+def _plan_directive_from_determination(det: str, agent: str) -> Optional[str]:
     if not det:
         return None
-    agent = (_field("Agent").split(",")[0].strip() or "ADT")
+    agent = (agent.split(",")[0].strip() or "ADT")
     d = det.lower()
     # NOT-due / status-specific cases FIRST — many share the "No injection due"
     # prefix, so the affirmative "injection due" check must come last and exclude
@@ -888,7 +883,4 @@ def render_adt_section(st: ADTStatus) -> str:
             else:
                 labeled.append(oa)
         lines.append(f"  Oral therapy:   {', '.join(labeled)}")
-    lines.append(f"  This visit:     {st.determination}")
-    if st.evidence:
-        lines.append(f"  Basis:          {'; '.join(dict.fromkeys(st.evidence))}")
     return "\n".join(lines)
