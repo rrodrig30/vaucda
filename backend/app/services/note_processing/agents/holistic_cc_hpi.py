@@ -426,9 +426,11 @@ def compose_cc_hpi(
         from .history_cleaners import clean_llm_commentary, _collapse_word_doubling
         hpi = clean_llm_commentary(hpi)
         hpi = _collapse_word_doubling(hpi)
-        from .hpi_agent import _reconcile_psa_direction, _scrub_psa_hallucinations
+        from .hpi_agent import (_reconcile_psa_direction, _scrub_psa_hallucinations,
+                                 _fix_bonescan_nodal_claims)
         hpi = _reconcile_psa_direction(hpi, psa_data or "")
         hpi = _scrub_psa_hallucinations(hpi, psa_data or "")
+        hpi = _fix_bonescan_nodal_claims(hpi)  # bone scan can't image lymph nodes
         hpi = _collapse_word_doubling(hpi)
         hpi = _scrub_vague_recency(hpi)
         hpi = _collapse_double_opener(hpi)  # final safety net vs any doubled opener

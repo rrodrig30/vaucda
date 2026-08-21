@@ -134,6 +134,14 @@ _META_SENT_BLOCK = re.compile(
     r"family\s+history|\bFHx\b|brothers?\s+had|father\s+had|sibling|"
     r"(?:brother|father|son|relative|paternal|maternal)",
     re.I)
+# Distant-metastasis sites (bone / visceral / distant) vs REGIONAL nodal disease.
+_DISTANT_SITE = re.compile(
+    r"osseous|osteoblastic|sclerotic|lytic|\bbone\b|bony|skeletal|vertebr|\brib\b|"
+    r"visceral|hepatic|\bliver\b|pulmonary|\blung\b|adrenal|\bbrain\b|"
+    r"widespread|diffuse|\bdistant\b|innumerable", re.I)
+_NODAL_ONLY = re.compile(
+    r"nodal|lymph\s*node|\bLN\b|\bLAD\b|lymphadenopath|inguinal|iliac|obturator|"
+    r"retroperitoneal|pelvic\s+node|\bregional\b", re.I)
 # Affirmative diagnosis / positive-finding phrasing for a metastatic mention.
 _META_POSITIVE = re.compile(
     r"metasta\w*\s+(?:prostate|castrat|castration|disease|cancer|lesion|deposit)|"
@@ -172,10 +180,16 @@ def _metastatic_documented(text: str) -> bool:
         cl = _clause(text, m.start(), m.end())
         if _META_SENT_BLOCK.search(cl):
             continue
-        if _META_POSITIVE.search(cl) and _IMAGING_CTX_RE.search(cl):
-            return True
-        if _META_POSITIVE.search(cl):
-            return True
+        if not _META_POSITIVE.search(cl):
+            continue
+        # Regional NODAL spread (N-stage: pelvic/iliac/obturator lymphadenopathy,
+        # "metastatic nodal spread") is NOT distant (M1) metastatic disease and
+        # must not drive continuous ADT — a bone scan can't even see nodes.
+        # Require a distant site (bone / visceral / distant) when the finding is
+        # framed as nodal.
+        if _NODAL_ONLY.search(cl) and not _DISTANT_SITE.search(cl):
+            continue
+        return True
     return False
 _INTERMITTENT_RE = re.compile(r"intermittent\s+(?:adt|androgen|hormon|therapy)", re.I)
 _HOLDING_RE = re.compile(
@@ -803,7 +817,19 @@ def render_adt_section(st: ADTStatus) -> str:
     if st.last_injection_display and st.last_injection_display != st.start_display:
         lines.append(f"  Last injection: {st.last_injection_display}")
     if st.oral_agents and st.agent not in st.oral_agents:
-        lines.append(f"  Oral therapy:   {', '.join(st.oral_agents)}")
+        # A first-generation antiandrogen (bicalutamide / flutamide / nilutamide)
+        # given alongside an LHRH AGONIST is transient flare protection at ADT
+        # start, NOT ongoing therapy — label it so it isn't read as a maintenance
+        # drug. (GnRH antagonists don't flare, so no antiandrogen accompanies them;
+        # ARPIs are ongoing and shown as-is.)
+        _agonist = st.agent_family in ("leuprolide", "goserelin", "triptorelin", "histrelin")
+        labeled = []
+        for oa in st.oral_agents:
+            if _agonist and re.match(r"\s*(?:bicalutamide|flutamide|nilutamide)", oa, re.I):
+                labeled.append(f"{oa} (initiation of ADT only)")
+            else:
+                labeled.append(oa)
+        lines.append(f"  Oral therapy:   {', '.join(labeled)}")
     lines.append(f"  This visit:     {st.determination}")
     if st.evidence:
         lines.append(f"  Basis:          {'; '.join(dict.fromkeys(st.evidence))}")

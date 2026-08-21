@@ -443,11 +443,13 @@ def _postprocess(hpi: str, psa_data: str, pathology_data: str, psh_data: str) ->
         pass
     try:
         from .hpi_agent import (_dedupe_hpi_sentences, _reconcile_psa_direction,
-                                _scrub_psa_hallucinations, _scrub_unsupported_biopsy_claims)
+                                _scrub_psa_hallucinations, _scrub_unsupported_biopsy_claims,
+                                _fix_bonescan_nodal_claims)
         hpi = _dedupe_hpi_sentences(hpi)
         hpi = _reconcile_psa_direction(hpi, psa_data)
         hpi = _scrub_psa_hallucinations(hpi, psa_data)
         hpi = _scrub_unsupported_biopsy_claims(hpi, pathology_data, psh_data)
+        hpi = _fix_bonescan_nodal_claims(hpi)  # bone scan can't image lymph nodes
     except Exception as e:  # noqa: BLE001
         logger.warning(f"HPI composer post-process partial: {e}")
     # word-doubling can be reintroduced by _reconcile_psa_direction

@@ -1156,6 +1156,25 @@ def _build_psa_delta_block(psa_data: Optional[str]) -> str:
     )
 
 
+_BONESCAN_NODAL_RE = re.compile(
+    r"\bbone\s+scan\b([^.;\n]{0,70}?\b(?:lymphadenopath\w*|lymph\s*nodes?|nodal|"
+    r"positive\s+nodes?|\bnodes?\b|\bLAD\b))", re.I)
+
+
+def _fix_bonescan_nodal_claims(hpi: str) -> str:
+    """A bone scan images the skeleton only — it physically cannot show lymph
+    nodes. When the LLM credits a nodal / lymphadenopathy finding to a 'bone scan'
+    (e.g. 'bone scan showed positive nodes'), re-attribute it to generic 'imaging'
+    so the note never states a physically impossible result. The gap is kept short
+    and same-clause so a legitimate 'bone scan showed osseous mets; CT showed
+    adenopathy' sentence is not touched."""
+    if not hpi:
+        return hpi
+    hpi = _BONESCAN_NODAL_RE.sub(lambda m: "imaging" + m.group(1), hpi)
+    # article agreement: "a/A imaging" -> "an/An imaging"
+    return re.sub(r"\b([Aa])\s+imaging\b", r"\1n imaging", hpi)
+
+
 def synthesize_hpi(
     gu_notes: List[Dict[str, str]],
     non_gu_notes: List[Dict[str, str]],
@@ -1898,6 +1917,9 @@ Provide ONLY the clinical narrative HPI. NO meta-commentary, NO explanations lik
     # results include a specific gravity of 1.011, an EGFR CKD EPI of
     # 82, a glucose level of 102 mg/dL". Strip those sentences here.
     cleaned_hpi = _strip_nonurologic_sentences(cleaned_hpi)
+    # A bone scan cannot image lymph nodes — re-attribute any nodal finding
+    # wrongly credited to a 'bone scan' to generic 'imaging'.
+    cleaned_hpi = _fix_bonescan_nodal_claims(cleaned_hpi)
 
     # Temporal-anchor post-processors. Catch the LLM failures that
     # survive the deterministic temporal-anchor and imaging-recency
