@@ -111,6 +111,28 @@ _TX_KW = re.compile(
 # "s/p RRP 2018", "prostatectomy 1/2022", "completion of XRT 6/2025"
 _DATE_TOK = re.compile(r"(\d{1,2})[/-](?:(\d{1,2})[/-])?((?:19|20)\d{2})|\b((?:19|20)\d{2})\b")
 
+# Radical prostatectomy — PSADT is only reported for post-RP biochemical
+# recurrence (PSA > 0.2). Intact-prostate / radiation-only patients use the
+# Phoenix nadir+2 definition instead, not this table.
+_RP_RE = re.compile(
+    r"radical\s+prostatectomy|\bRRP\b|\bRALP\b|\bRARP\b|"
+    r"robot\w*[\s\w-]{0,25}?prostatectomy|laparoscopic[\s\w-]{0,25}?prostatectomy",
+    re.I)
+_RP_BARE = re.compile(r"\bprostatectomy\b", re.I)
+_SIMPLE_PROST_RE = re.compile(r"simple\s+prostatectomy", re.I)
+# Post-RP biochemical-recurrence PSA threshold.
+_BCR_PSA_THRESHOLD = 0.2
+
+
+def _had_radical_prostatectomy(chart: str) -> bool:
+    if not chart:
+        return False
+    if _RP_RE.search(chart):
+        return True
+    # bare "prostatectomy" counts (radical implied in a PCa chart) unless it is a
+    # SIMPLE prostatectomy (BPH enucleation, which leaves prostate tissue).
+    return bool(_RP_BARE.search(chart) and not _SIMPLE_PROST_RE.search(chart))
+
 
 def _treatment_dates(chart: str) -> List[Ymd]:
     """Dates of documented definitive treatments (RP / radiation / salvage) for
@@ -175,17 +197,21 @@ def _psadt_for_group(group: List[Tuple[Ymd, float]]) -> Optional[PSADTResult]:
 
 
 def compute_psadt(psa_data: str, chart_text: str = "") -> List[PSADTResult]:
-    """PSADT intervals for the chart's PSA series, chronological. A rising phase
-    is reported ONLY when it starts from a REAL nadir — a genuine treatment-
-    response trough (>=50% drop from a prior peak) or a nadir that follows a
-    documented definitive treatment — so pre-diagnosis rises and minor
-    fluctuations are not reported as spurious doubling times."""
+    """PSADT intervals for the chart's PSA series, chronological. Reported ONLY for
+    post-RADICAL-PROSTATECTOMY patients whose PSA has risen above 0.2 ng/mL
+    (post-RP biochemical recurrence) — not intact-prostate / radiation-only
+    patients. A rising phase must also start from a REAL nadir (a >=50% drop from a
+    prior peak, or a nadir following a documented definitive treatment), so
+    pre-diagnosis rises and minor fluctuations are not reported."""
+    if not _had_radical_prostatectomy(chart_text):
+        return []
     series = _parse_psa(psa_data)
     tx_dates = _treatment_dates(chart_text)
     results = []
     for g in _rising_groups(series):
         r = _psadt_for_group(g)
-        if r is not None and _is_real_nadir(r.nadir_ymd, r.nadir_val, series, tx_dates):
+        if (r is not None and r.peak_val > _BCR_PSA_THRESHOLD
+                and _is_real_nadir(r.nadir_ymd, r.nadir_val, series, tx_dates)):
             results.append(r)
     return results
 

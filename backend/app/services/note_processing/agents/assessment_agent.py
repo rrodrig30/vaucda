@@ -337,23 +337,23 @@ Read the ENTIRE note below carefully. Every section contains information that ma
                     continue
                 # HH:MM format: [r] Nov 06, 2025 08:08    0.51
                 m = re.search(
-                    r'\[r\]\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\s+\d{1,2}:\d{2}\s+(\d+\.?\d*)',
+                    r'(?:\[r\]\s*)?([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\s+\d{1,2}:\d{2}\s+(\d+\.?\d*)',
                     line
                 )
                 if m:
                     psa_values.append(f"{m.group(1)}: {m.group(2)}")
                     continue
-                # HHMM format (legacy): [r] Nov 06, 2025 0808    0.51
+                # HHMM format (legacy): Nov 06, 2025 0808    0.51
                 m = re.search(
-                    r'\[r\]\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\s+\d{4}\s{2,}(\d+\.?\d*)',
+                    r'(?:\[r\]\s*)?([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\s+\d{4}\s{2,}(\d+\.?\d*)',
                     line
                 )
                 if m:
                     psa_values.append(f"{m.group(1)}: {m.group(2)}")
                     continue
-                # No time format: [r] Nov 06, 2025         0.51
+                # No time format: Nov 06, 2025         0.51
                 m = re.search(
-                    r'\[r\]\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\s{5,}(\d+\.?\d*)',
+                    r'(?:\[r\]\s*)?([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\s{5,}(\d+\.?\d*)',
                     line
                 )
                 if m:

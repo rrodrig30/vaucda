@@ -281,9 +281,9 @@ def _format_psa_curve(entries: List[Tuple[datetime, float, str, bool]]) -> str:
                 formatted_time = f"{time_str[:2]}:{time_str[2:]}"
             else:
                 formatted_time = time_str
-            line = f"[r] {date_str} {formatted_time}    {value_str}"
+            line = f"{date_str} {formatted_time}    {value_str}"
         else:
-            line = f"[r] {date_str}         {value_str}"
+            line = f"{date_str}         {value_str}"
 
         lines.append(line)
 
