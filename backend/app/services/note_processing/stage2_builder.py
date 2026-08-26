@@ -316,12 +316,24 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     header."""
     if not text:
         return text
-    # Strip LLM meta-preamble the rewrite loops prepend ("Here is the rewritten
-    # treatment plan ...:", "Below is the updated assessment:").
-    text = re.sub(r"^\s*(?:here\s+is|here'?s|below\s+is|the\s+following\s+is|"
-                  r"sure[,!]?\s+here)\b[^\n:]{0,90}:\s*\n?", "", text, count=1, flags=re.I)
+    # Strip LLM meta-preamble the rewrite loops prepend, at the start OR mid-text
+    # after the first sentence ("Here is the rewritten treatment plan ...:",
+    # "Below is the updated assessment:", "Here is the comprehensive clinical
+    # assessment for the urology patient:").
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*(?:here\s+is|here'?s|below\s+is|"
+                  r"the\s+following\s+is|sure[,!]?\s+here)\b[^\n:]{0,90}:\s*",
+                  " ", text, flags=re.I)
+    # Trailing/inline self-referential editor notes ("Note that I corrected...",
+    # "I reported the highest-grade core...").
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*Note\s*(?:that|:)\s*I\b[^.!?]*[.!?]?", " ", text, flags=re.I)
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*I\s+(?:corrected|revised|updated|added|removed|"
+                  r"changed|reported|inferred|noted|adjusted|rewrote)\b[^.!?]*[.!?]?",
+                  " ", text, flags=re.I)
     text = _AP_DATE_PLACEHOLDER.sub(" today", text)
     text = _AP_BRACKET_PLACEHOLDER.sub("", text)
+    # Angle-bracket placeholders opus-class models emit: "<date>", "<value>",
+    # "on <date>" -> drop the placeholder (and a leading 'on/by/as of').
+    text = re.sub(r"(?:\s+(?:on|by|as\s+of|dated))?\s*<\s*[^>]{0,40}?\s*>", "", text)
     if not has_cci:
         text = _CCI_SENTENCE.sub("", text)
     # tidy whitespace/punctuation left by removals
@@ -334,11 +346,19 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
 
 
 def _strip_leading_header(text: str, header: str) -> str:
-    """Remove a duplicated leading 'ASSESSMENT:' / 'PLAN:' the LLM emitted (the
-    assembler adds its own)."""
+    """Remove duplicated leading 'ASSESSMENT:' / 'PLAN:' headers the LLM emitted
+    (the assembler adds its own). Loops so a doubled 'ASSESSMENT:\\nASSESSMENT:'
+    is fully removed — otherwise a residual header blocks the preamble scrub."""
     if not text:
         return text
-    return re.sub(rf"^\s*{header}\s*:?\s*\n?", "", text, count=1, flags=re.IGNORECASE)
+    prev = None
+    while prev != text:
+        prev = text
+        # Tolerate markdown bold around the header ('**ASSESSMENT:**') and an
+        # optional colon inside or outside the asterisks.
+        text = re.sub(rf"^\s*\*{{0,2}}\s*{header}\s*:?\s*\*{{0,2}}\s*:?\s*\n?",
+                      "", text, count=1, flags=re.IGNORECASE)
+    return text
 
 
 def _scrub_unproductive_plan(plan: str) -> str:

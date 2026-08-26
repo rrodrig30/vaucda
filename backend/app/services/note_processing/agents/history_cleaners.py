@@ -126,6 +126,21 @@ _SENTENCE_DROP_PATTERNS = (
     re.compile(r'\bNote\s*:\s*(?:The|This)\s+(?:rewritten|synthesized|'
                r'combined|generated)\s+(?:HPI|narrative|note|entry)[^.]*\.',
                re.IGNORECASE),
+    # opus-class models insert a mid-text meta-preamble after the first
+    # sentence: "...presents for follow-up. Here is the rewritten HISTORY OF
+    # PRESENT ILLNESS (HPI): The patient has...". Strip the "Here is the
+    # <adj> <SECTION>:" clause wherever it appears (start OR mid-paragraph).
+    re.compile(r'(?:^|(?<=[.!?]))\s*Here\s+(?:is|are)\s+(?:the\s+|my\s+|a\s+)?'
+               r'(?:rewritten|revised|updated|corrected|comprehensive|complete|'
+               r'following|new|reformatted|final)\b[^:.!?]{0,80}?:\s*',
+               re.IGNORECASE),
+    # Trailing self-referential editor notes: "Note that I corrected the first
+    # sentence...", "I reported the highest-grade core...", "I inferred...".
+    re.compile(r'(?:^|(?<=[.!?]))\s*Note\s*(?:that|:)\s*I\b[^.!?]*[.!?]?',
+               re.IGNORECASE),
+    re.compile(r"(?:^|(?<=[.!?]))\s*I\s+(?:corrected|revised|updated|added|removed|"
+               r"changed|reported|inferred|noted|adjusted|reformatted|rewrote)\b"
+               r"[^.!?]*[.!?]?", re.IGNORECASE),
     # LLM editorializing about clinical relevance — strip these as
     # they're meta-commentary, not clinical content.
     re.compile(r'\bHowever,?\s+this\s+(?:is|was)\s+not\s+(?:directly\s+)?'
@@ -472,6 +487,9 @@ def clean_llm_commentary(text: str) -> str:
     # Pass 3: sentence-level drops
     for pat in _SENTENCE_DROP_PATTERNS:
         text = pat.sub('', text)
+    # A mid-text drop can leave a sentence period touching the next sentence's
+    # capital ("follow-up.The patient") — restore the inter-sentence space.
+    text = re.sub(r'([.!?])([A-Z])', r'\1 \2', text)
 
     # Pass 4: legacy inline cleanups
     for pat in _LEGACY_INLINE_PATTERNS:
