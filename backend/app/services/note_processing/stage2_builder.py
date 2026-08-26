@@ -365,6 +365,21 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     return text.strip()
 
 
+def _renumber_problems(plan: str) -> str:
+    """Renumber 'PROBLEM #N:' / 'Problem #N:' headers sequentially (1, 2, 3, ...).
+    The LLM sometimes skips or repeats a number (e.g. #1, #2, #4, #5 — #3 dropped
+    when it merged two problems); the displayed sequence must be contiguous."""
+    if not plan:
+        return plan
+    counter = [0]
+
+    def _sub(_m):
+        counter[0] += 1
+        return f"PROBLEM #{counter[0]}:"
+
+    return re.sub(r"(?i)\bPROBLEM\s*#\s*\d+\s*:", _sub, plan)
+
+
 def _strip_leading_header(text: str, header: str) -> str:
     """Remove duplicated leading 'ASSESSMENT:' / 'PLAN:' headers the LLM emitted
     (the assembler adds its own). Loops so a doubled 'ASSESSMENT:\\nASSESSMENT:'
@@ -986,6 +1001,7 @@ def assemble_complete_note(
                                          has_cci)
     if plan:
         plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), has_cci)
+        plan = _renumber_problems(plan)
 
     # Add Assessment
     if assessment and assessment.strip():

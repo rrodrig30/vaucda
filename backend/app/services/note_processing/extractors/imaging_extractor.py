@@ -564,6 +564,22 @@ def extract_detailed_report_imaging(clinical_document: str) -> list:
     return imaging_reports
 
 
+# Non-imaging section markers that must TERMINATE an imaging report body. Without
+# these, a report whose next sibling study header is far away captures every
+# intervening non-imaging line (PMH problem list, med list, ROS, a whole prior
+# clinic note, a PSA table, raw pathology). Used in the impression-capture
+# lookahead alongside "next study header" / "===" / end-of-string.
+_IMAGING_BODY_STOP = (
+    r"\n[ \t]*(?:PMH|PAST\s+MEDICAL|PAST\s+SURGICAL|MEDICATIONS?|MEDS|ALLERGIES|"
+    r"Active\s+(?:problems|Outpatient|Non-VA)|Pending\s+Outpatient|"
+    r"Computerized\s+Problem|TUMOR\s+SCREENS|SERUM\s+PSA|-{2,}\s*TUMOR|"
+    r"Local\s+Title|Standard\s+Title|CHIEF\s+COMPLAINT|HISTORY\s+OF\s+PRESENT|"
+    r"GENERAL\s+ROS|(?:GU\s+)?REVIEW\s+OF\s+SYSTEMS|A/P\s*:|ASSESSMENT|PLAN\s*:|"
+    r"PHYSICAL\s+EXAM|SOCIAL\s+HISTORY|FAMILY\s+HISTORY|VITAL\s+SIGNS|"
+    r"Total\s+Medications|Signed\s+by|Path\s+[A-Z]{2,3}\s+\d)"
+)
+
+
 def extract_human_readable_imaging(clinical_document: str) -> list:
     """
     Extract human-readable imaging format.
@@ -609,7 +625,15 @@ def extract_human_readable_imaging(clinical_document: str) -> list:
     #   US RENAL BILATERAL (3/15/25):
     # Study names can contain: letters, digits, spaces, /, &, -, W/O, W/
     # The date is always in parentheses: (M/D/YY) or (MM/DD/YYYY)
-    study_pattern = r'([A-Za-z][A-Za-z0-9\s/&\-,.\(\)]+?\(\d{1,2}/\d{1,2}/\d{2,4}\)):?\s*\n(?:IMPRESSION:?\s*)?(.*?)(?=\n[A-Za-z][A-Za-z0-9\s/&\-,.]+?\(\d{1,2}/\d{1,2}/\d{2,4}\):?|={30,}|$)'
+    # The next-study-header lookahead must allow the SAME name characters as the
+    # main capture (including parentheses) — otherwise a study whose name carries
+    # an embedded '(' (e.g. a VistA-mangled 'CT RENAL STONE (ABD/PEL WO (6/15/2022):')
+    # isn't recognized as a boundary and the PRIOR report's impression swallows it.
+    study_pattern = (
+        r'([A-Za-z][A-Za-z0-9\s/&\-,.\(\)]+?\(\d{1,2}/\d{1,2}/\d{2,4}\)):?\s*\n'
+        r'(?:IMPRESSION:?\s*)?(.*?)'
+        r'(?=\n[A-Za-z][A-Za-z0-9\s/&\-,.\(\)]+?\(\d{1,2}/\d{1,2}/\d{2,4}\):?|'
+        + _IMAGING_BODY_STOP + r'|={30,}|$)')
 
     for match in re.finditer(study_pattern, imaging_content, re.DOTALL):
         study_line = match.group(1).strip()
@@ -903,11 +927,22 @@ def extract_cprs_format_imaging(clinical_document: str) -> list:
         re.MULTILINE | re.DOTALL,
     )
 
+    # The impression body must also terminate at a NON-imaging section header —
+    # otherwise a report whose 'Report'/'Signed by' terminator is far away (or
+    # absent) swallows the PMH problem list, med list, ROS, a whole prior clinic
+    # note, a PSA table, and raw pathology that follow it in a VistA export.
     impression_pat = re.compile(
         r'^Impression\s*\n'
         r'(?P<imp>.*?)'
-        r'(?=^Report\s*$|^Signed by |^Facility:|^Printed at:|^={30,}\s*$|\Z)',
-        re.MULTILINE | re.DOTALL,
+        r'(?=^Report\s*$|^Signed by |^Facility:|^Printed at:|^={30,}\s*$|'
+        r'^[ \t]*(?:PMH|PAST\s+MEDICAL|PAST\s+SURGICAL|MEDICATIONS?|MEDS|ALLERGIES|'
+        r'Active\s+(?:problems|Outpatient|Non-VA)|Pending\s+Outpatient|'
+        r'Computerized\s+Problem|-{2,}\s*TUMOR|TUMOR\s+SCREENS|SERUM\s+PSA|'
+        r'Local\s+Title|Standard\s+Title|CHIEF\s+COMPLAINT|HISTORY\s+OF\s+PRESENT|'
+        r'GENERAL\s+ROS|(?:GU\s+)?REVIEW\s+OF\s+SYSTEMS|A/P\s*:|ASSESSMENT|PLAN\s*:|'
+        r'PHYSICAL\s+EXAM|SOCIAL\s+HISTORY|FAMILY\s+HISTORY|VITAL\s+SIGNS|'
+        r'Total\s+Medications|Path\s+[A-Z]{2,3}\s+\d)\b|\Z)',
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
 
     # Walk the document looking for blocks. For each block we also
