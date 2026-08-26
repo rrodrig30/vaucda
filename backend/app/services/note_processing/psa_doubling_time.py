@@ -114,12 +114,31 @@ _DATE_TOK = re.compile(r"(\d{1,2})[/-](?:(\d{1,2})[/-])?((?:19|20)\d{2})|\b((?:1
 # Radical prostatectomy — PSADT is only reported for post-RP biochemical
 # recurrence (PSA > 0.2). Intact-prostate / radiation-only patients use the
 # Phoenix nadir+2 definition instead, not this table.
+# UNAMBIGUOUS radical prostatectomy (incl. retropubic / perineal / robotic / lap
+# variants and the RRP/RALP/RARP abbreviations).
 _RP_RE = re.compile(
-    r"radical\s+prostatectomy|\bRRP\b|\bRALP\b|\bRARP\b|"
+    r"radical\s+(?:retropubic\s+|perineal\s+|robotic\s+|robot[\s-]?assisted\s+|"
+    r"laparoscopic\s+)?prostatectomy|\bRRP\b|\bRALP\b|\bRARP\b|"
     r"robot\w*[\s\w-]{0,25}?prostatectomy|laparoscopic[\s\w-]{0,25}?prostatectomy",
     re.I)
 _RP_BARE = re.compile(r"\bprostatectomy\b", re.I)
-_SIMPLE_PROST_RE = re.compile(r"simple\s+prostatectomy", re.I)
+# The patient actually UNDERWENT it — a bare "prostatectomy" only counts as the
+# patient's own history near one of these anchors.
+_PT_HAD_ANCHOR = re.compile(
+    r"s/?p\b|status[\s-]?post|post[\s-]?op|underw\w+|had\s+(?:a\s+)?|"
+    r"history\s+of|\bh/?o\b|prior\s+|previous\s+|following\s+|after\s+", re.I)
+# Contexts where a bare "prostatectomy" is NOT the patient's own radical RP:
+#  - BPH procedures that leave prostate tissue (TURP / HoLEP / simple / enucleation)
+#  - family history (brother/father/…)
+#  - hypothetical / options / declined / template menus
+_NONRADICAL_OR_HYPO = re.compile(
+    r"\bturp\b|\(turp\)|holep|holmium|enucleation|transurethral|simple\s+prostatectomy|"
+    r"brother|father|sibling|\bson\b|paternal|maternal|family|uncle|relative|"
+    r"option|choos|interested|includ|discuss|candidate|proceed|consider|"
+    r"\bvs\.?\b|versus|declin|recommend|offer|elect|"
+    # a treatment-OPTIONS menu lists RP next to other definitive modalities
+    r"brachytherap|perineal\s+prostatectomy\b|hormone\s+therapy",
+    re.I)
 # Post-RP biochemical-recurrence PSA threshold.
 _BCR_PSA_THRESHOLD = 0.2
 
@@ -127,11 +146,20 @@ _BCR_PSA_THRESHOLD = 0.2
 def _had_radical_prostatectomy(chart: str) -> bool:
     if not chart:
         return False
-    if _RP_RE.search(chart):
-        return True
-    # bare "prostatectomy" counts (radical implied in a PCa chart) unless it is a
-    # SIMPLE prostatectomy (BPH enucleation, which leaves prostate tissue).
-    return bool(_RP_BARE.search(chart) and not _SIMPLE_PROST_RE.search(chart))
+    # Unambiguous radical prostatectomy — but only if that very phrase isn't itself
+    # in a hypothetical/options/menu context (e.g. "radical prostatectomy vs XRT").
+    for m in _RP_RE.finditer(chart):
+        win = chart[max(0, m.start() - 70):m.end() + 40]
+        if not _NONRADICAL_OR_HYPO.search(win):
+            return True
+    # A bare "prostatectomy" counts ONLY when the patient clearly underwent it
+    # (s/p / status-post / underwent anchor nearby) AND it isn't a BPH procedure,
+    # family history, or a hypothetical/options mention.
+    for m in _RP_BARE.finditer(chart):
+        win = chart[max(0, m.start() - 80):m.end() + 40]
+        if _PT_HAD_ANCHOR.search(win) and not _NONRADICAL_OR_HYPO.search(win):
+            return True
+    return False
 
 
 def _treatment_dates(chart: str) -> List[Ymd]:
