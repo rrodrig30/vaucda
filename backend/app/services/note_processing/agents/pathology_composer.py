@@ -160,6 +160,34 @@ YOUR PREVIOUS DRAFT (incomplete):
 Rewrite the complete PATHOLOGY RESULTS content now:"""
 
 
+# Markers that indicate the LLM ECHOED its prompt scaffolding / raw material
+# instead of composing a clean summary (opus-class failure mode) — the composed
+# section must never contain these. Everything from the first such marker onward
+# is cut.
+_PATH_ECHO_CUT = re.compile(
+    r"(?im)^\s*(?:PATHOLOGY\s+MATERIAL\s*:|"
+    r"MICROSCOPIC\s+EXAM(?:/DIAGNOSIS)?\s*:|"
+    r"HISTORY\s+OF\s+PRESENT\s+ILLNESS\s*:|"
+    r"Impression\s*/\s*PLAN\s*:|CHIEF\s+COMPLAINT\s*:|"
+    r"Prior\s+biopsies?\s*\(OSH\)|SOURCE\s+MATERIAL\s*:).*",
+    re.DOTALL,
+)
+# LLM meta-preamble the composer sometimes prepends.
+_PATH_PREAMBLE = re.compile(
+    r"^\s*(?:here\s+is|here'?s|below\s+is|the\s+following\s+is|sure[,!]?\s+here)"
+    r"\b[^\n:]{0,90}:\s*\n?", re.IGNORECASE)
+
+
+def _strip_path_echo(draft: str) -> str:
+    """Remove a leading meta-preamble and cut any echoed prompt-scaffolding / raw
+    material dump so the composed pathology can never bleed the source blob."""
+    if not draft:
+        return draft
+    draft = _PATH_PREAMBLE.sub("", draft, count=1)
+    draft = _PATH_ECHO_CUT.sub("", draft)
+    return draft.strip()
+
+
 def compose_pathology(
     chart: str,
     llm_call: LLMCallable,
@@ -174,18 +202,22 @@ def compose_pathology(
         return None
     source_findings = _findings(ctx)
     try:
-        draft = (llm_call(_compose_prompt(ctx)) or "").strip()
+        draft = _strip_path_echo((llm_call(_compose_prompt(ctx)) or "").strip())
         repairs = 0
         while source_findings and repairs < max_repair:
             missing = source_findings - _findings(draft)
             if not missing:
                 break
-            draft = (llm_call(_repair_prompt(ctx, draft, missing)) or draft).strip()
+            draft = _strip_path_echo(
+                (llm_call(_repair_prompt(ctx, draft, missing)) or draft).strip())
             repairs += 1
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Pathology composer failed, falling back: {e}")
         return None
-    if not draft:
+    # If echo-stripping left nothing (the model only echoed scaffolding/raw
+    # material), fall back rather than emit an empty or bleeding section.
+    if not draft or len(draft) < 15:
+        logger.warning("Pathology composer produced only scaffolding/echo; falling back")
         return None
     # Report residual completeness / grounding for the audit trail.
     covered = _findings(draft)
