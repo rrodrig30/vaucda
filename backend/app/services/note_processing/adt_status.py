@@ -352,6 +352,10 @@ class ADTStatus:
     completed_display: str = ""
     restarted_display: str = ""
     completed_again_display: str = ""
+    # We only say "Completed" when there is affirmative completion evidence; else
+    # the closing date is shown as "Last dose given" (factual, no over-claim).
+    completed_confident: bool = False
+    last_dose_display: str = ""
 
 
 _STATUS_DISPLAY = {
@@ -760,17 +764,20 @@ def build_adt_status(raw_text: str, visit_date: str = "",
                                     "GIVEN_TODAY", "SCHEDULED", "NOT_APPLICABLE")
     st.is_active = bool(not _lapsed and (_active_inj or (_active_status and _ongoing_inj)))
 
+    # Affirmative completion evidence — only then do we label a closing date
+    # "Completed"; otherwise it's just the "Last dose given" (avoids implying a
+    # course was intentionally finished when we only have the last recorded dose).
+    st.completed_confident = st.status == "COMPLETED"
     courses = _split_courses(dates, st.interval_months)
     if courses:
         st.start_display = courses[0][0][3]
-        if len(courses) == 1:
-            # Completed only when the (single) course is finished; blank if ongoing.
-            st.completed_display = "" if st.is_active else courses[0][1][3]
-        else:
-            # >=2 courses: course 1 is finished (a restart followed).
+        st.last_dose_display = courses[-1][1][3]
+        if len(courses) >= 2:
+            # A restart followed, so course 1 definitely completed.
             st.completed_display = courses[0][1][3]
             st.restarted_display = courses[-1][0][3]
-            st.completed_again_display = "" if st.is_active else courses[-1][1][3]
+            # The final course's closing (Completed again vs Last dose given) is
+            # decided in render from is_active / completed_confident.
     return st
 
 
@@ -856,19 +863,30 @@ def _plan_directive_from_determination(det: str, agent: str) -> Optional[str]:
 def render_adt_section(st: ADTStatus) -> str:
     if not st or not st.present:
         return ""
+    def _row(label, value):
+        return f"  {(label + ':').ljust(17)}{value}"
+
     lines = []
-    lines.append(f"  Status:         {'Active' if st.is_active else 'Inactive'}")
+    lines.append(_row("Status", "Active" if st.is_active else "Inactive"))
     reg = _regimen(st)
     if reg.strip():
-        lines.append(f"  Agent:          {reg}")
+        lines.append(_row("Agent", reg))
     if st.start_display:
-        lines.append(f"  Started:        {st.start_display}")
-        # Completed is blank while the course is ongoing (not yet completed).
-        lines.append(f"  Completed:      {st.completed_display}")
-    # A second ADT course (recurrence): Restarted / Completed again.
-    if st.restarted_display:
-        lines.append(f"  Restarted:      {st.restarted_display}")
-        lines.append(f"  Completed again: {st.completed_again_display}")
+        lines.append(_row("Started", st.start_display))
+        # Closing line for the (final) course. "Completed" only with affirmative
+        # completion evidence; an ongoing or merely-lapsed course shows the factual
+        # "Last dose given" instead of implying the course was intentionally ended.
+        if st.restarted_display:
+            # Two courses: course 1 completed (a restart followed), then restarted.
+            lines.append(_row("Completed", st.completed_display))
+            lines.append(_row("Restarted", st.restarted_display))
+            _final_label = "Completed again" if (not st.is_active and st.completed_confident) \
+                else "Last dose given"
+            lines.append(_row(_final_label, st.last_dose_display))
+        else:
+            _label = "Completed" if (not st.is_active and st.completed_confident) \
+                else "Last dose given"
+            lines.append(_row(_label, st.last_dose_display or st.completed_display))
     if st.oral_agents and st.agent not in st.oral_agents:
         # A first-generation antiandrogen (bicalutamide / flutamide / nilutamide)
         # given alongside an LHRH AGONIST is transient flare protection at ADT
@@ -882,5 +900,5 @@ def render_adt_section(st: ADTStatus) -> str:
                 labeled.append(f"{oa} (initiation of ADT only)")
             else:
                 labeled.append(oa)
-        lines.append(f"  Oral therapy:   {', '.join(labeled)}")
+        lines.append(_row("Oral therapy", ", ".join(labeled)))
     return "\n".join(lines)
