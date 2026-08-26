@@ -142,10 +142,23 @@ _NONRADICAL_OR_HYPO = re.compile(
 # Post-RP biochemical-recurrence PSA threshold.
 _BCR_PSA_THRESHOLD = 0.2
 
+# Explicit clinician correction that the patient had RADIATION, not surgery — an
+# erroneous "status post prostatectomy" note that was corrected must not license
+# PSADT. When present, only UNAMBIGUOUS radical-RP evidence counts (not a bare
+# narrative "prostatectomy", which is exactly what gets copied-forward in error).
+_SURGERY_CORRECTION_RE = re.compile(
+    r"treated\s+with\s+(?:xrt|radiation|ebrt|imrt|sbrt|radiotherapy)[^.\n]{0,25}?,?\s*"
+    r"not\s+surg\w*|radiation[,\s]+not\s+(?:surgery|surgical|prostatectomy)|"
+    r"\bnot\s+surgery\b|(?:did\s+not|never|has\s+not)\s+(?:have|undergo|had)\s+"
+    r"(?:a\s+)?(?:surgery|prostatectomy)|denies\s+(?:any\s+)?(?:surgery|prostatectomy)",
+    re.IGNORECASE,
+)
+
 
 def _had_radical_prostatectomy(chart: str) -> bool:
     if not chart:
         return False
+    _corrected = bool(_SURGERY_CORRECTION_RE.search(chart))
     # Unambiguous radical prostatectomy — but only if that very phrase isn't itself
     # in a hypothetical/options/menu context (e.g. "radical prostatectomy vs XRT").
     for m in _RP_RE.finditer(chart):
@@ -154,7 +167,11 @@ def _had_radical_prostatectomy(chart: str) -> bool:
             return True
     # A bare "prostatectomy" counts ONLY when the patient clearly underwent it
     # (s/p / status-post / underwent anchor nearby) AND it isn't a BPH procedure,
-    # family history, or a hypothetical/options mention.
+    # family history, or a hypothetical/options mention. Skipped entirely when the
+    # chart corrects the record to radiation-not-surgery (strong RP above still
+    # counts; a bare narrative 'prostatectomy' does not).
+    if _corrected:
+        return False
     for m in _RP_BARE.finditer(chart):
         win = chart[max(0, m.start() - 80):m.end() + 40]
         if _PT_HAD_ANCHOR.search(win) and not _NONRADICAL_OR_HYPO.search(win):

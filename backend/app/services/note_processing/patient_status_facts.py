@@ -276,6 +276,37 @@ def _completion_verb_nearby(text: str, position: int, window: int = 60) -> bool:
     return bool(_COMPLETION_VERB_RE.search(text[max(0, position - window):position]))
 
 
+# An explicit clinician CORRECTION that the patient had RADIATION, not surgery —
+# the exact failure mode where an erroneous "status post prostatectomy" addendum
+# is later corrected ("he was treated with XRT, not surgery"; "PSA rarely is
+# undetectable after radiation, only after prostatectomy"). When this is present
+# and no PSH/pathology independently confirms a prostatectomy, any narrative
+# "prostatectomy" assertion is spurious and must not become a fact.
+_SURGERY_CORRECTION_RE = re.compile(
+    r"treated\s+with\s+(?:xrt|radiation|ebrt|imrt|sbrt|radiotherapy)[^.\n]{0,25}?,?\s*"
+    r"not\s+surg\w*|"
+    r"radiation[,\s]+not\s+(?:surgery|surgical|prostatectomy)|"
+    r"\bnot\s+surgery\b|"
+    r"(?:did\s+not|didn'?t|never|has\s+not|hasn'?t)\s+(?:have|undergo|had)\s+"
+    r"(?:a\s+)?(?:surgery|prostatectomy|surgical\s+treatment)|"
+    r"\bno\s+(?:prior\s+|history\s+of\s+|h/o\s+)?(?:surgery|prostatectomy)\b|"
+    r"denies\s+(?:any\s+)?(?:surgery|prostatectomy)",
+    re.IGNORECASE,
+)
+_PROSTATECTOMY_TX_RE = re.compile(
+    r"\b(?:radical\s+)?prostatectomy\b|\bRALP\b|\bRARP\b|\bRRP\b", re.IGNORECASE)
+
+
+def _prostatectomy_independently_confirmed(*sources: Optional[str]) -> bool:
+    """True when PSH / pathology independently document a prostatectomy — the
+    only evidence strong enough to KEEP a prostatectomy despite a 'not surgery'
+    correction. Pathology anchors on an actual RP specimen, not a bare word."""
+    psh_blob = "\n".join(s for s in sources if s).lower()
+    if re.search(r"\b(?:radical\s+)?prostatectomy\b|\bralp\b|\brarp\b|\brrp\b", psh_blob):
+        return True
+    return False
+
+
 def find_completed_treatments(text: str) -> List[str]:
     """Find evidence the patient has actually undergone urologic treatment.
 
@@ -884,6 +915,21 @@ def extract_patient_status_facts(
         for t in raw_treatments:
             if t.lower() not in {x.lower() for x in treatments}:
                 treatments.append(t)
+
+    # Correction guard: if the chart explicitly states the patient had RADIATION,
+    # not surgery, and no PSH/pathology confirms a prostatectomy, drop any
+    # narrative "prostatectomy" assertion — an erroneous copy-forward addendum
+    # ("status post prostatectomy") that a clinician corrected must not surface as
+    # a fact in the HPI / Assessment / Plan. (MURRAY: XRT 2014–2016, corrected
+    # 'treated with XRT, not surgery'; PSH lists only cataract.)
+    _correction_src = "\n".join(filter(None, (raw_clinical_text, stage1_note)))
+    if (_SURGERY_CORRECTION_RE.search(_correction_src)
+            and not _prostatectomy_independently_confirmed(psh, pathology)):
+        _before = len(treatments)
+        treatments = [t for t in treatments if not _PROSTATECTOMY_TX_RE.search(t)]
+        if len(treatments) != _before:
+            logger.info("patient_status_facts: dropped narrative prostatectomy — "
+                        "chart corrects to radiation-not-surgery, no PSH/path RP")
         # Also broaden cancer-evidence pickup: an explicit prostate-cancer
         # diagnosis in the raw narrative (e.g. prior assessment problem
         # list) is reliable ground truth that PMH may have logged only as
