@@ -336,6 +336,26 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     text = re.sub(r"(?:\s+(?:on|by|as\s+of|dated))?\s*<\s*[^>]{0,40}?\s*>", "", text)
     if not has_cci:
         text = _CCI_SENTENCE.sub("", text)
+    # Strip sentences that narrate the INTERNAL PROMPT SCAFFOLDING (the model
+    # referencing its own instruction blocks) — never clinical content.
+    text = re.sub(
+        r"[^.!?\n]*\b(?:HPI\s+skeleton|AVAILABLE\s+INFORMATION|"
+        r"(?:AGE\s*/?\s*)?LIFE[\s-]?EXPECTANCY\s+GUARDRAIL|GUARDRAIL\s+block|"
+        r"Assessment\s+Narrative|ABSOLUTE\s+RULES|MUST[\s-]?INCLUDE|"
+        r"as\s+(?:per|instructed)\s+(?:the|in)\b[^.!?\n]*\b(?:block|section|above)|"
+        r"the\s+(?:above|provided)\s+(?:block|skeleton|context|information|narrative))"
+        r"\b[^.!?\n]*[.!?]", "", text, flags=re.I)
+    # Meta sentences about the assessment/plan itself.
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*(?:This|The\s+above)\s+"
+                  r"(?:assessment|plan|note)\b[^.!?\n]*"
+                  r"(?:align|address|incorporat|honor|reflect|summariz|is\s+based|"
+                  r"does\s+not\s+include)[^.!?\n]*[.!?]", " ", text, flags=re.I)
+    # Generic trailing meta "Note: ...".
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*Note\s*:\s*(?:The|This|All|I)\b[^.!?\n]*[.!?]",
+                  " ", text, flags=re.I)
+    # Leading orphan name fragment before the first PROBLEM/bullet ("Murray.").
+    text = re.sub(r"^\s*[A-Z][a-zA-Z'-]{1,20}\.\s*(?=(?:PROBLEM|\*|-|Continue|Monitor))",
+                  "", text)
     # tidy whitespace/punctuation left by removals
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\s+([.,;])", r"\1", text)
