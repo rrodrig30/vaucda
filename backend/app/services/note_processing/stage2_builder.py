@@ -365,6 +365,88 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     return text.strip()
 
 
+# Filler words dropped when comparing PROBLEM titles for duplication, plus
+# abbreviation/synonym expansion so "BPH" == "benign prostatic hyperplasia".
+_PROBLEM_STOPWORDS = frozenset({
+    "chronic", "acute", "the", "of", "a", "an", "with", "and", "history", "hx",
+    "status", "post", "ongoing", "known", "stable", "new", "possible", "likely",
+    "management", "follow", "followup", "for", "on", "in", "to", "related",
+    "secondary", "surveillance", "active",
+})
+_PROBLEM_SYNONYMS = {
+    "bph": "benign prostatic hyperplasia",
+    "luts": "lower urinary tract symptoms",
+    "boo": "bladder outlet obstruction",
+    "ed": "erectile dysfunction",
+    "htn": "hypertension",
+    "hld": "hyperlipidemia",
+    "dm": "diabetes mellitus",
+    "pca": "prostate cancer",
+}
+
+
+def _problem_signature(title: str) -> frozenset:
+    t = (title or "").lower()
+    for abbr, full in _PROBLEM_SYNONYMS.items():
+        t = re.sub(rf"\b{abbr}\b", full, t)
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return frozenset(w for w in t.split()
+                     if len(w) > 2 and w not in _PROBLEM_STOPWORDS)
+
+
+def _problems_duplicate(a: frozenset, b: frozenset) -> bool:
+    """Two PROBLEM titles are the same clinical issue when their significant-word
+    signatures are equal, one is fully contained in the other (e.g. 'outlet
+    obstruction' ⊂ 'bladder outlet obstruction'), or they overlap heavily."""
+    if not a or not b:
+        return False
+    if a == b or a <= b or b <= a:
+        return True
+    inter = len(a & b)
+    union = len(a | b)
+    return union > 0 and inter / union >= 0.7
+
+
+def _bullet_units(body: str):
+    """Split a PROBLEM block body into individual bullet units (the plan mixes
+    ' * ' inline separators and newline bullets)."""
+    units = re.split(r"\s*\*\s+|\n[ \t]*[-•]\s*|\n{2,}", body)
+    return [u.strip() for u in units if u.strip()]
+
+
+def _dedupe_problems(plan: str) -> str:
+    """Merge near-duplicate PROBLEM blocks the LLM emitted (e.g. 'Chronic Outlet
+    Obstruction' and 'Chronic Bladder Outlet Obstruction'). Keeps the FIRST block
+    and folds in any genuinely novel bullets from the duplicate; drops the rest.
+    Renumbering is applied separately afterward."""
+    if not plan or "PROBLEM" not in plan.upper():
+        return plan
+    parts = re.split(r"(?i)(?=\bPROBLEM\s*#\s*\d+\s*:)", plan)
+    preamble, blocks = parts[0], parts[1:]
+    if len(blocks) < 2:
+        return plan
+    kept = []  # list of mutable [signature, block_text]
+    for block in blocks:
+        m = re.match(r"(?i)\s*PROBLEM\s*#\s*\d+\s*:\s*([^\n*]*)", block)
+        if not m:
+            kept.append([None, block])
+            continue
+        sig = _problem_signature(m.group(1))
+        dup = next((k for k in kept if k[0] is not None
+                    and _problems_duplicate(k[0], sig)), None)
+        if dup is None:
+            kept.append([sig, block])
+            continue
+        # Fold novel bullets from the duplicate into the kept block.
+        seen = {re.sub(r"[^a-z0-9]", "", u.lower()) for u in _bullet_units(dup[1])}
+        body = block[m.end():]
+        extra = [u for u in _bullet_units(body)
+                 if re.sub(r"[^a-z0-9]", "", u.lower()) not in seen]
+        if extra:
+            dup[1] = dup[1].rstrip() + "".join(f"\n- {u}" for u in extra) + "\n"
+    return preamble + "".join(b for _, b in kept)
+
+
 def _renumber_problems(plan: str) -> str:
     """Renumber 'PROBLEM #N:' / 'Problem #N:' headers sequentially (1, 2, 3, ...).
     The LLM sometimes skips or repeats a number (e.g. #1, #2, #4, #5 — #3 dropped
@@ -1001,6 +1083,7 @@ def assemble_complete_note(
                                          has_cci)
     if plan:
         plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), has_cci)
+        plan = _dedupe_problems(plan)
         plan = _renumber_problems(plan)
 
     # Add Assessment
