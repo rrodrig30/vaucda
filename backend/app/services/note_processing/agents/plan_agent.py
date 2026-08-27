@@ -314,6 +314,20 @@ ACTIVE VOICE — AFFIRMATIVE RECOMMENDATIONS ONLY (MANDATORY):
 - Do NOT recommend tests/exams that are anatomically impossible or inapplicable
   (e.g. a rectal exam / DRE or prostate imaging in a patient without a prostate).
 
+GROUNDED, GUIDELINE-CONCORDANT RECOMMENDATIONS (MANDATORY):
+- EMBODY the guideline in the recommendation itself — write the specific
+  guideline-concordant ACTION and cite the SPECIFIC guideline inline (e.g.
+  "...per NCCN Prostate Cancer Guidelines" or "...per AUA Localized Prostate
+  Cancer Guideline"). NEVER append a vague instruction to "follow NCCN/AUA
+  guidelines" — do not tell the reader to follow guidelines; state what the
+  guideline dictates for THIS patient.
+- NO IF-THEN HYPOTHETICALS. Do NOT write conditional future-scenario chains
+  ("Check PSA; if PSA exceeds 4, then perform a workup with biopsy ± MRI..."). If
+  a future test is warranted, order it with its interval and stop. Every
+  recommendation must be a concrete action GROUNDED in THIS patient's current,
+  documented status — never a generic contingency that may not even apply to this
+  patient (e.g. a prostate-biopsy pathway in a man who is s/p prostatectomy).
+
 PROBLEM SELECTION RULES:
 - Problem #1 MUST match the Chief Complaint from the "CC:" line
 - ONLY create problems for conditions the patient ACTUALLY HAS (documented in HPI, PMH, or Assessment)

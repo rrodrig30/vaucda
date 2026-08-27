@@ -334,6 +334,62 @@ def _is_negative_rec_clause(clause: str) -> bool:
             and bool(_NEG_REC_CLAUSE.search(c)))
 
 
+# Ungrounded if-then hypotheticals — a conditional projecting a FUTURE test /
+# procedure / workup that isn't grounded in THIS patient ("if PSA exceeds 4, then
+# perform a prostate-cancer workup with biopsy"). Patient RETURN-PRECAUTIONS
+# ("return/call if fever") are legitimate and preserved.
+_HYPO_LEAD = _re_unprod.compile(
+    r"^\s*(?:if\b|should\s+(?:he|she|his|her|the\s+patient|the\s+psa|psa|symptoms|"
+    r"there|any|these|results?)|in\s+the\s+event\b|were\s+\w+\s+to\b|in\s+case\b|"
+    r"in\s+the\s+future\b|down\s+the\s+(?:road|line)\b|at\s+(?:that|a\s+later)\s+"
+    r"(?:point|time)\b)", _re_unprod.IGNORECASE)
+_HYPO_ACTION = _re_unprod.compile(
+    r"\b(?:biops\w+|work[\s-]?up|\bMRI\b|mp?MRI|imaging|\bCT\b|\bPET\b|PSMA|scan|"
+    r"refer\w*|evaluat\w+|treat\w+|therap\w+|proceed|pursue|obtain|order|initiate|"
+    r"start|repeat|perform|surger\w+|resection|cystoscop\w+|urodynamic\w+|"
+    r"prostatectomy|radiation|ablation|biopsy)\b", _re_unprod.IGNORECASE)
+# A VAGUE guideline hand-wave clause — "(and then) follow/per/adhere to ...
+# guidelines" as a trailing INSTRUCTION (not a specific inline citation like
+# "per NCCN guidelines for low-risk prostate cancer", which continues past
+# 'guidelines' and is kept).
+_VAGUE_GUIDELINE = _re_unprod.compile(
+    r"^(?:and\s+)?(?:then\s+)?(?:follow|adhere\s+to|manage\s+per|per|according\s+to|"
+    r"in\s+accordance\s+with|consistent\s+with|as\s+per)\b[^.;]{0,40}?\bguidelines?\b\.?$",
+    _re_unprod.IGNORECASE)
+
+
+def _is_hypothetical_rec_clause(clause: str) -> bool:
+    c = clause.strip()
+    return bool(_HYPO_LEAD.match(c) and _HYPO_ACTION.search(c)
+                and not _UP_PRECAUTION.search(c))
+
+
+def _is_vague_guideline_clause(clause: str) -> bool:
+    return bool(_VAGUE_GUIDELINE.match(clause.strip()))
+
+
+def _is_droppable_clause(clause: str) -> bool:
+    """A clause is dropped from the A/P when it is a negative recommendation, an
+    ungrounded if-then hypothetical, or a vague 'follow the guidelines' hand-wave."""
+    return (_is_negative_rec_clause(clause) or _is_hypothetical_rec_clause(clause)
+            or _is_vague_guideline_clause(clause))
+
+
+# Trailing "…and then follow/adhere to/according to … guidelines" hand-wave
+# appended to an otherwise-affirmative recommendation. Stripped from the END of a
+# clause. A SPECIFIC inline citation ("per NCCN guidelines for low-risk prostate
+# cancer") is NOT matched — 'guidelines' there is followed by a topic, and 'per'
+# is deliberately excluded from the verb list.
+_TRAIL_GUIDELINE = _re_unprod.compile(
+    r"\s*[,;]?\s*(?:and\s+)?(?:then\s+)?(?:follow\w*|adher\w+\s+to|manage\s+(?:per|"
+    r"according\s+to)|in\s+accordance\s+with|according\s+to|consistent\s+with)\s+"
+    r"(?:the\s+)?[^.;]{0,30}?\bguidelines?\b\.?\s*$", _re_unprod.IGNORECASE)
+
+
+def _strip_trailing_guideline(clause: str) -> str:
+    return _TRAIL_GUIDELINE.sub("", clause).rstrip(" ,;")
+
+
 def _strip_negative_recs(text: str, is_plan: bool) -> str:
     """Remove negative-recommendation CLAUSES, keeping affirmative content.
     Plan: per bullet, split on ';' and drop negative clauses (drop the bullet if
@@ -342,12 +398,15 @@ def _strip_negative_recs(text: str, is_plan: bool) -> str:
         return text
 
     def _trim(segment: str) -> str:
-        parts = [p.strip() for p in segment.split(";")]
-        kept = [p for p in parts if p and not _is_negative_rec_clause(p)]
+        # Split on ';' AND sentence boundaries ('. ' before a capital / If / Should)
+        # so a trailing hypothetical sentence in the same bullet is isolated.
+        raw = _re_unprod.split(r";|(?<=[.!?])\s+(?=[A-Z])", segment)
+        kept = [_strip_trailing_guideline(p.strip().rstrip(".")) for p in raw
+                if p and p.strip() and not _is_droppable_clause(p)]
+        kept = [p for p in kept if p]
         if not kept:
             return ""
         out = "; ".join(kept)
-        # If we dropped a leading negative clause, uppercase the new lead.
         out = out[0].upper() + out[1:] if out and out[0].islower() else out
         return out
 
