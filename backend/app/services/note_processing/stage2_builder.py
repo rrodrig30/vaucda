@@ -279,6 +279,80 @@ _UP_JUSTIFIED = _re_unprod.compile(
     r'comorbid|frail|advanced\s+age)\b', _re_unprod.IGNORECASE)
 
 
+# ---------------------------------------------------------------------------
+# Active-voice enforcement: recommendations must be affirmative ("recommend you
+# DO X"), never negative ("no need for biopsy", "DRE is not indicated"). Negative
+# recommendation CLAUSES are trimmed; a bullet's affirmative clauses are kept.
+# (Clinical FINDINGS like "no evidence of metastatic disease" are NOT touched —
+# they carry no negation-of-ACTION cue.)
+# ---------------------------------------------------------------------------
+_AFFIRM_LEAD = _re_unprod.compile(
+    r"^\s*[-*•]?\s*(?:continue|recommend|order|schedule|obtain|administer|refer|"
+    r"start|initiate|monitor|counsel|discuss|perform|reassess|return|follow|repeat|"
+    r"maintain|provide|ensure|arrange|place|renew|titrate|advise|educate|encourage|"
+    r"consider|plan|proceed|offer|pursue|check|draw|measure|assess|evaluate|treat|"
+    r"co-?manage|manage|coordinate|prescribe|hold|resume|increase|decrease|adjust)\b",
+    _re_unprod.IGNORECASE)
+_NEG_REC_CLAUSE = _re_unprod.compile(
+    r"\bno\s+(?:need|indication|role|recommendation|further|additional|repeat|routine|"
+    r"dedicated|new|change|immediate|current|ongoing|urologic)\b"
+    r"|\b(?:is|are|was|were)\s+not\s+(?:indicated|recommended|required|needed|necessary|"
+    r"warranted|performed|initiated|planned|pursued|offered|obtained|ordered)\b"
+    r"|\bnot\s+(?:indicated|recommended|necessary|needed|required|warranted)\b"
+    r"|\bdo(?:es)?\s+not\s+(?:recommend|require|need|warrant|indicate)\b"
+    r"|\bwill\s+not\s+(?:order|recommend|pursue|perform|obtain|proceed|initiate)\b"
+    r"|\bno\s+\w+(?:\s+\w+){0,4}?\s+(?:is\s+|are\s+|was\s+|were\s+)?(?:indicated|"
+    r"recommended|required|needed|performed|initiated|planned|ordered|warranted)\b",
+    _re_unprod.IGNORECASE)
+
+
+def _is_negative_rec_clause(clause: str) -> bool:
+    c = clause.strip()
+    return (len(c) >= 4 and not _AFFIRM_LEAD.match(c)
+            and bool(_NEG_REC_CLAUSE.search(c)))
+
+
+def _strip_negative_recs(text: str, is_plan: bool) -> str:
+    """Remove negative-recommendation CLAUSES, keeping affirmative content.
+    Plan: per bullet, split on ';' and drop negative clauses (drop the bullet if
+    none remain). Assessment: per sentence, same, then drop empty sentences."""
+    if not text:
+        return text
+
+    def _trim(segment: str) -> str:
+        parts = [p.strip() for p in segment.split(";")]
+        kept = [p for p in parts if p and not _is_negative_rec_clause(p)]
+        if not kept:
+            return ""
+        out = "; ".join(kept)
+        # If we dropped a leading negative clause, uppercase the new lead.
+        out = out[0].upper() + out[1:] if out and out[0].islower() else out
+        return out
+
+    if is_plan:
+        lines = []
+        for line in text.split("\n"):
+            body = line.lstrip()
+            prefix = line[:len(line) - len(body)]
+            if body[:1] in ("-", "*", "•"):
+                marker, rest = body[0], body[1:].strip()
+                trimmed = _trim(rest)
+                if trimmed:
+                    lines.append(f"{prefix}{marker} {trimmed}")
+                # else: whole bullet was a negative recommendation — drop it
+            else:
+                lines.append(line)
+        return "\n".join(lines)
+    # Assessment narrative: sentence-wise.
+    sents = _re_unprod.split(r"(?<=[.!?])\s+", text.strip())
+    kept = []
+    for s in sents:
+        t = _trim(s)
+        if t:
+            kept.append(t if t.endswith((".", "!", "?")) else t + ".")
+    return " ".join(kept).strip()
+
+
 def _is_unproductive_segment(seg: str) -> bool:
     """True if a Plan bullet / Assessment sentence is a hypothetical-contingency
     or a recommendation-against-an-inapplicable-test (and not a guideline
@@ -884,6 +958,7 @@ def build_stage2_note(
             assessment = scrub_liver_therapy_prose(assessment)
             assessment = _break_dash_bullets(assessment)
             assessment = _scrub_unproductive_assessment(assessment)
+            assessment = _strip_negative_recs(assessment, is_plan=False)
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
@@ -993,6 +1068,7 @@ def build_stage2_note(
                                      _plan_temporal_call, "Plan", ref_note=stage1_note)
             plan = _break_dash_bullets(plan)
             plan = _scrub_unproductive_plan(plan)
+            plan = _strip_negative_recs(plan, is_plan=True)
         except Exception:  # noqa: BLE001
             pass
 

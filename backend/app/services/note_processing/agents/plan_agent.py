@@ -302,6 +302,18 @@ CRITICAL - READ THE CHIEF COMPLAINT FIRST (MANDATORY):
 Look at the "CC:" line in the Stage 1 note. The Chief Complaint is the PRIMARY reason for this visit.
 Problem #1 in your output MUST address this Chief Complaint.
 
+ACTIVE VOICE — AFFIRMATIVE RECOMMENDATIONS ONLY (MANDATORY):
+- Every recommendation MUST be phrased as an ACTION to take: "Continue...",
+  "Order...", "Recommend...", "Schedule...", "Refer...", "Monitor...".
+- NEVER write a negative recommendation — do NOT say "no need for biopsy", "no
+  further imaging is recommended/indicated", "DRE is not indicated", "no
+  surveillance required", "no additional therapy needed", etc. If something is
+  not needed, simply DO NOT MENTION IT — omit it entirely rather than stating it
+  is not needed. (Clinical FINDINGS like "no evidence of metastatic disease" are
+  fine — those are observations, not recommendations.)
+- Do NOT recommend tests/exams that are anatomically impossible or inapplicable
+  (e.g. a rectal exam / DRE or prostate imaging in a patient without a prostate).
+
 PROBLEM SELECTION RULES:
 - Problem #1 MUST match the Chief Complaint from the "CC:" line
 - ONLY create problems for conditions the patient ACTUALLY HAS (documented in HPI, PMH, or Assessment)
