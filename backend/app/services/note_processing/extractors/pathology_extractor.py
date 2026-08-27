@@ -1502,7 +1502,33 @@ def extract_pathology(clinical_document: str) -> str:
     if not pathology_reports:
         return ""
 
-    return '\n\n'.join(pathology_reports)
+    return _truncate_pathology_bleed('\n\n'.join(pathology_reports))
+
+
+# Non-pathology section headers that must TERMINATE a pathology report — a
+# DIAGNOSIS capture whose terminator sits far away otherwise absorbs an
+# intervening medication-reconciliation list, problem list, or ROS (THORNTON:
+# 'Active Outpatient Medications' bled into the pathology section).
+_PATH_BLEED_STOP = re.compile(
+    r"(?im)(?:^|[;\n])\s*(?:"
+    r"Medication\s+Reconc\w*|Current\s+Medications|"
+    r"Active\s+(?:Inpatient|Outpatient)(?:,?\s*(?:Inpatient|Outpatient|and|Clinic))*"
+    r"\s+Medications|Pending\s+Outpatient\s+Medications|"
+    r"Computerized\s+Problem\s+List|Active\s+problems|"
+    r"REVIEW\s+OF\s+SYSTEMS|GU\s+review\s+of\s+systems|"
+    r"PHYSICAL\s+EXAM|VITAL\s+SIGNS|CHIEF\s+COMPLAINT"
+    r")\b.*",
+    re.DOTALL,
+)
+
+
+def _truncate_pathology_bleed(text: str) -> str:
+    """Cut anything from a non-pathology section header onward — the pathology
+    extractor's DIAGNOSIS captures occasionally run past their report into an
+    adjacent med-reconciliation / problem-list / ROS block."""
+    if not text:
+        return text
+    return _PATH_BLEED_STOP.sub("", text).rstrip()
 
 
 def extract_pathology_from_note(note_content: str) -> str:
