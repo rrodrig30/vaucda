@@ -326,6 +326,12 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     # Trailing/inline self-referential editor notes ("Note that I corrected...",
     # "I reported the highest-grade core...").
     text = re.sub(r"(?:^|(?<=[.!?]))\s*Note\s*(?:that|:)\s*I\b[^.!?]*[.!?]?", " ", text, flags=re.I)
+    # Trailing edit-log the model appends ("I made the following changes: * ...").
+    text = re.sub(
+        r"(?is)\b(?:I\s+(?:have\s+)?(?:also\s+)?made\s+the\s+following|"
+        r"(?:the\s+)?following\s+(?:changes?|edits?)\s+(?:were|have\s+been|are)\s+made|"
+        r"Changes?\s+made|Edits?\s+(?:made|applied))\b[^:\n]{0,40}:\s*[-*\s].*",
+        "", text)
     text = re.sub(r"(?:^|(?<=[.!?]))\s*I\s+(?:corrected|revised|updated|added|removed|"
                   r"changed|reported|inferred|noted|adjusted|rewrote)\b[^.!?]*[.!?]?",
                   " ", text, flags=re.I)

@@ -431,6 +431,23 @@ def clean_llm_commentary(text: str) -> str:
     if not text:
         return text
 
+    # Pass -1: high-value meta strips that MUST run before the generic
+    # sentence-drop patterns. (a) A leading "Here is the rewritten HPI:" preamble
+    # — stripped whole, before the greedy "The rewritten HPI ...." pattern can eat
+    # the first real sentence and leave a "Here is" stub. (b) A trailing
+    # self-referential EDIT LOG the model appends ("I made the following changes:
+    # * Added dates ... * Changed ...") — removed from that marker to the end.
+    text = re.sub(
+        r"^\s*Here\s+(?:is|are|'?s)\s+(?:the\s+|my\s+|an?\s+)?"
+        r"(?:rewritten|revised|updated|corrected|reformatted|final|new|complete|"
+        r"comprehensive)\s+[^:\n]{0,50}?:\s*", "", text, count=1, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?is)\b(?:I\s+(?:have\s+)?(?:also\s+)?made\s+the\s+following|"
+        r"(?:the\s+)?following\s+(?:changes?|edits?|revisions?)\s+(?:were|have\s+been|"
+        r"are)\s+made|Changes?\s+made|Edits?\s+(?:made|applied)|"
+        r"I\s+(?:have\s+)?(?:also\s+)?made\s+(?:these|the)\s+edits?)"
+        r"\b[^:\n]{0,40}:\s*[-*\s].*", "", text)
+
     # Pass 0: rubric-leak truncation. Runs FIRST so the rest of the
     # cleaner doesn't waste cycles on the meta-block, and so subsequent
     # sentence-split logic isn't confused by the label colons.
