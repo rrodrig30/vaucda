@@ -191,9 +191,12 @@ async def retrieve_active_rag_context(
     )
 
     all_context_parts = []
+    global_context_parts = []   # community-level map-reduce syntheses lead
     all_sources = []
     seen_doc_ids = set()
-    max_context_length = 4000
+    # The community map-reduce synthesis is the highest-value GraphRAG output;
+    # give the whole context a larger budget so it isn't crowded out by chunks.
+    max_context_length = 9000
 
     for query in queries:
         try:
@@ -211,13 +214,28 @@ async def retrieve_active_rag_context(
             )
 
             if rag_result.has_context:
-                # Add context, avoiding duplicates
+                # Add context, avoiding duplicates. The GraphRAG community-level
+                # synthesis (global map-reduce) and the local graph synthesis are
+                # the high-value outputs — give them a large per-doc budget and
+                # lead with them; chunks get a smaller slice. Surface community
+                # provenance so the community-level contribution is VISIBLE.
                 for doc in rag_result.documents:
-                    if doc.doc_id not in seen_doc_ids:
-                        seen_doc_ids.add(doc.doc_id)
-                        all_context_parts.append(
-                            f"[{doc.source}] {doc.title}\n{doc.content[:500]}"
-                        )
+                    if doc.doc_id in seen_doc_ids:
+                        continue
+                    seen_doc_ids.add(doc.doc_id)
+                    cat = getattr(doc, "category", "") or ""
+                    meta = getattr(doc, "metadata", {}) or {}
+                    if cat in ("graphrag_global", "graphrag_local"):
+                        budget, bucket = 3500, global_context_parts
+                    else:
+                        budget, bucket = 700, all_context_parts
+                    prov = ""
+                    if meta.get("communities_queried"):
+                        prov = (f" [communities queried={meta['communities_queried']}, "
+                                f"mapped answers={meta.get('intermediate_answers', '?')}]")
+                    bucket.append(
+                        f"[{doc.source}] {doc.title}{prov}\n{doc.content[:budget]}"
+                    )
 
                 # Add sources
                 for source in rag_result.sources:
@@ -228,12 +246,16 @@ async def retrieve_active_rag_context(
             logger.warning(f"RAG retrieval failed for query '{query}': {e}")
             continue
 
-    # Assemble context with length limit
-    context = "\n\n---\n\n".join(all_context_parts)
+    # Assemble context with length limit — community-level syntheses lead so they
+    # are never truncated out by lower-value chunk text.
+    context = "\n\n---\n\n".join(global_context_parts + all_context_parts)
     if len(context) > max_context_length:
         context = context[:max_context_length] + "\n[Context truncated for length]"
 
-    logger.info(f"Active RAG retrieval: {len(context)} chars from {len(all_sources)} sources")
+    logger.info(
+        "Active RAG retrieval: %d chars from %d sources "
+        "(%d community-synthesis part(s), %d chunk part(s))",
+        len(context), len(all_sources), len(global_context_parts), len(all_context_parts))
 
     return context, all_sources
 

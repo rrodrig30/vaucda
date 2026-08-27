@@ -69,7 +69,7 @@ class RAGPipeline:
         retriever: RAGRetriever,
         neo4j_client: Optional[Neo4jClient] = None,
         embedding_generator: Optional[EmbeddingGenerator] = None,
-        max_context_length: int = 4000,
+        max_context_length: int = 9000,
         include_metadata: bool = True
     ):
         """
@@ -425,8 +425,14 @@ class RAGPipeline:
             }
 
             logger.info(
-                "GraphRAG retrieved %d documents (global=%s local=%s)",
-                len(documents), global_meta.get("status"), local_meta.get("status")
+                "GraphRAG retrieved %d documents | GLOBAL(map-reduce): status=%s "
+                "communities_queried=%s mapped_answers=%s | LOCAL(graph): status=%s "
+                "entities=%s relationships=%s chunks=%s",
+                len(documents),
+                global_meta.get("status"), global_meta.get("communities_queried", 0),
+                global_meta.get("intermediate_answers", 0),
+                local_meta.get("status"), local_meta.get("entity_count", 0),
+                local_meta.get("relationship_count", 0), local_meta.get("chunk_count", 0),
             )
             return documents, top_meta
 
@@ -455,8 +461,20 @@ class RAGPipeline:
             # Build document section
             doc_parts = []
 
-            # Header with source
+            # Header with source. For GraphRAG community-level results, surface the
+            # map-reduce provenance (communities queried / mapped answers / entities
+            # + relationships traversed) so the community-level contribution is
+            # VISIBLE and clearly distinguished from plain vector chunks.
             header = f"[Source {idx}: {doc.source} - {doc.title}]"
+            _m = doc.metadata or {}
+            if doc.category == "graphrag_global" and _m.get("communities_queried"):
+                header += (f"\n[GraphRAG GLOBAL map-reduce: "
+                           f"{_m['communities_queried']} communities queried, "
+                           f"{_m.get('intermediate_answers', '?')} relevant community "
+                           f"answers synthesized]")
+            elif doc.category == "graphrag_local" and _m.get("entity_count") is not None:
+                header += (f"\n[GraphRAG LOCAL graph: {_m.get('entity_count', 0)} entities, "
+                           f"{_m.get('relationship_count', 0)} relationships traversed]")
             doc_parts.append(header)
 
             # Add metadata if enabled
