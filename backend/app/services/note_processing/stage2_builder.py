@@ -402,6 +402,49 @@ _RADICAL_RP = _re_unprod.compile(
 _PHOENIX_MARGIN = 2.0
 
 
+def _phoenix_status(stage1_note: str):
+    """(is_post_radiation_no_rp, current_psa, nadir_psa) parsed from the PSA CURVE,
+    or None when not applicable / not enough data."""
+    src = stage1_note or ""
+    if not _RADIATION_TX.search(src) or _RADICAL_RP.search(src):
+        return None
+    m = _re_unprod.search(r"(?s)\nPSA CURVE:\s*\n(.*?)(?=\n[A-Z][A-Za-z ]{2,}:|\n=|\Z)", src)
+    if not m:
+        return None
+    vals = []
+    for line in m.group(1).splitlines():
+        fm = _re_unprod.findall(r"(\d+\.\d+)", line)
+        if fm:
+            vals.append(float(fm[-1]))
+    if len(vals) < 2:
+        return None
+    return (vals[0], min(vals))   # (current = most recent, nadir = series min)
+
+
+def _phoenix_directive(stage1_note: str) -> str:
+    """Authoritative-facts directive for a post-radiation patient whose PSA is
+    below the Phoenix recurrence threshold — steers the LLM to surveillance-only."""
+    st = _phoenix_status(stage1_note)
+    if not st:
+        return ""
+    current, nadir = st
+    thresh = nadir + _PHOENIX_MARGIN
+    if current >= thresh:
+        return ""   # recurrence met — let the plan pursue workup
+    return (
+        "BIOCHEMICAL RECURRENCE STATUS (deterministic — authoritative):\n"
+        f"- Patient had DEFINITIVE RADIATION (not prostatectomy). Recurrence is the "
+        f"PHOENIX criterion = nadir + 2.0 ng/mL.\n"
+        f"- PSA nadir {nadir:g} ng/mL; most recent PSA {current:g} ng/mL; Phoenix "
+        f"threshold {thresh:g} ng/mL.\n"
+        f"- Phoenix threshold NOT met -> this is NOT biochemical recurrence. A rise "
+        f"below {thresh:g} (esp. during testosterone recovery after ADT) is expected.\n"
+        f"- Therefore: do NOT order PSMA PET/CT, salvage therapy, or a metastatic "
+        f"workup, and do NOT frame the visit around recurrence. Recommend continued "
+        f"PSA surveillance only."
+    )
+
+
 def _below_phoenix_post_radiation(stage1_note: str) -> bool:
     """DETERMINISTIC post-radiation recurrence check, independent of the note's
     prose. True when the patient had definitive RADIATION (and NOT a radical
@@ -989,6 +1032,13 @@ def build_stage2_note(
             raw_clinical_text=_raw_for_facts or None,
         )
     authoritative_facts = format_facts_for_prompt(patient_facts)
+
+    # Deterministic biochemical-recurrence status for post-RADIATION patients —
+    # injected so the Assessment AND Plan agents never frame a sub-Phoenix PSA as
+    # recurrence and never order PSMA PET / salvage / metastatic workup.
+    _phoenix = _phoenix_directive(stage1_note)
+    if _phoenix:
+        authoritative_facts = (authoritative_facts or "") + "\n\n" + _phoenix
 
     # PHASE 2.1: rebuild the HPI skeleton at Stage 2 so the Assessment
     # agent sees the same structured story the HPI was rendered from.
