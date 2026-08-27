@@ -321,6 +321,16 @@ GROUNDED, GUIDELINE-CONCORDANT RECOMMENDATIONS (MANDATORY):
   Cancer Guideline"). NEVER append a vague instruction to "follow NCCN/AUA
   guidelines" — do not tell the reader to follow guidelines; state what the
   guideline dictates for THIS patient.
+- POST-RADIATION RECURRENCE LOGIC (MANDATORY): after DEFINITIVE RADIATION
+  (IMRT/EBRT/brachytherapy), biochemical recurrence is the PHOENIX criterion =
+  PSA nadir + 2.0 ng/mL — NOT the post-prostatectomy 0.2 threshold. Do NOT
+  recommend PSMA PET/CT, salvage therapy, or a recurrence workup unless the PSA
+  has actually reached nadir + 2.0. A PSA rise that is still BELOW nadir + 2.0 —
+  especially during testosterone recovery after ADT cessation — is expected and
+  warrants PSA surveillance ONLY. A minimum-PSA rule for a test (e.g. "PSMA PET
+  requires PSA >= 0.5") is an AUTHORIZATION FLOOR (a necessary eligibility
+  condition), NOT an indication to order the test — never order PSMA PET just
+  because the PSA cleared that floor.
 - NO IF-THEN HYPOTHETICALS. Do NOT write conditional future-scenario chains
   ("Check PSA; if PSA exceeds 4, then perform a workup with biopsy ± MRI..."). If
   a future test is warranted, order it with its interval and stop. Every

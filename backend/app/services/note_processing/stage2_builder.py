@@ -368,6 +368,49 @@ def _is_vague_guideline_clause(clause: str) -> bool:
     return bool(_VAGUE_GUIDELINE.match(clause.strip()))
 
 
+# The note asserts the biochemical-recurrence threshold is NOT met (post-radiation
+# Phoenix nadir+2 not reached, or the PSA rise is explained by testosterone
+# recovery after ADT). When that is stated, ORDERING PSMA PET / salvage therapy /
+# a recurrence workup is self-contradictory and clinically wrong — a PSA below the
+# recurrence threshold does not warrant recurrence imaging. (VANBRUGGEN: post-IMRT,
+# nadir 0.10, PSA 0.53 during testosterone recovery — Phoenix 2.10 not met — the
+# LLM still ordered PSMA PET off the VA PSA>=0.5 *authorization floor*, which is a
+# necessary eligibility threshold, NOT an indication.)
+_RECURRENCE_NOT_MET = _re_unprod.compile(
+    r"(?i)(?:phoenix[^.]{0,45}?\b(?:not|has\s+not|hasn'?t)\s+(?:been\s+)?met"
+    r"|(?:threshold|criteri\w+)[^.]{0,45}?(?:biochemical\s+)?recurrenc\w*[^.]{0,25}?"
+    r"\b(?:not|has\s+not|hasn'?t)\s+(?:been\s+)?met"
+    r"|\b(?:has\s+)?not\s+(?:yet\s+)?met[^.]{0,30}?(?:criteri\w+|threshold)[^.]{0,25}?"
+    r"(?:recurrence|treatment\s+failure|relapse)"
+    r"|most\s+consistent\s+with\s+testosterone\s+recovery"
+    r"|attribut\w+\s+to\s+testosterone\s+recovery)")
+# An ORDER verb placed DIRECTLY on a recurrence-workup target (so "Order PSMA PET"
+# matches but "Schedule return visit ... to review PSMA results" does not).
+_ORDERS_RECURRENCE_WORKUP = _re_unprod.compile(
+    r"(?i)\b(?:order|obtain|arrange|schedule|proceed\s+with|perform|recommend|"
+    r"pursue|initiate)\s+(?:a\s+|an\s+|the\s+|early\s+|repeat\s+)?"
+    r"(?:PSMA(?:\s*[-/]?\s*PET(?:/CT)?)?|salvage\s+(?:therap\w+|radiation|RT|ADT|"
+    r"treatment|prostatectomy))\b")
+
+
+def _strip_contradicted_recurrence_workup(plan: str, assessment: str) -> str:
+    """Drop Plan bullets that ORDER a recurrence workup (PSMA PET / salvage) when
+    the note itself states the biochemical-recurrence threshold has NOT been met."""
+    if not plan:
+        return plan
+    if not _RECURRENCE_NOT_MET.search(f"{assessment or ''}\n{plan}"):
+        return plan
+    out = []
+    for line in plan.split("\n"):
+        body = line.lstrip()
+        if body[:1] in ("-", "*", "•") and _ORDERS_RECURRENCE_WORKUP.search(body):
+            logger.info("Dropped contradicted recurrence-workup Plan bullet "
+                        "(recurrence threshold stated NOT met)")
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _is_droppable_clause(clause: str) -> bool:
     """A clause is dropped from the A/P when it is a negative recommendation, an
     ungrounded if-then hypothetical, or a vague 'follow the guidelines' hand-wave."""
@@ -1173,6 +1216,7 @@ def build_stage2_note(
             plan = _break_dash_bullets(plan)
             plan = _scrub_unproductive_plan(plan)
             plan = _strip_negative_recs(plan, is_plan=True)
+            plan = _strip_contradicted_recurrence_workup(plan, assessment)
         except Exception:  # noqa: BLE001
             pass
 
