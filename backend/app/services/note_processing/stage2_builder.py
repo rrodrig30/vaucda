@@ -393,12 +393,49 @@ _ORDERS_RECURRENCE_WORKUP = _re_unprod.compile(
     r"treatment|prostatectomy))\b")
 
 
-def _strip_contradicted_recurrence_workup(plan: str, assessment: str) -> str:
+_RADIATION_TX = _re_unprod.compile(
+    r"\b(?:IMRT|EBRT|SBRT|IGRT|VMAT|brachytherap\w+|external\s+beam|radiotherapy|"
+    r"radiation\s+therapy|\bXRT\b|seed\s+implant|proton)\b", _re_unprod.IGNORECASE)
+_RADICAL_RP = _re_unprod.compile(
+    r"radical\s+prostatectomy|\bRRP\b|\bRALP\b|\bRARP\b|"
+    r"robot\w*[\s\w-]{0,25}prostatectomy", _re_unprod.IGNORECASE)
+_PHOENIX_MARGIN = 2.0
+
+
+def _below_phoenix_post_radiation(stage1_note: str) -> bool:
+    """DETERMINISTIC post-radiation recurrence check, independent of the note's
+    prose. True when the patient had definitive RADIATION (and NOT a radical
+    prostatectomy) and the most recent PSA is still BELOW the Phoenix threshold
+    (nadir + 2.0 ng/mL) — i.e. NOT biochemical recurrence, so PSMA PET / salvage
+    is not indicated (VANBRUGGEN: nadir 0.10, current 0.53, Phoenix 2.10)."""
+    src = stage1_note or ""
+    if not _RADIATION_TX.search(src) or _RADICAL_RP.search(src):
+        return False
+    m = _re_unprod.search(r"(?s)\nPSA CURVE:\s*\n(.*?)(?=\n[A-Z][A-Za-z ]{2,}:|\n=|\Z)", src)
+    if not m:
+        return False
+    vals = []
+    for line in m.group(1).splitlines():
+        fm = _re_unprod.findall(r"(\d+\.\d+)", line)
+        if fm:
+            vals.append(float(fm[-1]))   # trailing number on the line is the PSA
+    if len(vals) < 2:
+        return False
+    current, nadir = vals[0], min(vals)   # curve is reverse-chronological
+    return current < nadir + _PHOENIX_MARGIN
+
+
+def _strip_contradicted_recurrence_workup(plan: str, assessment: str,
+                                          stage1_note: str = "") -> str:
     """Drop Plan bullets that ORDER a recurrence workup (PSMA PET / salvage) when
-    the note itself states the biochemical-recurrence threshold has NOT been met."""
+    biochemical recurrence has NOT occurred — either the note states the threshold
+    isn't met, OR (deterministically) the patient is post-radiation with PSA below
+    the Phoenix nadir+2.0 threshold."""
     if not plan:
         return plan
-    if not _RECURRENCE_NOT_MET.search(f"{assessment or ''}\n{plan}"):
+    triggered = (_RECURRENCE_NOT_MET.search(f"{assessment or ''}\n{plan}")
+                 or _below_phoenix_post_radiation(stage1_note))
+    if not triggered:
         return plan
     out = []
     for line in plan.split("\n"):
@@ -1216,7 +1253,7 @@ def build_stage2_note(
             plan = _break_dash_bullets(plan)
             plan = _scrub_unproductive_plan(plan)
             plan = _strip_negative_recs(plan, is_plan=True)
-            plan = _strip_contradicted_recurrence_workup(plan, assessment)
+            plan = _strip_contradicted_recurrence_workup(plan, assessment, stage1_note)
         except Exception:  # noqa: BLE001
             pass
 
