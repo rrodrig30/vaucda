@@ -529,12 +529,12 @@ async def list_user_rules(
     current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List the authenticated user's Assessment & Plan rules (active + inactive)."""
+    """List the Assessment & Plan rules (active + inactive). Rules are SHARED
+    across all accounts — every authenticated user sees the same clinic rule set."""
     if not current_user:
         return []
     stmt = (
         select(UserRule)
-        .where(UserRule.user_id == current_user.user_id)
         .order_by(UserRule.sort_order.asc(), UserRule.id.asc())
     )
     result = await db.execute(stmt)
@@ -547,17 +547,19 @@ async def create_user_rule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new Assessment & Plan rule for the authenticated user."""
-    # Compute default sort_order = (max + 10) for stable append-at-end semantics.
+    """Create a new SHARED Assessment & Plan rule (visible to all accounts).
+    user_id records the creator for audit only — it does not scope visibility."""
+    # Compute default sort_order = (max + 10) for stable append-at-end semantics,
+    # across the GLOBAL rule set.
     if payload.sort_order is None:
-        max_stmt = select(UserRule).where(UserRule.user_id == current_user.user_id).order_by(UserRule.sort_order.desc()).limit(1)
+        max_stmt = select(UserRule).order_by(UserRule.sort_order.desc()).limit(1)
         existing = (await db.execute(max_stmt)).scalars().first()
         next_order = (existing.sort_order + 10) if existing else 0
     else:
         next_order = payload.sort_order
 
     rule = UserRule(
-        user_id=current_user.user_id,
+        user_id=current_user.user_id,  # creator audit only; rules are shared
         rule_text=payload.rule_text.strip(),
         is_active=payload.is_active,
         sort_order=next_order,
@@ -565,7 +567,7 @@ async def create_user_rule(
     db.add(rule)
     await db.commit()
     await db.refresh(rule)
-    logger.info(f"Created user rule {rule.id} for user {current_user.user_id}")
+    logger.info(f"Created shared user rule {rule.id} (by {current_user.user_id})")
     return rule
 
 
@@ -576,11 +578,9 @@ async def update_user_rule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update fields on a single user rule. 404 if it does not belong to the caller."""
-    stmt = select(UserRule).where(
-        UserRule.id == rule_id,
-        UserRule.user_id == current_user.user_id,
-    )
+    """Update fields on a single SHARED rule. Any authenticated user may edit any
+    rule (rules are a shared clinic set). 404 only if the id does not exist."""
+    stmt = select(UserRule).where(UserRule.id == rule_id)
     rule = (await db.execute(stmt)).scalars().first()
     if not rule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
@@ -603,11 +603,9 @@ async def delete_user_rule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a single user rule. 404 if it does not belong to the caller."""
-    stmt = select(UserRule).where(
-        UserRule.id == rule_id,
-        UserRule.user_id == current_user.user_id,
-    )
+    """Delete a single SHARED rule (any authenticated user may delete any rule).
+    404 only if the id does not exist."""
+    stmt = select(UserRule).where(UserRule.id == rule_id)
     rule = (await db.execute(stmt)).scalars().first()
     if not rule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
