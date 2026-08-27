@@ -982,20 +982,32 @@ def build_stage2_note(
 
     # Step 2: Synthesize Assessment
     print("\n[2/6] Synthesizing Assessment (clinical impression)...")
-    assessment = synthesize_assessment(
-        stage1_note=stage1_note,
-        prior_assessments=prior_assessments,
-        ambient_transcript=ambient_transcript,
-        calculator_results=calculator_results,
-        rag_content=rag_content,
-        model=effective_model,
-        task_config=task_config,  # Pass full task_config for multi-provider LLM support
-        visit_progression=visit_progression,
-        cross_specialty_context=cross_specialty_context,
-        prior_ap_context=prior_ap_context_for_assessment,
-        authoritative_facts=authoritative_facts,
-        hpi_skeleton=_stage2_skeleton_text,
-    )
+
+    def _do_synthesize_assessment():
+        return synthesize_assessment(
+            stage1_note=stage1_note,
+            prior_assessments=prior_assessments,
+            ambient_transcript=ambient_transcript,
+            calculator_results=calculator_results,
+            rag_content=rag_content,
+            model=effective_model,
+            task_config=task_config,  # full task_config for multi-provider LLM support
+            visit_progression=visit_progression,
+            cross_specialty_context=cross_specialty_context,
+            prior_ap_context=prior_ap_context_for_assessment,
+            authoritative_facts=authoritative_facts,
+            hpi_skeleton=_stage2_skeleton_text,
+        )
+
+    assessment = _do_synthesize_assessment()
+    # Retry on a transient empty/failed Assessment (LLM timeout / API error) so a
+    # note never ships without an Assessment.
+    _asmt_attempts = 0
+    while (not assessment or not assessment.strip()) and _asmt_attempts < 2:
+        _asmt_attempts += 1
+        logger.warning("Assessment synthesis returned empty — retrying (%d/2)", _asmt_attempts)
+        print(f"      ⚠ Assessment empty — retrying ({_asmt_attempts}/2)...")
+        assessment = _do_synthesize_assessment()
     print(f"      Assessment: {len(assessment) if assessment else 0} chars")
 
     # Deterministic fact guard on the GENERATED assessment. The sanitizer runs
@@ -1103,24 +1115,35 @@ def build_stage2_note(
 
     # Step 4: Synthesize Plan
     print("\n[4/6] Synthesizing Plan (treatment plan)...")
-    plan = synthesize_plan(
-        stage1_note=stage1_note,
-        prior_plans=prior_plans,
-        ambient_transcript=ambient_transcript,
-        calculator_results=calculator_results,
-        rag_content=rag_content,
-        model=effective_model,
-        task_config=task_config,  # Pass full task_config for multi-provider LLM support
-        visit_progression=visit_progression,
-        cross_specialty_context=cross_specialty_context,
-        prior_ap_context=prior_ap_context_for_plan,
-        authoritative_facts=_plan_facts,
-        # Pass the just-generated Assessment so the Plan can be congruent
-        # with the recommendations the Assessment narrative makes. Without
-        # this the two sections drift (e.g. Assessment says "MRI 6-12
-        # months", Plan says "MRI + biopsy").
-        assessment_text=assessment,
-    )
+
+    def _do_synthesize_plan():
+        return synthesize_plan(
+            stage1_note=stage1_note,
+            prior_plans=prior_plans,
+            ambient_transcript=ambient_transcript,
+            calculator_results=calculator_results,
+            rag_content=rag_content,
+            model=effective_model,
+            task_config=task_config,  # full task_config for multi-provider LLM support
+            visit_progression=visit_progression,
+            cross_specialty_context=cross_specialty_context,
+            prior_ap_context=prior_ap_context_for_plan,
+            authoritative_facts=_plan_facts,
+            # Pass the just-generated Assessment so the Plan can be congruent
+            # with the recommendations the Assessment narrative makes.
+            assessment_text=assessment,
+        )
+
+    plan = _do_synthesize_plan()
+    # Retry on a transient empty/failed Plan synthesis — a note must NEVER ship
+    # without a Plan. An LLM timeout (e.g. 60s on a large chart with many injected
+    # rules) or a transient API error otherwise silently drops the whole Plan.
+    _plan_attempts = 0
+    while (not plan or not plan.strip()) and _plan_attempts < 2:
+        _plan_attempts += 1
+        logger.warning("Plan synthesis returned empty — retrying (%d/2)", _plan_attempts)
+        print(f"      ⚠ Plan empty — retrying ({_plan_attempts}/2)...")
+        plan = _do_synthesize_plan()
     print(f"      Plan: {len(plan) if plan else 0} chars")
 
     # Same deterministic fact guard on the generated Plan.
