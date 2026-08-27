@@ -165,12 +165,20 @@ Rewrite the complete PATHOLOGY RESULTS content now:"""
 # section must never contain these. Everything from the first such marker onward
 # is cut.
 _PATH_ECHO_CUT = re.compile(
-    r"(?im)^\s*(?:PATHOLOGY\s+MATERIAL\s*:|"
-    r"MICROSCOPIC\s+EXAM(?:/DIAGNOSIS)?\s*:|"
-    r"HISTORY\s+OF\s+PRESENT\s+ILLNESS\s*:|"
-    r"Impression\s*/\s*PLAN\s*:|CHIEF\s+COMPLAINT\s*:|"
-    r"Prior\s+biopsies?\s*\(OSH\)|SOURCE\s+MATERIAL\s*:).*",
+    r"(?im)^\s*\**\s*(?:PATHOLOGY\s+MATERIAL|"
+    r"MICROSCOPIC\s+EXAM(?:/DIAGNOSIS)?|"
+    r"HISTORY\s+OF\s+PRESENT\s+ILLNESS|"
+    r"Impression\s*/\s*PLAN|CHIEF\s+COMPLAINT|"
+    r"Prior\s+biopsies?\s*\(OSH\)|SOURCE\s+MATERIAL|"
+    r"Provider\s+Narrative|Facility\s*:|Medication\s+Reconc)\b.*",
     re.DOTALL,
+)
+# Standalone scaffolding/metadata fragment lines the composer sometimes leaves
+# (a lone 'MATERIAL**' after a header strip, VistA export metadata rows).
+_PATH_META_LINE = re.compile(
+    r"(?im)^\s*\**\s*(?:MATERIAL\**|Facility\s*:[^\n]*|Provider\s+Narrative|"
+    r"Date\s+(?:of\s+Onset|Modified|Reported|Verified)|VISTA\s+EXPORT|"
+    r"={5,}|-{5,})\s*\**\s*$\n?",
 )
 # LLM meta-preamble the composer sometimes prepends.
 _PATH_PREAMBLE = re.compile(
@@ -185,6 +193,8 @@ def _strip_path_echo(draft: str) -> str:
         return draft
     draft = _PATH_PREAMBLE.sub("", draft, count=1)
     draft = _PATH_ECHO_CUT.sub("", draft)
+    draft = _PATH_META_LINE.sub("", draft)
+    draft = re.sub(r"\n{3,}", "\n\n", draft)
     return draft.strip()
 
 
