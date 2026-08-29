@@ -1,28 +1,74 @@
 """Cystoscopy procedure-note builder.
 
-A cystoscopy note is a PROCEDURE note with a fixed template (see cysto.txt), not
-a clinic note, so it gets its own single-pass builder rather than the Stage-1/
-Stage-2 clinic pipeline. It:
+A cystoscopy note is a PROCEDURE note with a fixed template (cysto_template.txt),
+not a clinic note, so it gets its own single-pass builder rather than the
+Stage-1/Stage-2 clinic pipeline. The output follows cysto_template.txt exactly:
 
-  1. Extracts the header (name / SSN-last4 / date), the indication, and the
-     relevant imaging + labs for the visit from the source document.
-  2. Emits the fixed procedure narrative, branching MALE vs FEMALE for the
-     urethral / pelvic exam portion.
-  3. LLM-generates the per-patient sections — anticipated bladder/urethra
-     Findings, Assessment, Plan, and Disposition — grounded ONLY in that
-     patient's indication, imaging, labs, and known GU diagnoses.
+  Name/SSN/Date header -> INDICATION -> HPI -> IMAGING -> LABS (last 6 months) ->
+  UA WITH CULTURES -> PATHOLOGY -> CONSENT (fixed) -> OPERATOR (fixed) ->
+  NARRATIVE (fixed boilerplate + fixed physical-exam skeleton) -> ASSESSMENT ->
+  PLAN.
 
-The generated sections are anticipatory (the provider edits them after the
-actual procedure); they are specific to the patient's workup, never a fixed
-template.
+Data-driven sections (indication, HPI, imaging, labs, UA/cultures, pathology) are
+auto-populated from the source; CONSENT / OPERATOR / the NARRATIVE + exam skeleton
+are fixed template text; the exam findings (prostatic-urethra length/pattern,
+bladder mucosa, ureteral orifices) are left as fill-in prompts the provider
+completes during/after the procedure. ASSESSMENT and PLAN are LLM-anticipated
+from the workup and edited by the provider. For female patients the prostatic-
+urethra exam line is dropped (no prostate).
 """
 import re
 from typing import Optional
 
 from .llm_helper import synthesize_with_llm
-from .extractors import extract_imaging, extract_medications
+from .extractors import extract_imaging, extract_medications, extract_pathology
 from .extractors.lab_extractor import extract_labs
 from .gu_diagnoses import detect_patient_sex, detect_gu_diagnoses
+
+_MON3 = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+
+def _parse_mdy(s: str):
+    from datetime import date
+    m = re.match(r"\s*(\d{1,2})/(\d{1,2})/(\d{2,4})", s or "")
+    if not m:
+        return None
+    mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    y = y + 2000 if y < 100 else y
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def _filter_labs_recent(labs: str, ref_date_str: str, months: int = 6) -> str:
+    """Keep only lab lines dated within `months` of the procedure date (per the
+    template's 'only last 6 months or less'). Lines without a parseable date
+    (section headers, notes) are kept."""
+    if not labs:
+        return labs
+    from datetime import date, timedelta
+    ref = _parse_mdy(ref_date_str) or date.today()
+    cutoff = ref - timedelta(days=int(months * 30.5))
+    kept = []
+    for line in labs.splitlines():
+        dm = re.search(r"\(([A-Za-z]{3})[a-z]*\s+(\d{1,2}),?\s+(\d{4})\)", line)
+        if not dm:
+            kept.append(line)
+            continue
+        mo = _MON3.get(dm.group(1).lower())
+        if not mo:
+            kept.append(line)
+            continue
+        try:
+            ld = date(int(dm.group(3)), mo, int(dm.group(2)))
+        except ValueError:
+            kept.append(line)
+            continue
+        if ld >= cutoff:
+            kept.append(line)
+    return "\n".join(kept).strip()
 
 # Clinical context the cysto HPI needs beyond imaging/labs/diagnoses.
 _ANTICOAG_RE = re.compile(
@@ -55,27 +101,35 @@ def _scan_sentences(text: str, pattern, max_n: int = 4) -> str:
             break
     return "\n".join(f"- {s}" for s in out)
 
-_FIXED_INTRO = (
-    "After informed consent was obtained, the patient was brought to the "
-    "procedure room, disrobed, draped, and prepped in the usual sterile "
-    "fashion. 2% Lidocaine jelly was placed into the urethra by the nurse/"
-    "medical assistant. A flexible cystoscope with a video camera was placed "
-    "into the urethra and advanced through the urethra forward towards the "
-    "bladder."
+# Fixed procedure template (cysto_template.txt). The NARRATIVE boilerplate and
+# the physical-exam skeleton are verbatim; the exam findings are left as fill-in
+# prompts the provider completes during/after the procedure.
+_OPERATOR = "Ronald Rodriguez, MD"
+_TEMPLATE_NARRATIVE = (
+    "After informed consent was obtained and the risk and benefits discussed "
+    "with the patient, they were brought to the holding area, and then brought "
+    "to the procedure room, where they were prepped and draped in the normal "
+    "sterile fashion.  A time out was performed and the patient confirmed an "
+    "understanding of the procedure and its indication.  2% Lidocaine jelly was "
+    "instilled into the urethra sterilely, and then the patient underwent "
+    "flexible cystoscopy with a 16 Fr flexible cystoscope.  The findings were as "
+    "follows:"
 )
-_MALE_EXAM = (
-    "The Fossa Navicularis and anterior urethra were examined, as well as the "
-    "bulbar urethra, membranous urethra and prostatic urethra."
+_MALE_EXAM_SKELETON = (
+    "-Anterior urethra:  Fossa navicularis, pendulous urethra, bulbar urethra "
+    "and membranous urethra were unremarkable.\n\n"
+    "-Prostatic urethra:  XXX Length.  Pattern was:\n\n"
+    "-Bladder:  The bladder mucosa was inspected and found to have:\n"
+    "Retroflexion was performed demonstrating--\n\n"
+    "-UO's were orthotopic single systems bilaterally and demonstrated:"
 )
-_FEMALE_EXAM = (
-    "A bimanual pelvic exam was performed, examining for pelvic floor descent, "
-    "weakness, leakage with valsalva, and urethral hypermobility (Q-tip test). "
-    "The urethra was examined for strictures, diverticula, or lesions."
-)
-_BLADDER_INSPECTION = (
-    "The bladder was fully inspected, including the trigone, floor, posterior "
-    "wall, lateral walls, dome and the bladder neck through retroflexion. "
-    "Findings included:"
+# Female patients have no prostatic urethra — drop that line to avoid an
+# anatomically-impossible finding.
+_FEMALE_EXAM_SKELETON = (
+    "-Anterior urethra:  The urethra was unremarkable.\n\n"
+    "-Bladder:  The bladder mucosa was inspected and found to have:\n"
+    "Retroflexion was performed demonstrating--\n\n"
+    "-UO's were orthotopic single systems bilaterally and demonstrated:"
 )
 
 _CYSTO_SYSTEM = (
@@ -120,14 +174,19 @@ def _extract_header(text: str) -> dict:
     return {"name": name, "ssn4": ssn4, "date": date}
 
 
+_SECTION_KEYS = ["HPI", "INDICATION", "FINDINGS", "ASSESSMENT", "PLAN", "DISPOSITION"]
+
+
 def _parse_llm_sections(raw: str) -> dict:
-    """Split the LLM response into FINDINGS / ASSESSMENT / PLAN / DISPOSITION."""
-    keys = ["FINDINGS", "ASSESSMENT", "PLAN", "DISPOSITION"]
-    out = {k: "" for k in keys}
-    # Match each header and capture until the next known header (or end).
-    for i, k in enumerate(keys):
-        nxt = "|".join(keys[i + 1:]) or r"\Z"
-        m = re.search(rf"{k}\s*:\s*(.*?)(?=\n\s*(?:{nxt})\s*:|\Z)", raw, re.S | re.I)
+    """Split the LLM response into its labeled sections. Each header captures until
+    the NEXT known header (in ANY order) or end-of-text, so a section can never
+    swallow a following section's content."""
+    out = {k: "" for k in _SECTION_KEYS}
+    others = "|".join(_SECTION_KEYS)
+    for k in _SECTION_KEYS:
+        # stop at any OTHER known header (order-independent)
+        m = re.search(rf"(?:^|\n)\s*{k}\s*:\s*(.*?)(?=\n\s*(?:{others})\s*:|\Z)",
+                      raw, re.S | re.I)
         if m:
             out[k] = re.sub(r"\s+\n", "\n", m.group(1)).strip()
     return out
@@ -247,8 +306,13 @@ def build_cystoscopy_note(
         imaging = _filter_imaging_recent(imaging, ref_year, years=2)
     try:
         labs = (extract_labs(text, header.get("date", "")) or "").strip()
+        labs = _filter_labs_recent(labs, header.get("date", ""), months=6)
     except Exception:
         labs = ""
+    try:
+        pathology = (extract_pathology(text) or "").strip()
+    except Exception:
+        pathology = ""
 
     # Prior TURBTs (dates + findings), oldest first / most recent last.
     turbts = _turbt_history(patient_facts, text)
@@ -318,56 +382,47 @@ def build_cystoscopy_note(
         llm_raw = ""
 
     sections = _parse_llm_sections(llm_raw)
-    hpi_m = re.search(r"(?:^|\n)\s*HPI\s*:\s*(.*?)(?=\n\s*(?:INDICATION|FINDINGS)\s*:|\Z)",
-                      llm_raw, re.S | re.I)
-    cysto_hpi = re.sub(r"\s+\n", "\n", hpi_m.group(1).strip()) if hpi_m else ""
-    ind_m = re.search(r"INDICATION\s*:\s*(.*?)(?=\n\s*FINDINGS\s*:|\Z)", llm_raw, re.S | re.I)
-    indication = (ind_m.group(1).strip() if ind_m else "").strip()
-    if not indication:
-        indication = (gu[0].name if gu else "Cystoscopic evaluation of the lower urinary tract")
+    cysto_hpi = sections["HPI"]
+    indication = sections["INDICATION"] or (
+        gu[0].name if gu else "Cystoscopic evaluation of the lower urinary tract")
 
-    exam = _FEMALE_EXAM if sex == "female" else _MALE_EXAM
-    findings = sections["FINDINGS"] or "No mucosal lesions, tumors, or stones were identified."
-    narrative = f"{_FIXED_INTRO}\n\n{exam}\n\n{_BLADDER_INSPECTION} {findings}"
+    exam_skeleton = _FEMALE_EXAM_SKELETON if sex == "female" else _MALE_EXAM_SKELETON
+    narrative = f"{_TEMPLATE_NARRATIVE}\n\n{exam_skeleton}"
 
+    # Fixed template layout (cysto_template.txt). Data-driven sections (indication,
+    # HPI, imaging, labs, UA/cultures, pathology) are auto-populated; CONSENT,
+    # OPERATOR and the NARRATIVE + exam skeleton are fixed; the exam findings and
+    # ASSESSMENT/PLAN are completed/edited by the provider around the procedure.
     lines = [
-        "                                              CYSTOSCOPY NOTE",
-        f"Patient Name: {header['name']}",
-        f"Last 4 SSN: {header['ssn4']}",
-        f"Date of Procedure: {header['date']}",
+        f"Name: {header['name']}",
+        f"SSN {header['ssn4']}",
+        f"Date: {header['date']}",
+        "\t\t\tCYSTOSCOPY NOTE",
         "",
-        f"Indication for Procedure: {indication}",
+        f"INDICATION: {indication}",
         "",
+        f"HPI: {cysto_hpi}",
+        "",
+        "IMAGING:",
+        (imaging or ""),
+        "",
+        "LABS (only last 6 months or less):",
+        (labs or ""),
+        "",
+        "UA WITH CULTURES IF AVAILABLE:",
+        (culture or ""),
+        "",
+        "PATHOLOGY:",
+        (pathology or ""),
+        "",
+        "CONSENT: Obtained via Web IMED",
+        "",
+        f"OPERATOR: {_OPERATOR}",
+        "",
+        f"NARRATIVE:  {narrative}",
+        "",
+        f"ASSESSMENT:\n{sections['ASSESSMENT']}",
+        "",
+        f"PLAN:\n{sections['PLAN']}",
     ]
-    if cysto_hpi:
-        lines += [f"HPI: {cysto_hpi}", ""]
-    lines += [
-        "Relevant Imaging for this Visit:",
-        (imaging or "None available for this visit."),
-        "",
-        "Relevant Labs for this Visit:",
-        (labs or "None available for this visit."),
-        "",
-    ]
-
-    # Prior TURBT history — oldest first, most recent presented last.
-    if turbts:
-        lines.append("Prior TURBT History (most recent last):")
-        for d, finding in turbts:
-            lines.append(f"  - {d}: {finding}")
-        lines.append("")
-
-    lines += [
-        f"Narrative: {narrative}",
-        "",
-        f"Assessment: {sections['ASSESSMENT']}",
-        "",
-        f"Plan: {sections['PLAN']}",
-        "",
-        "Surveillance Schedule (routine post-treatment follow-up):",
-        _surveillance_table(),
-        "",
-        "Complications: None.",
-        f"Disposition: {sections['DISPOSITION'] or 'Patient tolerated the procedure well and was discharged in stable condition.'}",
-    ]
-    return "\n".join(lines).strip() + "\n"
+    return "\n".join(lines).rstrip() + "\n"
