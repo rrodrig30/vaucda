@@ -254,7 +254,7 @@ class Settings(BaseSettings):
     # batch_processor; the guard applies to the DEDUPED size, so this ceiling only
     # rejects charts that are genuinely huge even after trimming duplication.
     # 0 disables the guard.
-    BATCH_MAX_FILE_CHARS: int = 400000
+    BATCH_MAX_FILE_CHARS: int = 500000
 
     @property
     def batch_allowed_dirs_list(self) -> List[str]:
