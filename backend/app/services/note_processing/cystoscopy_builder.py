@@ -53,20 +53,27 @@ def _filter_labs_recent(labs: str, ref_date_str: str, months: int = 6) -> str:
     cutoff = ref - timedelta(days=int(months * 30.5))
     kept = []
     for line in labs.splitlines():
+        ld = None
+        # "(Aug 04, 2026)" month-name format
         dm = re.search(r"\(([A-Za-z]{3})[a-z]*\s+(\d{1,2}),?\s+(\d{4})\)", line)
-        if not dm:
-            kept.append(line)
-            continue
-        mo = _MON3.get(dm.group(1).lower())
-        if not mo:
-            kept.append(line)
-            continue
-        try:
-            ld = date(int(dm.group(3)), mo, int(dm.group(2)))
-        except ValueError:
-            kept.append(line)
-            continue
-        if ld >= cutoff:
+        if dm and _MON3.get(dm.group(1).lower()):
+            try:
+                ld = date(int(dm.group(3)), _MON3[dm.group(1).lower()], int(dm.group(2)))
+            except ValueError:
+                ld = None
+        if ld is None:
+            # "(12/03/2025)" numeric M/D/Y format
+            dn = re.search(r"\((\d{1,2})/(\d{1,2})/(\d{2,4})\)", line)
+            if dn:
+                y = int(dn.group(3))
+                y = y + 2000 if y < 100 else y
+                try:
+                    ld = date(y, int(dn.group(1)), int(dn.group(2)))
+                except ValueError:
+                    ld = None
+        if ld is None:
+            kept.append(line)      # header / undated line — keep
+        elif ld >= cutoff:
             kept.append(line)
     return "\n".join(kept).strip()
 
@@ -385,6 +392,17 @@ def build_cystoscopy_note(
     cysto_hpi = sections["HPI"]
     indication = sections["INDICATION"] or (
         gu[0].name if gu else "Cystoscopic evaluation of the lower urinary tract")
+
+    # Apply the same active-voice enforcement clinic notes get: no negative
+    # recommendations ("no biopsy required"), no ungrounded if-then, no vague
+    # "follow guidelines" hand-wave. Keeps affirmative recommendations + findings.
+    try:
+        from .stage2_builder import _strip_negative_recs
+        sections["ASSESSMENT"] = _strip_negative_recs(sections["ASSESSMENT"], is_plan=False)
+        # The cysto Plan is a prose paragraph -> sentence-based processing.
+        sections["PLAN"] = _strip_negative_recs(sections["PLAN"], is_plan=False)
+    except Exception:
+        pass
 
     exam_skeleton = _FEMALE_EXAM_SKELETON if sex == "female" else _MALE_EXAM_SKELETON
     narrative = f"{_TEMPLATE_NARRATIVE}\n\n{exam_skeleton}"
