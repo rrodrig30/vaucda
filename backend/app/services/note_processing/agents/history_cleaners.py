@@ -356,6 +356,18 @@ _INLINE_PLACEHOLDER_RE = re.compile(
 )
 
 
+# Bare single-token template placeholders the LLM leaves when it lacks a value,
+# e.g. "His most recent PSA, on [date], is undetectable" -> the "[date]" (and the
+# orphaned connective/comma) must go. Consumes a leading connective ("on"/"in"/
+# "dated") and flanking commas so the sentence reads cleanly after removal.
+_BARE_PLACEHOLDER_RE = re.compile(
+    r'\s*,?\s*(?:\b(?:on|in|at|dated|of|as\s+of)\s+)?'
+    r'\[(?:dates?|age|values?|results?|time|year|month|day|number|dose|dosage|'
+    r'name|sex|gender|X|\?|TBD)\]\s*,?',
+    re.IGNORECASE,
+)
+
+
 # Stripped legacy patterns retained for backward compat with callers
 # that haven't switched yet.
 _LEGACY_INLINE_PATTERNS = (
@@ -453,6 +465,9 @@ def clean_llm_commentary(text: str) -> str:
     # Pass 2: inline placeholder removal (handles any survivors that
     # weren't inside a recognizable sentence boundary).
     text = _INLINE_PLACEHOLDER_RE.sub('', text)
+    # Pass 2b: bare single-token placeholders ("[date]", "[value]") + orphaned
+    # connective/comma.
+    text = _BARE_PLACEHOLDER_RE.sub(' ', text)
 
     # Pass 3: sentence-level drops
     for pat in _SENTENCE_DROP_PATTERNS:

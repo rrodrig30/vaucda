@@ -39,6 +39,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from .gu_diagnoses import GUDiagnosis, detect_gu_diagnoses, detect_patient_sex
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,6 +109,12 @@ _HEDGING_RE = re.compile(
 )
 
 
+# A cancer term immediately FOLLOWED by "screening" is a screening context
+# (pre-diagnosis), not a confirmed diagnosis. "Surveillance" is intentionally
+# excluded here — that can mean active surveillance of a real cancer.
+_TRAILING_SCREENING_RE = re.compile(r"\s*screening\b", re.IGNORECASE)
+
+
 def _is_family_history_or_hedged(text: str, match_start: int, window: int = 80) -> bool:
     """True if the span at ``match_start`` is a family-history mention or
     a hedged/suspected/comparison reference rather than a confirmed
@@ -139,6 +147,14 @@ def find_cancer_evidence(text: str) -> List[str]:
             # patient. Hedged / suspected / comparison mentions are not
             # confirmed diagnoses. Both must be excluded.
             if _is_family_history_or_hedged(text, m.start()):
+                continue
+            # Trailing-screening guard: "prostate cancer SCREENING" is a
+            # screening context, not a diagnosis. The preceding-window hedge
+            # filter only catches "SCREENING FOR prostate cancer" (screening
+            # before); this catches "screening" AFTER the term. Fixes FLORES
+            # ("#Prostate cancer screening." + benign biopsy) mis-promoted to
+            # cancer_status=PRESENT -> a fabricated "prostate adenocarcinoma".
+            if _TRAILING_SCREENING_RE.match(text[m.end():m.end() + 18]):
                 continue
             found.append(m.group(0))
     # Dedup case-insensitively while preserving first-seen order
@@ -211,6 +227,47 @@ _COMPLETION_VERB_PATTERN = (
 )
 _COMPLETION_VERB_RE = re.compile(_COMPLETION_VERB_PATTERN, re.IGNORECASE)
 
+# Discussion / counseling / option-list / intent / CONDITIONAL-FUTURE markers.
+# When any sit in the same window as a treatment keyword, the prose is COUNSELING
+# about the option or describing a FUTURE/CONDITIONAL plan — NOT asserting the
+# treatment was performed. The conditional-future clauses ("if his PSA rises",
+# "should the PSA become detectable") specifically catch SALVAGE-radiation
+# hypotheticals: a s/p-RALP patient with an undetectable PSA whose chart merely
+# DISCUSSES salvage RT must NOT be logged as s/p radiation (which would wrongly
+# set phoenix_applicable=True and confabulate a radiation course). Shared by both
+# treatment detectors so they filter identically.
+_TREATMENT_DISCUSSION_RE = re.compile(
+    r"\b(?:discuss(?:ed|ing|ion)?|consider(?:ed|ing|ation)?|"
+    r"offer(?:ed|ing)?|interest(?:ed)?\s+in|may\s+benefit|"
+    r"option(?:s)?\s+(?:of|for|include|are|to)|"
+    r"candidate\s+(?:for|of)|recommend(?:ed|ing|ation)?|"
+    r"plan(?:ned|ning)?\s+(?:for|to)|consult(?:ed|ation)?\s+(?:for|to)|"
+    r"referred\s+(?:for|to)|scheduled\s+(?:for|to)|"
+    r"await(?:ing|s)?|elect(?:ed)?\s+against|"
+    r"under\s+consideration|"
+    r"including|consist(?:ing|s)\s+of|such\s+as|"
+    r"pursu(?:e|ing|ed)|"
+    r"if\s+(?:his\s+|the\s+)?psa|should\s+(?:his\s+|the\s+)?psa|"
+    r"when\s+(?:his\s+|the\s+)?psa|"
+    r"if\s+[^.]{0,40}?(?:rise|recur|detectable|persist|elevat)|"
+    r"would\s+(?:need|require|be\s+offered|consider)|"
+    r"never\s+heard\s+of|never\s+been\s+told\s+about)\b",
+    re.IGNORECASE,
+)
+_TREATMENT_DECLINED_RE = re.compile(
+    r"\b(?:declined|declines|refuses|refused|deferred|not\s+a\s+candidate)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_hypothetical_or_declined_treatment(text: str, match_start: int,
+                                           match_end: int) -> bool:
+    """True if the treatment mention is a discussion / option / conditional-
+    future / declined statement rather than a performed treatment."""
+    window = text[max(0, match_start - 100):match_end + 60]
+    return bool(_TREATMENT_DISCUSSION_RE.search(window)
+                or _TREATMENT_DECLINED_RE.search(window))
+
 
 def _completion_verb_nearby(text: str, position: int, window: int = 60) -> bool:
     """True if a completion verb appears within the ``window`` chars BEFORE
@@ -234,6 +291,11 @@ def find_completed_treatments(text: str) -> List[str]:
                 continue
             if not _completion_verb_nearby(text, m.start()):
                 continue
+            # Reject discussion / option / conditional-future ("salvage RT if PSA
+            # rises") / declined mentions — a completion-like verb can sit near a
+            # merely-planned treatment (parity with find_treatment_in_raw_...).
+            if _is_hypothetical_or_declined_treatment(text, m.start(), m.end()):
+                continue
             # Capture the verb..noun span for a readable quote
             quote_start = max(0, m.start() - 60)
             raw = text[quote_start:m.end()]
@@ -255,6 +317,8 @@ def find_completed_treatments(text: str) -> List[str]:
             if not qualifier_re.search(window_text):
                 continue
             if not _completion_verb_nearby(text, m.start()):
+                continue
+            if _is_hypothetical_or_declined_treatment(text, m.start(), m.end()):
                 continue
             found.append(m.group(0))
 
@@ -396,31 +460,10 @@ def find_treatment_in_raw_clinical_text(text: str) -> List[str]:
     if not text:
         return []
 
-    declined_re = re.compile(
-        r"\b(?:declined|declines|refuses|refused|deferred|not\s+a\s+candidate)\b",
-        re.IGNORECASE,
-    )
-    # Discussion / counseling / option-list / intent markers. When any
-    # of these sit in the same window as a "completion-verb-like" token,
-    # the prose is COUNSELING about the option, not asserting it was
-    # performed. Without this filter, sentences like
-    #   "He says that he was only offered RALP and AS at USA"
-    # — where 'was on' matches inside 'was only' or where 'history of'
-    # appears nearby — register as completed RALP.
-    discussion_re = re.compile(
-        r"\b(?:discuss(?:ed|ing|ion)?|consider(?:ed|ing|ation)?|"
-        r"offer(?:ed|ing)?|interest(?:ed)?\s+in|may\s+benefit|"
-        r"option(?:s)?\s+(?:of|for|include|are|to)|"
-        r"candidate\s+(?:for|of)|recommend(?:ed|ing|ation)?|"
-        r"plan(?:ned|ning)?\s+(?:for|to)|consult(?:ed|ation)?\s+(?:for|to)|"
-        r"referred\s+(?:for|to)|scheduled\s+(?:for|to)|"
-        r"await(?:ing|s)?|elect(?:ed)?\s+against|"
-        r"under\s+consideration|"
-        r"including|consist(?:ing|s)\s+of|such\s+as|"
-        r"pursu(?:e|ing|ed)|"
-        r"never\s+heard\s+of|never\s+been\s+told\s+about)\b",
-        re.IGNORECASE,
-    )
+    # Shared module-level filters (see _TREATMENT_DISCUSSION_RE / _DECLINED_RE):
+    # keeps both treatment detectors identical, incl. conditional-future markers.
+    declined_re = _TREATMENT_DECLINED_RE
+    discussion_re = _TREATMENT_DISCUSSION_RE
 
     found: List[str] = []
     for tx_pattern in _RAW_TREATMENT_TOKENS:
@@ -511,6 +554,59 @@ _ADT_ACTIVE_RE = re.compile(
     r"(?:ADT|androgen\s+deprivation|Lupron|Eligard|leuprolide|degarelix)",
     re.IGNORECASE,
 )
+# A FINITE oncologic course that has reached its end. "completed" (not just
+# "stopped/discontinued") is the phrasing the verb-based detectors miss, and
+# it is the dominant context-blind-recommendation driver once both stages
+# share these facts: the Plan is told to "continue Eligard" because a finished
+# fixed course still looks active.
+_ADT_FINITE_COMPLETED_RE = re.compile(
+    r"(?:completed|finished|received\s+all\s+of)\s+(?:his\s+|her\s+|the\s+|a\s+|an\s+)?"
+    r"(?:\d+[-\s]?(?:year|yr|month|mo)s?|planned|prescribed|"
+    r"\d+\s*(?:of|/)\s*\d+\s*(?:dose|injection|shot|cycle))"
+    r"[^.\n]{0,40}?(?:course|therapy|ADT|androgen\s+deprivation|"
+    r"leuprolide|lupron|eligard|goserelin|zoladex|degarelix|"
+    r"abiraterone|enzalutamide|apalutamide|darolutamide)"
+    r"|(?:final|last)\s+(?:dose|injection|shot)\s+(?:of\s+)?"
+    r"(?:ADT|leuprolide|lupron|eligard|goserelin|zoladex|degarelix)",
+    re.IGNORECASE,
+)
+_ADT_TOKEN_RE = re.compile(
+    r"\b(?:ADT|androgen\s+deprivation|leuprolide|lupron|eligard|goserelin|"
+    r"zoladex|degarelix|relugolix|orgovyx|abiraterone|enzalutamide|"
+    r"apalutamide|darolutamide)\b",
+    re.IGNORECASE,
+)
+
+
+_ADT_CLASS_TOKENS = (
+    "eligard", "leuprolide", "lupron", "degarelix", "goserelin", "zoladex",
+    "zoladez", "relugolix", "orgovyx", "firmagon", "abiraterone", "zytiga",
+    "enzalutamide", "xtandi", "apalutamide", "erleada", "darolutamide",
+    "nubeqa", "bicalutamide", "casodex",
+)
+_CHEMO_CLASS_TOKENS = ("docetaxel", "cabazitaxel", "taxotere", "jevtana")
+
+
+def _drop_meds_for_inactive_category(
+    active_meds: List[str], status: Dict[str, str],
+) -> List[str]:
+    """Drop ADT/chemo-class drugs from the active-med list when the
+    category-level status detector marked that class DISCONTINUED/COMPLETED."""
+    if not active_meds or not status:
+        return active_meds
+    adt_inactive = status.get("adt") in ("DISCONTINUED", "COMPLETED")
+    chemo_inactive = status.get("chemo") in ("DISCONTINUED", "COMPLETED")
+    if not (adt_inactive or chemo_inactive):
+        return active_meds
+    kept: List[str] = []
+    for med in active_meds:
+        ml = med.lower()
+        if adt_inactive and any(t in ml for t in _ADT_CLASS_TOKENS):
+            continue
+        if chemo_inactive and any(t in ml for t in _CHEMO_CLASS_TOKENS):
+            continue
+        kept.append(med)
+    return kept
 
 
 def _detect_treatment_active_status(
@@ -531,20 +627,21 @@ def _detect_treatment_active_status(
     out: Dict[str, str] = {}
     if not raw_text:
         return out
-    if not confirmed_treatments:
-        return out
-    joined = "\n".join(confirmed_treatments).lower()
+    joined = "\n".join(confirmed_treatments).lower() if confirmed_treatments else ""
 
-    # ADT — explicit discontinuation language dominates over active language.
-    # Only emit a verdict when a confirmed ADT-class treatment was detected.
-    if re.search(
+    _adt_in_confirmed = bool(re.search(
         r"\b(?:adt|androgen\s+deprivation|leuprolide|lupron|eligard|"
         r"degarelix|abiraterone|enzalutamide|apalutamide|darolutamide)\b",
         joined,
-    ):
+    ))
+    _adt_finite_completed = bool(_ADT_FINITE_COMPLETED_RE.search(raw_text))
+
+    # ADT — explicit discontinuation language dominates over active language.
+    if _adt_in_confirmed:
         has_adt_discontinued = bool(
             _ADT_DISCONTINUED_RE.search(raw_text)
             or _ADT_DISCONTINUED_BY_FOLLOWING_RE.search(raw_text)
+            or _adt_finite_completed
         )
         has_adt_active = bool(_ADT_ACTIVE_RE.search(raw_text))
         if has_adt_discontinued:
@@ -553,6 +650,13 @@ def _detect_treatment_active_status(
             out['adt'] = 'ACTIVE'
         else:
             out['adt'] = 'UNCERTAIN'
+    elif _adt_finite_completed and _ADT_TOKEN_RE.search(raw_text):
+        # Ungated SAFE-direction path: when confirmed_treatments missed the ADT
+        # (patient_status_facts misclassified a treated patient as naive), we
+        # still mark a FINITE-COMPLETED course as DISCONTINUED. We only emit in
+        # the completed direction here — never ACTIVE — so this cannot create a
+        # false "continue ADT" recommendation.
+        out['adt'] = 'DISCONTINUED'
 
     # One-time treatments — confirmed-list membership IS the COMPLETED signal.
     if re.search(
@@ -696,6 +800,18 @@ class PatientStatusFacts:
     biopsy, TURBT, DEXA, etc.). Surfaced separately because these were
     frequently missed by synthesis agents despite being decision-driving."""
 
+    patient_sex: str = ""
+    """'female' | 'male' | '' from demographics. Guards against
+    anatomically-impossible narratives (prostate cancer in a female patient)."""
+
+    other_gu_diagnoses: List[GUDiagnosis] = field(default_factory=list)
+    """Non-prostate GU diagnoses (renal / bladder / upper-tract / testicular /
+    penile / adrenal), each with organ + category (cancer / indeterminate /
+    benign) + grade + status. Everything else in this layer models ONLY
+    prostate cancer; without this the CC/HPI/Assessment/Plan agents have no
+    structured anchor for a renal-mass or bladder-tumor primary and default to
+    a prostate/PSA narrative (or hallucinate prostate cancer)."""
+
     treatment_active_status: Dict[str, str] = field(default_factory=dict)
     """Per-category current-status verdict for the HPI agent. Categories:
     'adt' (DISCONTINUED | ACTIVE), 'radiation'/'prostatectomy'/'focal'
@@ -708,6 +824,7 @@ class PatientStatusFacts:
 def extract_patient_status_facts(
     stage1_note: str,
     raw_clinical_text: Optional[str] = None,
+    raw_source_text: Optional[str] = None,
 ) -> PatientStatusFacts:
     """Compute deterministic ground-truth facts from clinical sources.
 
@@ -838,10 +955,57 @@ def extract_patient_status_facts(
             detect_current_active_treatments,
             extract_procedure_findings,
         )
-        timeline = extract_clinical_timeline(raw_for_timeline)
+        # Timeline also runs on the ORIGINAL text (same normalizer-strips-
+        # pathology-headers reason as procedure findings) so copy-forward biopsy
+        # events date to their own report, not a nearer non-prostate stamp.
+        timeline = extract_clinical_timeline(raw_source_text or raw_for_timeline)
         current_phase = classify_current_phase(timeline)
+        # current_active_treatments now comes from the AUTHORITATIVE VistA
+        # RXOP active-outpatient list (see detect_current_active_treatments).
+        # That list is definitive for current meds, so we do NOT post-filter
+        # it by narrative treatment-status. (ADT/Eligard is handled separately
+        # via treatment_active_status because intermittent ADT is often absent
+        # from the active Rx list even when ongoing.)
         active_meds = detect_current_active_treatments(raw_for_timeline)
-        proc_findings = extract_procedure_findings(raw_for_timeline)
+        # Procedure findings run on the ORIGINAL text: the VistA->CPRS normalizer
+        # strips the pathology "Collected: <date>" specimen headers that anchor a
+        # biopsy to its own report, so on normalized text a prostate biopsy can be
+        # mis-dated to a nearer non-prostate specimen (BILEK: colon adenoma
+        # 06/01/2011). Same normalizer trap as gu-diagnoses / the lesion table.
+        proc_findings = extract_procedure_findings(raw_source_text or raw_for_timeline)
+
+        # Authoritative reconciliation: cancer_status is the single source of
+        # truth for whether this patient HAS prostate cancer. When it is
+        # ABSENT (no confirmed diagnosis), any prostate-cancer DIAGNOSIS or
+        # prostate STAGING_DECISION event that a regex scraped from the raw
+        # text is spurious — it would make the HPI assert "diagnosed with
+        # metastatic prostate cancer" while the Assessment (which reads
+        # cancer_status) correctly hedges. Drop them so the HPI can't
+        # contradict the ground truth. (Non-prostate events — renal-mass
+        # surveillance, biopsies, procedures — are preserved.)
+        if status == "ABSENT" and timeline:
+            _pca_re = re.compile(
+                r"prostate\s+(?:cancer|adenocarcinoma)|"
+                r"metastatic\s+prostate|mCRPC|mHSPC|"
+                r"biochemical\s+(?:recurrence|failure|relapse)|"
+                r"castrat", re.IGNORECASE)
+            timeline = [
+                e for e in timeline
+                if not (e.event_type in ("DIAGNOSIS", "STAGING_DECISION")
+                        and _pca_re.search(f"{e.modality} {e.detail}"))
+            ]
+
+    # Multi-cancer ground truth: patient sex + non-prostate GU diagnoses. The
+    # rest of this function is prostate-only; these give the CC/HPI/Assessment/
+    # Plan agents a structured anchor for a renal-mass / bladder-tumor primary.
+    # GU-diagnosis + sex detection must see the ORIGINAL clinician text, not the
+    # VistA->CPRS-normalized form: the normalizer strips narrative clinical
+    # signal (venous invasion "invades the right renal vein", "No change in the
+    # RCC") that the confirmation gate relies on. Same trap as the lesion-size
+    # table — normalized text silently loses the diagnosis. Prefer raw_source_text.
+    detect_src = raw_source_text or raw_for_timeline or stage1_note or ""
+    patient_sex = detect_patient_sex(detect_src)
+    other_gu = detect_gu_diagnoses(detect_src)
 
     return PatientStatusFacts(
         cancer_status=status,
@@ -853,6 +1017,8 @@ def extract_patient_status_facts(
         biopsy_all_negative=biopsy_all_negative,
         asap_present=asap,
         inconsistencies=inconsistencies,
+        patient_sex=patient_sex,
+        other_gu_diagnoses=other_gu,
         treatment_active_status=treatment_active,
         clinical_timeline=timeline,
         current_phase=current_phase,
@@ -868,6 +1034,107 @@ def extract_patient_status_facts(
 # Conditional phrasings ("considering focal therapy", "patient declined
 # focal therapy", "if focal therapy is offered") do NOT match because they
 # lack a completion verb.
+# --- Treatment-fact cleaning (dedup + non-urologic / ED exclusion) ----------
+_NONURO_CANCER_RE = re.compile(
+    r"\blymphoma\b|\bMALT\b|gastric|\blung\b|colon|colorect|breast|pancrea|"
+    r"hepatocell|esophag|melanoma|leukemia|glioma|head\s+and\s+neck|"
+    r"non[\s-]?small[\s-]?cell|small[\s-]?cell|sarcoma|thyroid", re.IGNORECASE)
+_URO_TX_ANCHOR_RE = re.compile(
+    r"prostat|\bPSA\b|\bRRP\b|\bRALP\b|\bRARP\b|\bRP\b|bladder|renal|kidney|"
+    r"nephr|urotheli|\bTURBT\b|\bADT\b|androgen|leuprolide|Lupron|Eligard|"
+    r"degarelix|abiraterone|enzalutamide|apalutamide|darolutamide|brachy|"
+    r"Lutetium|Pluvicto|cystectomy|penectomy|orchiectomy", re.IGNORECASE)
+_ED_TX_RE = re.compile(
+    r"\bEDEX\b|alprostadil|\bICI\b|intracavernosal|penile\s+inject|\bTrimix\b|"
+    r"sildenafil|tadalafil|vardenafil|Viagra|Cialis|Levitra|vacuum\s+erection|"
+    r"penile\s+(?:implant|prosthesis)", re.IGNORECASE)
+
+
+def _canon_tx_modality(m: str) -> str:
+    """Collapse treatment-modality synonyms to a canonical key so duplicates
+    (e.g. 'radiation therapy' vs 'radiation', 'RRP' vs 'radical retropubic
+    prostatectomy') merge."""
+    s = (m or "").lower()
+    if any(k in s for k in ("prostatectomy", "rrp", "ralp", "rarp", "\brp\b")):
+        return "prostatectomy"
+    if any(k in s for k in ("radiation", "ebrt", "imrt", "sbrt", "igrt", "xrt",
+                            "brachy", "seed implant", "radiotherap")):
+        return "radiation"
+    if any(k in s for k in ("adt", "androgen", "leuprolide", "lupron", "eligard",
+                            "goserelin", "zoladex", "degarelix", "firmagon", "orgovyx")):
+        return "ADT"
+    if any(k in s for k in ("abiraterone", "enzalutamide", "apalutamide",
+                            "darolutamide", "arsi")):
+        return "ARSI"
+    if any(k in s for k in ("docetaxel", "cabazitaxel", "chemo")):
+        return "chemotherapy"
+    if any(k in s for k in ("lutetium", "pluvicto", "radioligand", "radium")):
+        return "radioligand"
+    if any(k in s for k in ("focal", "hifu", "tulsa", "cryo")):
+        return "focal"
+    return s.strip()
+
+
+def clean_treatment_facts(facts: "PatientStatusFacts") -> "PatientStatusFacts":
+    """Dedup and de-noise the treatment facts before they reach the CC/HPI/
+    Assessment/Plan agents:
+
+      - drop treatments whose context is a NON-UROLOGIC cancer (e.g. radiation
+        for gastric MALT lymphoma) unless a urologic anchor is present;
+      - drop erectile-dysfunction treatments (ICI / EDEX / alprostadil) from the
+        cancer-treatment list;
+      - collapse duplicate / re-worded events by canonical modality (so
+        "radiation therapy" + "radiation" and the dozen "s/p RRP" phrasings
+        become one each).
+    """
+    def _drop(blob: str) -> bool:
+        if _ED_TX_RE.search(blob):
+            return True
+        if _NONURO_CANCER_RE.search(blob) and not _URO_TX_ANCHOR_RE.search(blob):
+            return True
+        return False
+
+    # Clinical timeline: keep non-treatment events untouched; clean treatments.
+    kept, seen = [], {}
+    for e in facts.clinical_timeline:
+        if not e.event_type.startswith("TREATMENT"):
+            kept.append(e)
+            continue
+        blob = f"{e.modality} {e.detail} {getattr(e, 'source_quote', '')}"
+        if _drop(blob):
+            continue
+        canon = _canon_tx_modality(e.modality) or (e.modality or "")
+        e.modality = canon
+        key = (canon, e.event_type)
+        if key in seen:
+            prev = seen[key]
+            if (e.date_key or "9999") < (prev.date_key or "9999"):
+                kept[kept.index(prev)] = e
+                seen[key] = e
+            continue
+        seen[key] = e
+        kept.append(e)
+    facts.clinical_timeline = kept
+
+    # confirmed_urologic_treatments: drop non-uro/ED, then keep ONE cleanest
+    # representative per canonical modality (prefer no non-urologic-cancer term,
+    # then the shortest phrasing — so 'Gastric MALT lymphoma' text doesn't
+    # survive as the prostatectomy line).
+    def _score(s: str):
+        return (1 if _NONURO_CANCER_RE.search(s) else 0, len(s))
+    by_canon: Dict[str, str] = {}
+    for t in facts.confirmed_urologic_treatments:
+        if _drop(t):
+            continue
+        canon = _canon_tx_modality(t)
+        cur = by_canon.get(canon)
+        if cur is None or _score(t) < _score(cur):
+            by_canon[canon] = t
+    facts.confirmed_urologic_treatments = list(by_canon.values())
+    facts.treatment_naive = len(by_canon) == 0
+    return facts
+
+
 _TREATMENT_ASSERTION_RE = re.compile(
     r"(?:" + _COMPLETION_VERB_PATTERN + r")"
     r"(?:\s+\S+){0,8}?"
@@ -888,12 +1155,30 @@ _CANCER_STATE_RE = re.compile(
     r"salvage\s+(?:therapy|treatment|radiation|EBRT|prostatectomy|chemo)|"
     r"post[\s\-]?treatment\s+(?:surveillance|recurrence|PSA|status)|"
     r"recurrent\s+(?:prostate\s+)?(?:cancer|disease)|"
-    r"diagnosis\s+of\s+prostate\s+(?:cancer|adenocarcinoma)|"
+    r"diagnos(?:is\s+of|ed\s+with)\s+prostate\s+(?:cancer|adenocarcinoma)|"
     r"history\s+of\s+prostate\s+(?:cancer|adenocarcinoma)|"
+    r"(?:treated|managed)\s+for\s+prostate\s+(?:cancer|adenocarcinoma)|"
+    r"known\s+prostate\s+(?:cancer|adenocarcinoma)|"
     r"completed\s+definitive\s+(?:focal\s+therapy|radiation|treatment|brachytherapy)|"
     r"after\s+(?:definitive\s+)?(?:focal\s+therapy|focal\s+ablation|"
     r"radiation|radiation\s+therapy|EBRT|brachytherapy|HIFU|TULSA|"
     r"prostatectomy|radical\s+prostatectomy)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Prostate-specific vocabulary that is anatomically impossible in a female
+# patient. Bare "prostate cancer" is included here (unlike the male ABSENT
+# guard, which requires an assertion form) because a female can have NO
+# prostate context at all — any un-negated mention is an error.
+_FEMALE_IMPOSSIBLE_RE = re.compile(
+    r"\b(?:"
+    r"prostate\s+(?:cancer|adenocarcinoma|carcinoma)|"
+    r"prostatectomy|"
+    r"PSA\s+(?:screening|surveillance|kinetics|velocity|doubling)|"
+    r"(?:elevated|rising)\s+PSA|"
+    r"androgen[\s\-]+deprivation|\bADT\b|"
+    r"Gleason|Grade\s+Group"
     r")\b",
     re.IGNORECASE,
 )
@@ -951,6 +1236,14 @@ def sanitize_context_against_facts(
             if m and not _preceded_by_negation(sentence, m.start()):
                 drop_reason = "cancer-state vocabulary (no cancer evidence)"
 
+        # Prostate cancer / PSA screening / prostatectomy / ADT are anatomically
+        # impossible in a female patient — strip any un-negated positive mention
+        # (a "no prostate cancer" negation is preserved by the guard).
+        if not drop_reason and (facts.patient_sex or "").lower() == "female":
+            fm = _FEMALE_IMPOSSIBLE_RE.search(sentence)
+            if fm and not _preceded_by_negation(sentence, fm.start()):
+                drop_reason = "prostate-specific assertion in a female patient"
+
         if not drop_reason and not facts.phoenix_applicable:
             # Phoenix without radiation is always wrong, even for cancer-present
             # patients (Phoenix is post-radiation specifically).
@@ -989,8 +1282,44 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
         "Treat the following as fact. If your generated text contradicts",
         "any line below, your answer is wrong and will be rejected.",
         "",
-        f"PROSTATE_CANCER_STATUS: {facts.cancer_status}",
     ]
+
+    if facts.patient_sex:
+        lines.append(f"PATIENT_SEX: {facts.patient_sex}")
+        if facts.patient_sex == "female":
+            lines.append(
+                "  -> Prostate cancer, PSA screening, prostatectomy and ADT are "
+                "ANATOMICALLY IMPOSSIBLE in a female patient. Never write any "
+                "prostate-cancer narrative, and read PROSTATE_CANCER_STATUS below "
+                "as not-applicable."
+            )
+        lines.append("")
+
+    # Non-prostate GU diagnoses are frequently the PRIMARY reason for the visit
+    # (renal mass, bladder tumor). List them FIRST so the CC and HPI anchor to
+    # the correct organ instead of defaulting to a prostate/PSA narrative.
+    if facts.other_gu_diagnoses:
+        lines.append(
+            "OTHER_UROLOGIC_DIAGNOSES (non-prostate — often the PRIMARY problem):"
+        )
+        for d in facts.other_gu_diagnoses:
+            bits = [f"{d.organ}: {d.name}", f"[{d.category}]"]
+            if d.grade:
+                bits.append(f"grade {d.grade}")
+            if d.status:
+                bits.append(d.status)
+            lines.append("  - " + " ".join(bits))
+        lines.append(
+            "  -> Center the CC and HPI on these when present. An 'indeterminate' "
+            "mass is NEITHER cancer NOR benign — frame it as a mass/lesion of "
+            "uncertain significance (NEVER call an unbiopsied mass 'benign'). The "
+            "prostate status below is a SEPARATE, organ-specific finding: "
+            "PROSTATE_CANCER_STATUS: ABSENT does NOT mean the patient is "
+            "cancer-free."
+        )
+        lines.append("")
+
+    lines.append(f"PROSTATE_CANCER_STATUS: {facts.cancer_status}")
     if facts.cancer_evidence:
         lines.append("  Evidence found:")
         for ev in facts.cancer_evidence[:5]:
@@ -1060,10 +1389,23 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
         lines.append("CURRENT_ACTIVE_TREATMENTS (last-known-active per source):")
         for med in facts.current_active_treatments[:8]:
             lines.append(f"  - {med}")
+        # Differentiate CHRONIC meds (continue) from FINITE oncologic courses
+        # (do NOT auto-continue). The old blanket "MUST keep every med" forced
+        # the Plan to write "continue Eligard/abiraterone" even when the course
+        # was completed — the dominant context-blind-recommendation error once
+        # both stages share these facts.
         lines.append(
-            "  Note: the Plan MUST keep every continuing med listed above on "
-            "the patient's regimen unless the source explicitly documents "
-            "discontinuation."
+            "  Note: keep CHRONIC medications (BPH alpha-blockers / 5-ARIs, "
+            "supplements, etc.) on the regimen unless the source documents "
+            "discontinuation. But a FINITE oncologic course — LHRH-agonist "
+            "ADT (leuprolide/Eligard/goserelin/degarelix), an ARSI "
+            "(abiraterone/enzalutamide/apalutamide/darolutamide), or "
+            "chemotherapy — must NOT be auto-continued: consult "
+            "CURRENT_TREATMENT_STATUS and CLINICAL_TIMELINE. If that course is "
+            "completed/finite (e.g. 'completed a 2-year course', 'final/last "
+            "dose', a fixed number of injections/cycles delivered, or "
+            "CURRENT_TREATMENT_STATUS shows COMPLETED/DISCONTINUED), frame it "
+            "as COMPLETED and do NOT order its continuation."
         )
 
     if facts.clinical_timeline:

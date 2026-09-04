@@ -17,6 +17,7 @@ Renderer guarantees:
 """
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Any
 
 
@@ -177,6 +178,16 @@ def render_prior_diagnosis(dx: Optional[Dict], sex: str) -> str:
     return " ".join(parts) + "."
 
 
+# A narrative_note that restates the treatment (verb-first) rather than adding
+# new context — dropped so it doesn't echo the main clause.
+_RESTATEMENT_NOTE_RE = re.compile(
+    r"^(?:completed?|complete|started|starting|initiated?|began|underwent|"
+    r"received|declined?|ongoing|continuing|most\s+recent|performed|"
+    r"status\s+post|s/p|treated\s+with)\b",
+    re.IGNORECASE,
+)
+
+
 def render_treatment_history(events: Optional[List[Dict]], sex: str) -> str:
     """Chronological list of treatment events. One sentence per event."""
     if not events:
@@ -217,9 +228,14 @@ def render_treatment_history(events: Optional[List[Dict]], sex: str) -> str:
         else:
             sentence = (f"{p['sub'].capitalize()} {status_verb} "
                         f"{modality_label}{date_part}.")
-        # Append optional narrative note
-        if evt.get("narrative_note"):
-            sentence = sentence.rstrip(".") + f" — {evt['narrative_note']}."
+        # Append optional narrative note — but only when it adds NEW context,
+        # not when it merely restates the treatment already in the sentence
+        # ("completed ADT in July 2023" on a completed-ADT event, "most recent
+        # TURBT on 05/12/2026"). A restatement starts with a status/treatment
+        # verb; a genuine note starts with for/with/at/due-to/etc.
+        note = evt.get("narrative_note")
+        if note and not _RESTATEMENT_NOTE_RE.match(note.strip()):
+            sentence = sentence.rstrip(".") + f" — {note}."
         sentences.append(sentence)
     return " ".join(sentences)
 
@@ -243,21 +259,32 @@ def render_psa_trajectory(psa: Optional[Dict]) -> str:
         "stable": "remains stable at",
         "fluctuating": "has fluctuated, most recently at",
     }.get(direction, "is")
-    if direction in ("stable", "fluctuating"):
+    has_prior = psa.get("prior_value") is not None
+    if not has_prior:
+        # Only one PSA value — a direction word ("remains stable",
+        # "increased") falsely implies a comparison and contradicts the
+        # Assessment (HOLES: HPI "remains stable at 93.36" vs Assessment
+        # "markedly elevated"). State the value without a trend.
+        sentence = f"Most recent PSA {current_v} ng/mL ({current_d})."
+    elif direction in ("stable", "fluctuating"):
         sentence = f"PSA {direction_verb} {current_v} ng/mL ({current_d})."
-    elif psa.get("prior_value") is not None:
+    else:
         prior_v = psa["prior_value"]
         prior_d = _format_date(psa.get("prior_date"))
         sentence = (f"PSA {direction_verb} from {prior_v} ng/mL "
                     f"({prior_d}) to {current_v} ng/mL ({current_d}).")
-    else:
-        sentence = f"Most recent PSA {current_v} ng/mL ({current_d})."
-    # Optional peak context
-    if (psa.get("peak_value") is not None
-            and psa.get("peak_value") != current_v
-            and psa.get("peak_value") != psa.get("prior_value")):
+    # Optional peak context — only when the peak is meaningfully HIGHER than
+    # the values already stated. A peak equal to (or below) current/prior is
+    # redundant noise ("stable at 0.19 ... Peak 0.19"); the LLM sometimes
+    # picks such a peak, so require strictly greater.
+    peak_v = psa.get("peak_value")
+    prior_v = psa.get("prior_value")
+    if (peak_v is not None
+            and isinstance(peak_v, (int, float))
+            and peak_v > current_v
+            and (prior_v is None or peak_v > prior_v)):
         peak_d = _format_date(psa.get("peak_date"))
-        sentence += f" Peak {psa['peak_value']} ng/mL ({peak_d})."
+        sentence += f" Peak {peak_v} ng/mL ({peak_d})."
     return sentence
 
 
@@ -306,14 +333,50 @@ def render_current_regimen(regimen: Optional[List[Dict]], sex: str) -> str:
             f"{', '.join(head)}, and {tail}.")
 
 
+# A redundant interval lead-in the LLM prefixes onto the summary, e.g.
+# "since the visit on 2026-01-12," / "since the last urology visit,". The
+# renderer supplies its own "Since the prior urology visit on DATE," so this
+# is stripped to avoid doubling.
+_INTERVAL_LEADIN_RE = re.compile(
+    # The renderer supplies its own "Since the prior urology visit on DATE,"
+    # anchor, so strip a redundant lead-in the LLM prefixes referring back to
+    # that prior encounter. Covers the noun the LLM varies on (visit /
+    # evaluation / encounter / appointment / assessment / consult[ation] /
+    # clinic visit) with the date before OR after it, and REQUIRES the
+    # trailing comma so it only removes the lead-in clause — never a
+    # legitimate "...follow-up visit was uneventful" mid-summary.
+    r"^since\b[^.\n]{0,45}?\b(?:visit|evaluation|encounter|appointment|"
+    r"assessment|consult(?:ation)?)\b(?:\s+on\s+[^,.\n]{0,25})?\s*,\s*",
+    re.IGNORECASE,
+)
+# ISO dates that occasionally leak into free-text summary/denies fields.
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+# A word echoed across "for"/"of" ("evaluation for evaluation", "management
+# of management") — collapse to a single occurrence. Same word both sides so
+# distinct phrases ("side of head") are untouched.
+_WORD_ECHO_RE = re.compile(r"\b(\w+)\s+(?:for|of)\s+\1\b", re.IGNORECASE)
+
+
 def render_interval_status(interval: Optional[Dict], sex: str) -> str:
     """'Since last visit on DATE, ... Patient denies X, Y, Z.'"""
     if not interval:
         return ""
     p = _pron(sex)
     parts: List[str] = []
+    last_d = interval.get("last_visit_date")
     if interval.get("summary"):
-        parts.append(interval["summary"].rstrip("."))
+        s = interval["summary"].rstrip(".")
+        # When we supply our own "Since the prior visit on DATE," lead-in
+        # below, strip a redundant one the LLM prefixed onto the summary
+        # (avoids "Since the prior urology visit on Jan 12, 2026, since the
+        # visit on 2026-01-12, ...").
+        if last_d:
+            s = _INTERVAL_LEADIN_RE.sub("", s).strip()
+        # Humanize any leaked ISO dates (2026-01-12 -> January 12, 2026).
+        s = _ISO_DATE_RE.sub(lambda m: _format_date(m.group(0)), s)
+        if s:
+            parts.append(s)
     if interval.get("denies"):
         denies = interval["denies"]
         if len(denies) == 1:
@@ -327,11 +390,27 @@ def render_interval_status(interval: Optional[Dict], sex: str) -> str:
     if not parts:
         return ""
     # Anchor to last visit date if provided
-    last_d = interval.get("last_visit_date")
     if last_d:
         joined = ". ".join(parts) + "."
-        return f"Since the prior urology visit on {_format_date(last_d)}, {joined.lower()[0]}{joined[1:]}"
+        # Lowercase the first letter so it flows after "..., " — but NOT when
+        # the first word is an acronym (PSA, CT, MRI) or the summary would be
+        # mangled ("pSA has risen").
+        first_word = joined.split(" ", 1)[0]
+        if not (len(first_word) >= 2 and first_word[:2].isupper()):
+            joined = joined[0].lower() + joined[1:]
+        return f"Since the prior urology visit on {_format_date(last_d)}, {joined}"
     return ". ".join(parts) + "."
+
+
+# Lead-in phrases the LLM commonly prefixes onto today_reason. Stripped so
+# the rendered "Today's visit is for ..." sentence doesn't double up into
+# "Today's visit is for The patient presents for ...".
+_TODAY_REASON_LEADIN_RE = re.compile(
+    r"^(?:the\s+patient\s+|he\s+|she\s+|patient\s+)?"
+    r"(?:presents?|is\s+here|is\s+seen|returns?|comes?\s+in|is\s+being\s+seen)"
+    r"(?:\s+today)?\s+(?:for|to|with)\s+",
+    re.IGNORECASE,
+)
 
 
 def render_today_reason(today_reason: Optional[str]) -> str:
@@ -339,6 +418,13 @@ def render_today_reason(today_reason: Optional[str]) -> str:
     if not today_reason or not today_reason.strip():
         return ""
     reason = today_reason.strip().rstrip(".")
+    # Drop a redundant "The patient presents for"/"returns for"/etc. lead-in
+    # so it doesn't concatenate with our "Today's visit is for" stem.
+    reason = _TODAY_REASON_LEADIN_RE.sub("", reason).strip()
+    # Also drop a bare leading "for " left after partial matches.
+    reason = re.sub(r"^for\s+", "", reason, flags=re.IGNORECASE).strip()
+    if not reason:
+        return ""
     return f"Today's visit is for {reason}."
 
 
@@ -376,4 +462,10 @@ def render_full_hpi(draft: Dict) -> str:
     # carry a stray "by urology" if the LLM emitted it in a free-string
     # field like visit_reason / today_reason / narrative_note.
     from .history_cleaners import strip_urology_referral_framing
-    return strip_urology_referral_framing(text)
+    text = strip_urology_referral_framing(text)
+    # Collapse a word echoed across a preposition, e.g. "urology consultation
+    # for evaluation of ..." becomes "urologic evaluation for evaluation of ..."
+    # after the referral scrub — reduce "evaluation for evaluation" to a single
+    # "evaluation". Same word on both sides only, so distinct phrases are safe.
+    text = _WORD_ECHO_RE.sub(r"\1", text)
+    return text

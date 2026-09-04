@@ -242,8 +242,16 @@ class Settings(BaseSettings):
     BATCH_ALLOWED_DIRS: str = '[]'  # JSON array of allowed base directories for batch processing
     BATCH_MAX_RETRIES: int = 3
     BATCH_FILE_SEPARATOR: str = "+++++++++"
-    BATCH_FILE_TIMEOUT: int = 5400  # seconds per file (90 minutes)
+    BATCH_FILE_TIMEOUT: int = 1200  # seconds per file (20 minutes) — a stuck cloud
+    # call auto-fails that one note so the batch moves on instead of freezing
     BATCH_MAX_FILES: int = 200  # maximum files in a single batch
+    # Reject only ABSURDLY oversized charts before the pipeline. These VistA
+    # exports are routinely 150-240K chars (copy-forward bloat) and process fine,
+    # so the guard must clear them — it only blocks the rare monster (400K+) that
+    # would peg the server. The 10-min per-note timeout is the backstop for merely
+    # slow files. (Was 120000, which wrongly rejected normal large charts.)
+    # 0 disables the guard.
+    BATCH_MAX_FILE_CHARS: int = 350000
 
     @property
     def batch_allowed_dirs_list(self) -> List[str]:

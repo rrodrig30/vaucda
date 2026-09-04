@@ -139,6 +139,18 @@ async def process_single_file(
     if not content.strip():
         raise ValueError(f"File is empty: {file_path.name}")
 
+    # Oversized-chart guard: reject a chart too large to process without pegging
+    # the server (copy-forward-bloated VistA dumps of 150K+ chars). Fail it fast
+    # here so the batch skips it in milliseconds instead of churning for the full
+    # timeout window and making the whole app unresponsive. Tunable via
+    # BATCH_MAX_FILE_CHARS (0 disables).
+    _max_chars = getattr(settings, "BATCH_MAX_FILE_CHARS", 0) or 0
+    if _max_chars and len(content) > _max_chars:
+        raise ValueError(
+            f"File too large: {len(content):,} chars (limit {_max_chars:,}). "
+            f"Process this chart separately or trim copy-forward duplication."
+        )
+
     # Prepend visit date so extractors (IPSS, age calculation) can use it
     if visit_date:
         content = f"VISIT DATE: {visit_date}\n\n{content}"
@@ -328,6 +340,10 @@ async def run_batch_processing(
                 )
                 result.error_message = error_msg
                 purge_func()
+                # Fail-fast on timeout: retrying a stuck/oversized note just burns
+                # another full timeout window (30 min across 3 attempts). Mark it
+                # failed and move on so the batch is never frozen by one bad note.
+                break
 
             except Exception as e:
                 error_msg = f"Processing error: {type(e).__name__}"

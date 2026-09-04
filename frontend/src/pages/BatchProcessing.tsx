@@ -13,7 +13,16 @@ interface SelectedFile {
   size: number
   noteType: string
   outputName: string
+  included: boolean
 }
+
+// Batch note-type options — 'auto' keeps the per-file filename detection.
+const BATCH_NOTE_TYPES = [
+  { value: 'auto', label: 'Auto-detect (from filename)' },
+  { value: 'urology_clinic', label: 'Urology Clinic' },
+  { value: 'urology_consult', label: 'Urology Consult' },
+  { value: 'cystoscopy', label: 'Cystoscopy Note' },
+]
 
 interface CompletedFile {
   filename: string
@@ -48,6 +57,34 @@ function triggerDownload(filename: string, content: string) {
   URL.revokeObjectURL(url)
 }
 
+// Save a single file, letting the user CHOOSE the destination via the File
+// System Access "Save As" dialog (Chrome/Edge/Opera). Falls back to a plain
+// browser download into the default download folder on Firefox/Safari.
+// Returns false only on a real error (AbortError = user cancelled, treated as
+// a no-op success). Never throws.
+async function saveFileWithPicker(filename: string, content: string): Promise<boolean> {
+  if (typeof (window as any).showSaveFilePicker === 'function') {
+    try {
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName: filename,
+        types: [{
+          description: 'VAUCDA note',
+          accept: { 'text/plain': ['.vaucda', '.txt'] },
+        }],
+      })
+      const writable = await handle.createWritable()
+      await writable.write(content)
+      await writable.close()
+      return true
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return true // user cancelled — no-op
+      // Any other error (e.g. permission) → fall back to a normal download.
+    }
+  }
+  triggerDownload(filename, content)
+  return true
+}
+
 // File System Access API: returns true on browsers (Chrome/Edge/Opera)
 // where we can request a writable directory handle and stream `.vaucda`
 // files into an `output/` subfolder of the user's chosen input folder.
@@ -68,10 +105,26 @@ async function writeFileToOutputSubfolder(
   await writable.close()
 }
 
+// Write directly into a user-chosen output directory (no 'output/' subfolder).
+async function writeFileToDir(
+  dirHandle: any,
+  filename: string,
+  content: string,
+): Promise<void> {
+  const fileHandle = await dirHandle.getFileHandle(filename, { create: true })
+  const writable = await fileHandle.createWritable()
+  await writable.write(content)
+  await writable.close()
+}
+
 export const BatchProcessing: React.FC = () => {
   const [selectedFiles, setSelectedFiles] = useState<SelectedFile[]>([])
   const [selectionError, setSelectionError] = useState<string | null>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
+  // Separate <input> for picking one or more individual files (not a folder).
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  // Note-type override applied to every file in the batch ('auto' = per-file).
+  const [batchNoteType, setBatchNoteType] = useState<string>('auto')
 
   // When the user picks a folder via the modern File System Access API
   // (Chrome/Edge), we hold a writable handle so completed `.vaucda`
@@ -80,6 +133,24 @@ export const BatchProcessing: React.FC = () => {
   const [dirHandle, setDirHandle] = useState<any>(null)
   const [folderName, setFolderName] = useState<string | null>(null)
   const [folderSaveError, setFolderSaveError] = useState<string | null>(null)
+  // Optional user-chosen destination for the generated files. When set,
+  // completed notes are written directly here instead of <input>/output/.
+  const [outputDirHandle, setOutputDirHandle] = useState<any>(null)
+  const [outputFolderName, setOutputFolderName] = useState<string | null>(null)
+
+  // Let the user pick a specific folder to save the generated .vaucda files to.
+  const handlePickOutputFolder = async () => {
+    try {
+      const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' })
+      setOutputDirHandle(handle)
+      setOutputFolderName(handle.name)
+      setFolderSaveError(null)
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        setFolderSaveError(`Could not open output folder: ${err?.message || String(err)}`)
+      }
+    }
+  }
 
   const [visitDate, setVisitDate] = useState('')
 
@@ -146,6 +217,7 @@ export const BatchProcessing: React.FC = () => {
             file, name: file.name, size: file.size,
             noteType: detectNoteType(file.name),
             outputName: file.name.replace(/\.[^/.]+$/, '') + '.vaucda',
+            included: true,
           })
         }
       }
@@ -171,6 +243,15 @@ export const BatchProcessing: React.FC = () => {
   // explicitly chooses the legacy picker via the hidden input.
   // Cannot write back to the input folder — completed files go to the
   // browser's download folder instead.
+  // Include/exclude individual files from the batch.
+  const toggleFileIncluded = (name: string) => {
+    setSelectedFiles(prev => prev.map(sf =>
+      sf.name === name ? { ...sf, included: !sf.included } : sf))
+  }
+  const setAllIncluded = (val: boolean) => {
+    setSelectedFiles(prev => prev.map(sf => ({ ...sf, included: val })))
+  }
+
   const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = e.target.files
     if (!fileList || fileList.length === 0) return
@@ -187,6 +268,7 @@ export const BatchProcessing: React.FC = () => {
           file, name: file.name, size: file.size,
           noteType: detectNoteType(file.name),
           outputName: file.name.replace(/\.[^/.]+$/, '') + '.vaucda',
+          included: true,
         })
       }
     }
@@ -202,7 +284,8 @@ export const BatchProcessing: React.FC = () => {
 
   const handleStartBatch = useCallback(() => {
     setShowConfirm(false)
-    if (selectedFiles.length === 0) return
+    const filesToProcess = selectedFiles.filter(sf => sf.included)
+    if (filesToProcess.length === 0) return
 
     setIsProcessing(true)
     setProcessError(null)
@@ -211,11 +294,14 @@ export const BatchProcessing: React.FC = () => {
     setTotalContent(null)
     setCurrentFile(null)
     setCurrentIndex(0)
-    setTotalFiles(selectedFiles.length)
+    setTotalFiles(filesToProcess.length)
 
     const handle = notesApi.batchUploadProcessStream(
-      selectedFiles.map(sf => sf.file),
-      { visitDate: visitDate || undefined },
+      filesToProcess.map(sf => sf.file),
+      {
+        visitDate: visitDate || undefined,
+        noteType: batchNoteType !== 'auto' ? batchNoteType : undefined,
+      },
       {
         onFileStart: (data) => {
           setCurrentFile(data.filename)
@@ -227,8 +313,16 @@ export const BatchProcessing: React.FC = () => {
           // (Chrome/Edge File System Access path). Otherwise the user
           // re-downloads via the per-row button in the results table.
           let saved = false
-          if (dirHandle && data.note_content) {
-            writeFileToOutputSubfolder(dirHandle, data.output_filename, data.note_content)
+          // Prefer the user-chosen output folder (write directly); otherwise
+          // fall back to <input folder>/output/. If neither, the per-row
+          // download button is used.
+          const writer = outputDirHandle && data.note_content
+            ? writeFileToDir(outputDirHandle, data.output_filename, data.note_content)
+            : (dirHandle && data.note_content
+              ? writeFileToOutputSubfolder(dirHandle, data.output_filename, data.note_content)
+              : null)
+          if (writer) {
+            writer
               .then(() => {
                 setCompletedFiles(prev => prev.map(cf =>
                   cf.outputFilename === data.output_filename
@@ -236,7 +330,7 @@ export const BatchProcessing: React.FC = () => {
               })
               .catch(err => {
                 setFolderSaveError(
-                  `Auto-save of ${data.output_filename} to <folder>/output/ failed: `
+                  `Auto-save of ${data.output_filename} failed: `
                   + `${err?.message || String(err)}`,
                 )
               })
@@ -324,6 +418,54 @@ export const BatchProcessing: React.FC = () => {
     }
   }, [dirHandle, completedFiles, totalContent])
 
+  // Download ALL completed notes (+ combined total.vaucda) to a folder the
+  // user picks on the spot — independent of how the input was selected. On
+  // Chrome/Edge/Opera one folder prompt writes every file directly; on other
+  // browsers it falls back to sequential downloads into the default folder.
+  const handleDownloadAllToFolder = useCallback(async () => {
+    const files = completedFiles.filter(cf => cf.status === 'completed' && cf.noteContent)
+    if (files.length === 0) return
+    setFolderSaveError(null)
+    if (typeof (window as any).showDirectoryPicker === 'function') {
+      let handle: any
+      try {
+        handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' })
+      } catch (err: any) {
+        if (err?.name !== 'AbortError') {
+          setFolderSaveError(`Could not open folder: ${err?.message || String(err)}`)
+        }
+        return
+      }
+      let written = 0
+      const errors: string[] = []
+      for (const cf of files) {
+        try {
+          await writeFileToDir(handle, cf.outputFilename, cf.noteContent!)
+          written++
+        } catch (err: any) {
+          errors.push(`${cf.outputFilename}: ${err?.message || String(err)}`)
+        }
+      }
+      if (totalContent) {
+        try {
+          await writeFileToDir(handle, 'total.vaucda', totalContent)
+          written++
+        } catch (err: any) {
+          errors.push(`total.vaucda: ${err?.message || String(err)}`)
+        }
+      }
+      setCompletedFiles(prev => prev.map(cf =>
+        cf.status === 'completed' ? { ...cf, savedToFolder: true } : cf))
+      setFolderSaveError(errors.length > 0
+        ? `Wrote ${written} to ${handle.name}; failed: ${errors.join('; ')}`
+        : `Saved ${written} file(s) to ${handle.name}.`)
+      return
+    }
+    // Fallback: sequential browser downloads.
+    for (const cf of files) triggerDownload(cf.outputFilename, cf.noteContent!)
+    if (totalContent) triggerDownload('total.vaucda', totalContent)
+  }, [completedFiles, totalContent])
+
   const handleCancelBatch = useCallback(() => {
     if (abortRef.current) {
       abortRef.current.abort()
@@ -371,7 +513,7 @@ export const BatchProcessing: React.FC = () => {
       {/* Folder Selection */}
       <Card>
         <div className="p-6">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Select Folder</h2>
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Select Files or Folder</h2>
 
           <input
             ref={folderInputRef}
@@ -383,12 +525,47 @@ export const BatchProcessing: React.FC = () => {
             accept=".txt"
             aria-label="Select folder containing clinical documents"
           />
+          {/* Individual-file picker: choose one or several .txt files (not a whole folder). */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={handleFolderSelect}
+            accept=".txt"
+            aria-label="Select one or more clinical document files"
+          />
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 flex-wrap">
             <Button onClick={handlePickFolder} disabled={isProcessing} className="flex items-center gap-2" aria-label="Browse for folder">
               <FiFolder className="w-4 h-4" aria-hidden="true" />
               Browse for Folder...
             </Button>
+            <Button variant="secondary" onClick={() => fileInputRef.current?.click()} disabled={isProcessing} className="flex items-center gap-2" aria-label="Select individual files">
+              <FiFileText className="w-4 h-4" aria-hidden="true" />
+              Select File(s)...
+            </Button>
+            <div>
+              <label htmlFor="batch-note-type" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Note Type</label>
+              <select
+                id="batch-note-type"
+                value={batchNoteType}
+                onChange={(e) => setBatchNoteType(e.target.value)}
+                disabled={isProcessing}
+                className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                aria-label="Note type applied to all files in the batch"
+              >
+                {BATCH_NOTE_TYPES.map(nt => (
+                  <option key={nt.value} value={nt.value}>{nt.label}</option>
+                ))}
+              </select>
+            </div>
+            {hasFSAccess && (
+              <Button variant="outline" onClick={handlePickOutputFolder} disabled={isProcessing} className="flex items-center gap-2" aria-label="Choose output folder for saved notes">
+                <FiFolder className="w-4 h-4" aria-hidden="true" />
+                {outputFolderName ? `Output: ${outputFolderName}` : 'Choose Output Folder...'}
+              </Button>
+            )}
             <div>
               <label htmlFor="batch-visit-date" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Visit Date</label>
               <input
@@ -404,7 +581,11 @@ export const BatchProcessing: React.FC = () => {
             {selectedFiles.length > 0 && (
               <span className="text-sm text-gray-600 dark:text-gray-400">
                 {selectedFiles.length} .txt file{selectedFiles.length !== 1 ? 's' : ''} selected
-                {folderName && (
+                {outputFolderName ? (
+                  <span className="ml-2 text-green-700 dark:text-green-400">
+                    · save to <span className="font-mono">{outputFolderName}/</span>
+                  </span>
+                ) : folderName && (
                   <span className="ml-2 text-green-700 dark:text-green-400">
                     · auto-save to <span className="font-mono">{folderName}/output/</span>
                   </span>
@@ -420,7 +601,7 @@ export const BatchProcessing: React.FC = () => {
           )}
 
           <div className="mt-3 text-xs text-gray-500 dark:text-gray-400 space-y-1">
-            <p>Files with <span className="font-mono font-semibold">CON</span> as a standalone word → <span className="font-semibold">Urology Consult</span>. All others → <span className="font-semibold">Urology Clinic Note</span>.</p>
+            <p>Pick a whole folder or individual <span className="font-mono">.txt</span> file(s), then use the checkboxes to include/exclude any. <span className="font-semibold">Note Type</span> = <span className="font-semibold">Auto-detect</span> uses the filename (<span className="font-mono">CON</span> as a standalone word → Consult, else Clinic); choose a specific type to force it for the whole batch.</p>
             {hasFSAccess ? (
               <p>Output files write directly into an <span className="font-mono">output/</span> subfolder of the folder you select. A combined <span className="font-mono">total.vaucda</span> is written alongside them.</p>
             ) : (
@@ -435,17 +616,26 @@ export const BatchProcessing: React.FC = () => {
         <Card>
           <div className="p-6">
             <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Files to Process ({selectedFiles.length})</h2>
-              <Button onClick={() => setShowConfirm(true)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700" aria-label="Start batch processing">
-                <FiPlay className="w-4 h-4" aria-hidden="true" /> Start Batch Processing
-              </Button>
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
+                Files to Process ({selectedFiles.filter(sf => sf.included).length} of {selectedFiles.length})
+              </h2>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => setAllIncluded(true)} className="text-xs text-primary hover:underline" aria-label="Select all files">All</button>
+                <span className="text-gray-300">·</span>
+                <button type="button" onClick={() => setAllIncluded(false)} className="text-xs text-primary hover:underline" aria-label="Deselect all files">None</button>
+                <Button onClick={() => setShowConfirm(true)} disabled={selectedFiles.every(sf => !sf.included)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 ml-2" aria-label="Start batch processing">
+                  <FiPlay className="w-4 h-4" aria-hidden="true" /> Start Batch Processing
+                </Button>
+              </div>
             </div>
 
             {showConfirm && (
               <div role="alertdialog" aria-labelledby="confirm-title" aria-describedby="confirm-desc" className="mb-4 p-4 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 rounded-lg">
                 <p id="confirm-title" className="font-semibold text-yellow-800 dark:text-yellow-300">Confirm Batch Processing</p>
                 <p id="confirm-desc" className="text-sm text-yellow-700 dark:text-yellow-400 mt-1">
-                  This will upload and process {selectedFiles.length} file{selectedFiles.length !== 1 ? 's' : ''}. Each note will download automatically as it completes.
+                  This will upload and process {selectedFiles.filter(sf => sf.included).length} file{selectedFiles.filter(sf => sf.included).length !== 1 ? 's' : ''}
+                  {batchNoteType !== 'auto' && ` as ${BATCH_NOTE_TYPES.find(n => n.value === batchNoteType)?.label}`}.
+                  Each note will download automatically as it completes.
                 </p>
                 <div className="mt-3 flex gap-2">
                   <Button onClick={handleStartBatch} className="bg-green-600 hover:bg-green-700">Confirm</Button>
@@ -458,6 +648,15 @@ export const BatchProcessing: React.FC = () => {
               <table className="w-full text-sm" role="table" aria-label="Files to process">
                 <thead>
                   <tr className="border-b border-gray-200 dark:border-gray-700">
+                    <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">
+                      <input
+                        type="checkbox"
+                        aria-label="Include all files"
+                        checked={selectedFiles.length > 0 && selectedFiles.every(sf => sf.included)}
+                        ref={el => { if (el) el.indeterminate = selectedFiles.some(sf => sf.included) && selectedFiles.some(sf => !sf.included) }}
+                        onChange={(e) => setAllIncluded(e.target.checked)}
+                      />
+                    </th>
                     <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">#</th>
                     <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Filename</th>
                     <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Size</th>
@@ -466,21 +665,40 @@ export const BatchProcessing: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {selectedFiles.map((sf, idx) => (
-                    <tr key={sf.name} className="border-b border-gray-100 dark:border-gray-800">
+                  {selectedFiles.map((sf, idx) => {
+                    // Effective note type = batch override when set, else per-file detection.
+                    const effType = batchNoteType !== 'auto' ? batchNoteType : sf.noteType
+                    const typeLabel = effType === 'cystoscopy' ? 'Cystoscopy'
+                      : effType === 'urology_consult' ? 'Consult' : 'Clinic'
+                    const typeClass = effType === 'cystoscopy'
+                      ? 'bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-300'
+                      : effType === 'urology_consult'
+                      ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300'
+                      : 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300'
+                    return (
+                    <tr key={sf.name} className={`border-b border-gray-100 dark:border-gray-800 ${sf.included ? '' : 'opacity-40'}`}>
+                      <td className="py-2 px-3">
+                        <input
+                          type="checkbox"
+                          aria-label={`Include ${sf.name}`}
+                          checked={sf.included}
+                          onChange={() => toggleFileIncluded(sf.name)}
+                        />
+                      </td>
                       <td className="py-2 px-3 text-gray-500">{idx + 1}</td>
                       <td className="py-2 px-3 font-mono text-gray-900 dark:text-white">
                         <span className="flex items-center gap-2"><FiFileText className="w-4 h-4 text-gray-400" aria-hidden="true" />{sf.name}</span>
                       </td>
                       <td className="py-2 px-3 text-gray-600 dark:text-gray-400">{formatBytes(sf.size)}</td>
                       <td className="py-2 px-3">
-                        <span className={`inline-flex px-2 py-0.5 rounded text-xs font-medium ${sf.noteType === 'urology_consult' ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300' : 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300'}`}>
-                          {sf.noteType === 'urology_consult' ? 'Consult' : 'Clinic'}
+                        <span className={`inline-flex px-2 py-0.5 rounded text-xs font-medium ${typeClass}`}>
+                          {typeLabel}
                         </span>
                       </td>
                       <td className="py-2 px-3 font-mono text-gray-500 dark:text-gray-400 text-xs">{sf.outputName}</td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
@@ -561,8 +779,17 @@ export const BatchProcessing: React.FC = () => {
                       Save all to {folderName}/output/
                     </Button>
                   )}
+                  {completedFiles.some(cf => cf.status === 'completed' && cf.noteContent) && (
+                    <Button
+                      onClick={handleDownloadAllToFolder}
+                      className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 w-fit"
+                      aria-label="Download all processed files to a folder you choose"
+                    >
+                      <FiFolder className="w-4 h-4" aria-hidden="true" /> Download all to folder…
+                    </Button>
+                  )}
                   {totalContent && (
-                    <Button onClick={() => triggerDownload('total.vaucda', totalContent)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 w-fit" aria-label="Download total.vaucda (all notes combined)">
+                    <Button onClick={() => saveFileWithPicker('total.vaucda', totalContent)} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 w-fit" aria-label="Download total.vaucda (all notes combined) — choose where to save">
                       <FiDownload className="w-4 h-4" aria-hidden="true" /> Download total.vaucda (all notes combined)
                     </Button>
                   )}
@@ -574,8 +801,8 @@ export const BatchProcessing: React.FC = () => {
                 )}
                 <p className="text-xs text-gray-500 dark:text-gray-400">
                   {dirHandle
-                    ? `Files were written to ${folderName}/output/ as each completed. Re-save anytime with the button above.`
-                    : 'Use the download buttons in the table below for individual files.'}
+                    ? `Files were written to ${folderName}/output/ as each completed. Use “Download all to folder…” to save everywhere else, or the per-row button to save one file where you choose.`
+                    : 'Use “Download all to folder…” to save every note to a folder you pick, or the per-row button to save one file where you choose.'}
                 </p>
               </div>
             )}
@@ -590,7 +817,7 @@ export const BatchProcessing: React.FC = () => {
                       <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">File</th>
                       <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Type</th>
                       <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Time</th>
-                      <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Re-download</th>
+                      <th scope="col" className="text-left py-2 px-3 text-gray-600 dark:text-gray-400 font-medium">Download</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -608,7 +835,7 @@ export const BatchProcessing: React.FC = () => {
                         </td>
                         <td className="py-2 px-3">
                           {cf.status === 'completed' && cf.noteContent && (
-                            <button onClick={() => triggerDownload(cf.outputFilename, cf.noteContent!)} className="text-blue-600 hover:text-blue-800 dark:text-blue-400" aria-label={`Re-download ${cf.outputFilename}`}>
+                            <button onClick={() => saveFileWithPicker(cf.outputFilename, cf.noteContent!)} className="text-blue-600 hover:text-blue-800 dark:text-blue-400" aria-label={`Download ${cf.outputFilename} — choose where to save`}>
                               <FiDownload className="w-4 h-4" />
                             </button>
                           )}

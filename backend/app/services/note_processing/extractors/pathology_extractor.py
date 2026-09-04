@@ -503,8 +503,21 @@ def _parse_bladder_specimens(diagnosis_block: str, date_str: str, results_list: 
     """
     specimen_results = []
 
-    # Pattern for individual specimen results - handles multiple bladder formats
-    specimen_pattern = r'([A-L])\.\s*((?:URINARY\s+)?BLADDER[,\s]+[^:]+?(?:TRANSURETHRAL\s+RESECTION|BIOPSY)?)[;\s:]*\n?\s*((?:[-•]\s*[^\n]+(?:\n\s+[^\n]+)*\n?\s*)+?)(?=\n\s*[A-L]\.\s|$)'
+    # Pattern for individual specimen results - handles multiple bladder formats.
+    # NOTE: the findings group is a simple lazy `.*?` bounded by the next-specimen
+    # lookahead. The previous nested-quantifier form
+    #   ((?:[-•]\s*[^\n]+(?:\n\s+[^\n]+)*\n?\s*)+?)
+    # caused CATASTROPHIC BACKTRACKING on large bladder-pathology blocks (TRICKEL:
+    # 157K chart froze a CPU core with the GIL held, so the async note-timeout
+    # could never fire and the whole server hung). The location group is length-
+    # bounded and newline-free to keep matching linear.
+    specimen_pattern = (
+        r'([A-L])\.\s*'
+        r'((?:URINARY\s+)?BLADDER[,\s][^:\n]{0,150})'   # location header (bounded)
+        r'\s*:\s*'                                        # colon terminator
+        r'(.*?)'                                          # findings (lazy, DOTALL)
+        r'(?=\n\s*[A-L]\.\s|\Z)'                          # up to next specimen / end
+    )
 
     for spec_match in re.finditer(specimen_pattern, diagnosis_block, re.IGNORECASE | re.DOTALL):
         spec_letter = spec_match.group(1)

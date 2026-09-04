@@ -1,0 +1,18 @@
+{
+  "patient_id": "11_HANSON_4280",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/Monday_7_6_2026/input/11_HANSON_4280.txt",
+  "primary_diagnosis": {
+    "organ": "prostate",
+    "malignancy": "cancer"
+  },
+  "cancer_organs": [
+    "prostate",
+    "bladder"
+  ],
+  "notes": "GG2 prostate cancer + bladder tumor s/p TURBT (bladder allowed as second cancer organ)"
+}

@@ -1,0 +1,15 @@
+{
+  "patient_id": "09_CATTANACH_1548",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/Monday_7_6_2026/input/09_CATTANACH_1548.txt",
+  "primary_diagnosis": {
+    "organ": "prostate",
+    "malignancy": "indeterminate"
+  },
+  "cancer_organs": [],
+  "notes": "elevated PSA 17.64->13.53, prior biopsies NEGATIVE, repeat biopsy -> NOT confirmed cancer (indeterminate)"
+}

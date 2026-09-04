@@ -512,6 +512,22 @@ CLINICAL REASONING REQUIREMENTS:
    - Mention the surveillance schedule if transitioning (e.g., "has now transitioned to q6 month surveillance")
    - Reference the most recent surveillance procedure and its findings
    - Note upcoming scheduled procedures if mentioned in the HPI
+9. PRIMARY-FIRST FRAMING (MANDATORY): Lead the Assessment with the patient's
+   ACTIVE PRIMARY problem — the cancer or the documented reason for THIS visit —
+   never an incidental finding. An incidental adrenal nodule or simple cyst is a
+   secondary clause at most, never the opening subject when a cancer is present.
+   Address EVERY active problem / every cancer the patient has (a patient may
+   have more than one cancer).
+10. BENIGN INCIDENTALS (MANDATORY): A finding the radiology characterizes as
+    BENIGN — adrenal myelolipoma, lipid-rich / washout adrenal adenoma, simple
+    (Bosniak I/II) renal cyst — requires NO routine imaging follow-up if it is
+    biochemically inactive. Do NOT recommend repeat/dedicated imaging,
+    surveillance, or monitoring for such a benign lesion; state it is benign and
+    needs no further follow-up. NEVER call a radiology-benign lesion "of
+    uncertain significance".
+11. NO TECHNICAL METADATA: Never put scanner/technical artifacts into the prose
+    — phantom size, kVp/mAs, reconstruction/kernel params, CPT or procedure
+    codes, raw reference-range numbers. Report only clinical findings.
 
 {calculator_instructions}
 TEMPORAL AWARENESS (MANDATORY for followup visits):
@@ -567,6 +583,14 @@ OUTPUT REQUIREMENTS:
 - Provide ONLY the assessment narrative (4-8 sentences)
 - NO meta-commentary, preamble, or explanations
 - Just the clean, clinical assessment text
+- AFFIRMATIVE ONLY: state what IS true and what WILL be done. Do NOT include
+  recommendations against inapplicable tests ("PSMA PET is not indicated as the
+  PSA is undetectable"), hypothetical contingencies ("should he fail to void,
+  surgical options could be explored"), or patronizing/tautological rationale
+  ("...as the prostate has been removed"). Omit the inapplicable rather than
+  explaining why it doesn't apply. (A guideline-grounded deferral with real
+  weight — e.g. deferring screening for limited life expectancy — may be stated
+  once, concisely.)
 
 The assessment should read as a coherent clinical impression that demonstrates awareness of this specific patient's presentation and history.
 """

@@ -17,6 +17,7 @@ Performance optimizations:
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -159,10 +160,150 @@ documenting the encounter.
 """
 
 
+def build_authoritative_patient_facts(
+    clinical_text: str,
+    source_format: str = "cprs",
+    llm_task_config: Optional[Any] = None,
+):
+    """Compute the SINGLE authoritative ``PatientStatusFacts`` from the raw
+    clinical document, the same way Stage 1's HPI defense layer does.
+
+    Phase 1 (shared-facts architecture): both ``build_urology_note`` (Stage 1)
+    and ``build_stage2_note`` (Stage 2 Assessment/Plan) must consume this
+    identical object. Previously each stage re-derived facts from a different
+    input — Stage 2 grounded on the *rendered* Stage-1 note (itself
+    LLM-generated), letting the Assessment invent a divergent set of
+    dates/treatments/status. Computing once, from the raw source, kills that
+    class of Stage-1↔Stage-2 contradiction and Stage-2 hallucination.
+    """
+    try:
+        from .source_normalizers import normalize_to_cprs
+        normalized = normalize_to_cprs(clinical_text, source_format) or clinical_text
+    except Exception:
+        normalized = clinical_text
+    _pmh = extract_pmh(normalized) or ""
+    _psh = extract_psh(normalized) or ""
+    _path = extract_pathology(normalized) or ""
+    stub = (
+        "PAST MEDICAL HISTORY:\n" + _pmh + "\n\n"
+        "PAST SURGICAL HISTORY:\n" + _psh + "\n\n"
+        "PATHOLOGY RESULTS:\n" + _path + "\n"
+    )
+    facts = extract_patient_status_facts(
+        stub, raw_clinical_text=normalized, raw_source_text=clinical_text)
+    # M4: when VAUCDA_L1=1, the fine-tuned L1 narrative extractor augments these
+    # facts from the consult/tumor-board prose (no-op + safe-degrade otherwise).
+    # Single hook point so Stage 1 and Stage 2 share the identical enriched object.
+    from .l1 import enrich_patient_facts_with_l1
+    facts = enrich_patient_facts_with_l1(facts, clinical_text)
+    # Option B — holistic GU diagnosis pass. Reads the whole chart + prior HPI
+    # with the LLM and returns the true GU problem list (any organ), replacing
+    # the organ-limited/misfiring regex anchor. Establishes the DIAGNOSIS anchor
+    # only; numbers/dates stay verified downstream. Safe no-op when no task
+    # config is provided or VAUCDA_HOLISTIC_DX=0.
+    if llm_task_config is not None:
+        try:
+            from .agents.holistic_diagnosis import enrich_facts_with_holistic_diagnoses
+            _prior_hpi, _prior_plan = _extract_prior_hpi_and_plan(clinical_text)
+            _holistic_ctx = (
+                "PRIOR HPI (clinician-authored summary):\n" + _prior_hpi + "\n\n"
+                "PROBLEM LIST / PMH:\n" + _pmh + "\n\n"
+                "PAST SURGICAL HISTORY:\n" + _psh + "\n\n"
+                "PATHOLOGY:\n" + _path[:2500]
+            )
+            facts = enrich_facts_with_holistic_diagnoses(
+                facts, _holistic_ctx, llm_task_config=llm_task_config)
+        except Exception as _e:
+            logger.warning(f"Holistic diagnosis pass skipped: {_e}")
+    # Dedup + de-noise treatment facts (canonical-modality dedup, drop
+    # non-urologic-cancer treatments e.g. gastric-MALT-lymphoma radiation, drop
+    # ED treatments) so the HPI doesn't repeat or conflate them.
+    from .patient_status_facts import clean_treatment_facts
+    facts = clean_treatment_facts(facts)
+    return facts
+
+
+_PSA_TEMPLATE_SCRUB_RE = re.compile(
+    r'(PSA[^.\n]{0,70}?)(<?\d+\.\d+(?:\s*[-–to]+\s*\d+\.\d+)?)',
+    re.IGNORECASE,
+)
+
+
+def _scrub_psa_values(text: str) -> str:
+    """Neutralize explicit PSA numbers in prior-note template text.
+
+    The prior HPI/Plan is fed to the HPI as a NARRATIVE template, but a prior
+    note may carry stale or erroneous PSA numbers ("Elevated PSA 4.3-5.1")
+    that conflict with the authoritative PSA CURVE (ASHFORD: labs are all
+    <1.0). Redact the numbers so the LLM cannot copy them from the template —
+    the PSA CURVE block is the single source for PSA values.
+    """
+    if not text:
+        return text
+    return _PSA_TEMPLATE_SCRUB_RE.sub(r"\1[see PSA CURVE]", text)
+
+
+# Section headers that terminate a prior-note HPI / Assessment-Plan capture.
+_PRIOR_HPI_STOP_RE = re.compile(
+    r"^(?:HPI:|IPSS:?|DIETARY|PAST\s+(?:MEDICAL|SURGICAL)|SOCIAL\b|FAMILY\b|"
+    r"SEXUAL\b|MEDICATIONS?:|ALLERGIES|PSA\s+Curve|====|-----|Signed\s+by|"
+    r"Cosigned\s+by|Standard\s+Title|Local\s+Title|ROS:|PE:|PHYSICAL\s+EXAM|"
+    r"Physical\s+Exam|Vital\s+signs|Labs\s+and\s+Imaging|Interval\s+history|"
+    r"IMPRESSION:|Medical\s+Problems:|Medication\s+List:|CC:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PRIOR_AP_RE = re.compile(
+    r"^(?:ASSESSMENT(?:\s+AND\s+PLAN)?:?|Assessment\s+and\s+Plan:?|"
+    r"A\s*/\s*P:?|PLAN:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_prior_hpi_and_plan(clinical_document: str) -> tuple:
+    """Return (prior_hpi, prior_plan) from the most complete prior clinic note.
+
+    The v2 HPI uses the prior HPI as a TEMPLATE to adapt (see hpi_json_prompt
+    rule 13). We pick the longest prior "HPI:" block as the template (a good
+    completeness proxy regardless of note ordering) and the Assessment/Plan
+    that follows it within the same note. Returns ("", "") when no usable
+    prior HPI is present (e.g. a brand-new patient), so the pipeline simply
+    falls back to building the HPI from structured facts.
+    """
+    if not clinical_document:
+        return "", ""
+    hpi_starts = [m.start() for m in re.finditer(r"^HPI:", clinical_document,
+                                                  re.MULTILINE)]
+    if not hpi_starts:
+        return "", ""
+    best_hpi, best_after = "", ""
+    for i, start in enumerate(hpi_starts):
+        body_start = clinical_document.find(":", start) + 1
+        nxt = _PRIOR_HPI_STOP_RE.search(clinical_document, body_start)
+        end = nxt.start() if nxt else min(len(clinical_document), body_start + 2200)
+        block = clinical_document[body_start:end].strip()
+        if len(block) > len(best_hpi):
+            best_hpi = block
+            # Capture the note-remainder after this HPI (up to the next HPI)
+            # so we can locate the matching Assessment/Plan.
+            note_end = (hpi_starts[i + 1] if i + 1 < len(hpi_starts)
+                        else len(clinical_document))
+            best_after = clinical_document[end:note_end]
+    # Locate the Assessment/Plan that follows the chosen HPI in its own note.
+    prior_plan = ""
+    ap = _PRIOR_AP_RE.search(best_after)
+    if ap:
+        prior_plan = best_after[ap.start():ap.start() + 1400].strip()
+    # Redact PSA numbers so a stale/erroneous prior-note PSA can't override the
+    # authoritative PSA CURVE block when the LLM adapts this template.
+    return _scrub_psa_values(best_hpi[:2200]), _scrub_psa_values(prior_plan)
+
+
 def build_urology_note(
     clinical_text: str,
     task_config: Optional["LLMTaskConfig"] = None,
     source_format: str = "cprs",
+    patient_facts: Optional["PatientStatusFacts"] = None,
+    note_type: str = "clinic_note",
 ) -> str:
     """
     Build a comprehensive urology clinic note from a clinical document.
@@ -189,11 +330,28 @@ def build_urology_note(
     # This ensures all synthesize_with_llm calls use the user's configured model
     set_current_task_config(task_config)
 
+    # Cystoscopy is a PROCEDURE note with its own fixed template (Male/Female
+    # branch, anticipated Findings/Assessment/Plan/Disposition) — build it in a
+    # single pass instead of the clinic Stage-1/Stage-2 pipeline. Stage 2
+    # (build_stage2_note) passes this note through unchanged for note_type
+    # 'cystoscopy'.
+    if (note_type or "").lower().replace(" ", "_") in (
+            "cystoscopy", "cysto", "cystoscopy_note"):
+        from .cystoscopy_builder import build_cystoscopy_note
+        return build_cystoscopy_note(
+            clinical_text, task_config=task_config,
+            source_format=source_format, patient_facts=patient_facts,
+        )
+
     # Source-format normalization. Applied at the very top so every
     # extractor / agent downstream sees CPRS-canonical section layout.
     # Pass-through for "cprs"; rewrites VistA section headers / tables
     # for "vista". Failures fall back to the original text so the
     # pipeline never blocks on a normalizer bug.
+    # Keep the pre-normalization text: the vista->cprs normalizer strips the
+    # structured "PSA TOTAL ... ng/mL" lab labels, which are needed to apply
+    # the lab-reports-win PSA precedence (see PSA extraction below).
+    _raw_clinical_text = clinical_text
     try:
         from .source_normalizers import normalize_to_cprs
         normalized = normalize_to_cprs(clinical_text, source_format)
@@ -288,6 +446,19 @@ def build_urology_note(
     document_pathology = extract_pathology(clinical_document)
     document_imaging = extract_imaging(clinical_document)
     document_psa = extract_psa(clinical_document)
+    # Lab-reports-win PSA precedence (clinical review decision): the raw
+    # source's structured "PSA TOTAL ... ng/mL <ref-range>" results are the
+    # authoritative lab system of record, but the vista->cprs normalizer
+    # strips the "PSA TOTAL" label — so extract_psa on the normalized document
+    # can't apply the precedence and may surface a spurious "PSA Curve:" block
+    # (ASHFORD: a 4.3-5.1 curve backed by no actual lab result). Re-extract
+    # from the RAW text whenever it carries structured lab reports; extract_psa
+    # then returns lab values only and overrides the normalized curve.
+    if _raw_clinical_text and re.search(r'PSA\s+TOTAL', _raw_clinical_text,
+                                        re.IGNORECASE):
+        _raw_psa = extract_psa(_raw_clinical_text)
+        if _raw_psa:
+            document_psa = _raw_psa
     document_labs = extract_labs(clinical_document, visit_date=_visit_date)
     document_stone_labs = extract_stone_labs(clinical_document)
     document_calcium = extract_calcium_series(clinical_document)
@@ -330,10 +501,17 @@ def build_urology_note(
     # text — the most common shape for radiation and ADT histories. The
     # raw scanner is gated by strict prostate-cancer co-occurrence rules
     # so dermatology cryotherapy etc. cannot trip it.
-    _hpi_patient_facts = extract_patient_status_facts(
-        _deterministic_stub_for_hpi,
-        raw_clinical_text=clinical_document,
-    )
+    # Phase 1: prefer the shared authoritative facts passed by the caller so
+    # Stage 1 and Stage 2 ground on the IDENTICAL object. Fall back to the
+    # inline computation when called standalone (backward compatible).
+    if patient_facts is not None:
+        _hpi_patient_facts = patient_facts
+    else:
+        _hpi_patient_facts = extract_patient_status_facts(
+            _deterministic_stub_for_hpi,
+            raw_clinical_text=clinical_document,
+            raw_source_text=_raw_clinical_text,
+        )
     _hpi_authoritative_facts = format_facts_for_prompt(_hpi_patient_facts)
     print(f"      Patient facts (for HPI): cancer={_hpi_patient_facts.cancer_status}, "
           f"naive={_hpi_patient_facts.treatment_naive}, "
@@ -466,7 +644,19 @@ def build_urology_note(
         )
 
     if patient_name or patient_ssn or patient_age:
-        print(f"      Patient: {patient_name} (SSN: {patient_ssn}, Age: {patient_age}, Sex: {patient_sex}, Race: {patient_race})")
+        # PHI-safe debug line: never log the full SSN or full name to stdout/logs.
+        # Redact SSN to last-4 (matches the note-header convention) and reduce the
+        # name to initials so processing is traceable without a direct identifier.
+        _ssn_disp = "XXX-XX-XXXX"
+        if patient_ssn:
+            _d = re.sub(r"\D", "", str(patient_ssn))
+            if len(_d) >= 4:
+                _ssn_disp = f"XXX-XX-{_d[-4:]}"
+        _name_disp = ""
+        if patient_name:
+            _parts = [p for p in re.split(r"[\s,]+", str(patient_name).strip()) if p]
+            _name_disp = "".join(p[0].upper() for p in _parts if p[:1].isalpha())[:4] or "?"
+        print(f"      Patient record loaded (Age: {patient_age}, Sex: {patient_sex})")
     else:
         print(f"      Patient demographics: Not found in document")
 
@@ -694,7 +884,54 @@ def build_urology_note(
     _doc_psh_cc = document_psh
     _clinical_doc_cc = clinical_document
 
+    # ---- LLM-FIRST HOLISTIC CC + HPI (VAUCDA_CC_HPI_HOLISTIC) ----
+    # One expert pass over the WHOLE chart writes BOTH the CC and the HPI, with
+    # the deterministic facts passed as ADVISORY (overridable by the chart) rather
+    # than as absolute rules. Fixes the fragmented-agent incoherence AND the
+    # false-fact-injection class (e.g. a discussed-but-never-done salvage RT). The
+    # result feeds BOTH _build_cc and _build_hpi below; either section falls back
+    # to its existing path when the holistic pass returns None. Skipped for
+    # consults (they have their own CC/HPI extraction).
+    _holistic_cc_hpi = None
+    import os as _os_h
+    if (_os_h.environ.get("VAUCDA_CC_HPI_HOLISTIC", "1") == "1"
+            and not _is_consult_val):
+        try:
+            from .agents.holistic_cc_hpi import compose_cc_hpi
+            from .llm_helper import synthesize_with_llm as _synth_h
+
+            def _h_call(p: str) -> str:
+                # High ceiling: deepseek/kimi are THINKING models, so num_predict
+                # caps thinking + the CC+HPI JSON COMBINED. A tight cap (2400) lets
+                # long reasoning truncate the JSON — parse-fail -> fallback, or a
+                # thinned/sparse HPI. This was the biggest source of run-to-run HPI
+                # variance (409c sparse vs 995c full on the SAME chart). num_predict
+                # is a ceiling, not a target, so a 2-paragraph HPI still stops early.
+                return _synth_h(prompt=p, temperature=0.0,
+                                task_config=task_config, max_tokens=16000)
+
+            _prior_hpi_h, _prior_plan_h = _extract_prior_hpi_and_plan(
+                clinical_document or "")
+            _holistic_cc_hpi = compose_cc_hpi(
+                facts=_hpi_pf,
+                raw_chart=_raw_clinical_text,
+                normalized_chart=clinical_document,
+                psa_data=_doc_psa,
+                pathology_data=_doc_path,
+                psh_data=document_psh,
+                prior_hpi=_prior_hpi_h,
+                patient_name=_patient_name_val,
+                patient_age=_patient_age_val,
+                patient_sex=_patient_sex_val,
+                llm_call=_h_call,
+            )
+        except Exception as _he:  # noqa: BLE001
+            logger.warning(f"Holistic CC/HPI error (falling back): {_he}")
+            _holistic_cc_hpi = None
+
     def _build_cc():
+        if _holistic_cc_hpi and _holistic_cc_hpi.get("cc"):
+            return _holistic_cc_hpi["cc"]
         if _consult_cc_val:
             return _consult_cc_val
         # Pass urologic clinical context so synthesize_cc can:
@@ -706,7 +943,7 @@ def build_urology_note(
         #     was completed AND the PSA trend confirms biochemical
         #     response. Without document_psh + clinical_document the
         #     reframe path can't see treatment history at all.
-        return synthesize_cc(
+        _seed_cc = synthesize_cc(
             gu_notes,
             non_gu_notes,
             document_pmh=_doc_pmh,
@@ -721,9 +958,39 @@ def build_urology_note(
             clinical_timeline=(
                 _hpi_pf.clinical_timeline if _hpi_pf else None
             ),
+            other_gu_diagnoses=(
+                _hpi_pf.other_gu_diagnoses if _hpi_pf else None
+            ),
+            patient_sex=_hpi_pf.patient_sex if _hpi_pf else None,
+            prostate_cancer_status=_hpi_pf.cancer_status if _hpi_pf else None,
         )
+        # LLM-forward CC REFINER (VAUCDA_CC_COMPOSER): keep the deterministic CC
+        # verbatim unless it contradicts the fact ledger / visit narrative (wrong
+        # treatment framing, benign-incidental-led, resected-cancer-called-
+        # uncertain). Fixes contradictory CCs (JELLSEY "scheduled Eligard
+        # injection") while preserving the cascade's specificity. Never returns
+        # anything worse than the seed; no-op when disabled.
+        from .cc_checks import strip_liver_directed_therapy
+        try:
+            from .agents.cc_composer import refine_cc
+            from .llm_helper import synthesize_with_llm
+
+            def _cc_call(p: str) -> str:
+                return synthesize_with_llm(prompt=p, temperature=0.0,
+                                           task_config=None, max_tokens=220)
+
+            _cc_out = refine_cc(_seed_cc, _hpi_pf, _clinical_doc_cc, _cc_call)
+        except Exception as _cce:  # noqa: BLE001
+            logger.warning(f"CC refiner error (using synthesize_cc): {_cce}")
+            _cc_out = _seed_cc
+        # Liver-directed-therapy guard: TACE/Y90/(chemo|radio)embolization belong
+        # to a concurrent HCC, never to a renal/urothelial/prostate primary — keep
+        # them off the GU chief complaint (RIVERA dual kidney+liver case).
+        return strip_liver_directed_therapy(_cc_out)
 
     def _build_hpi():
+        if _holistic_cc_hpi and _holistic_cc_hpi.get("hpi"):
+            return _holistic_cc_hpi["hpi"]
         if _is_consult_val and _consult_hpi_val:
             reason_for_request = (
                 _consult_data_val.get('reason_for_request', '')
@@ -768,10 +1035,36 @@ def build_urology_note(
             hpi_skeleton=_hpi_skeleton_text,
         )
 
+        # ---- HPI LLM-forward composer (VAUCDA_HPI_COMPOSER) ----
+        # The LLM writes the HPI from the fact ledger + PSA/pathology/timeline
+        # with a deterministic grounding+completeness verify-repair loop, so a
+        # copied-forward phantom biopsy date (JELLSEY "biopsy 10/29/2025") cannot
+        # survive. Ordered BEFORE v2; v1_text is the universal fallback. Safe-
+        # degrade to v2/v1 on any miss / when disabled.
+        import os as _os
+        if _os.environ.get("VAUCDA_HPI_COMPOSER", "1") == "1":
+            try:
+                from .agents.hpi_composer import compose_hpi
+                from .llm_helper import synthesize_with_llm as _synth_hpi
+
+                def _hpi_call(p: str) -> str:
+                    return _synth_hpi(prompt=p, temperature=0.0,
+                                      task_config=None, max_tokens=1600)
+
+                _composed_hpi = compose_hpi(_hpi_pf, _doc_psa, _doc_path,
+                                            document_psh, clinical_document,
+                                            _hpi_call, v1_text,
+                                            patient_name=_patient_name_val,
+                                            patient_age=_patient_age_val,
+                                            patient_sex=_patient_sex_val)
+                if _composed_hpi:
+                    return _composed_hpi
+            except Exception as _hce:  # noqa: BLE001
+                logger.warning(f"HPI composer error (using v2/v1): {_hce}")
+
         # ---- HPI v2 (constrained-JSON) path ----
         # Gated by VAUCDA_HPI_V2=1 env var. v2 has v1 text as its
         # fallback, so any v2 failure transparently degrades to v1.
-        import os as _os
         if _os.environ.get("VAUCDA_HPI_V2", "0") != "1":
             return v1_text
 
@@ -792,6 +1085,8 @@ def build_urology_note(
                 return _synth(prompt=prompt, temperature=0.0,
                               task_config=_v2_task_config)
 
+            _prior_hpi_text, _prior_plan_text = _extract_prior_hpi_and_plan(
+                clinical_document or "")
             gt = build_ground_truth(
                 patient_name=_patient_name_val or "",
                 patient_age=int(_patient_age_val) if str(_patient_age_val or "").isdigit() else 0,
@@ -805,6 +1100,23 @@ def build_urology_note(
                 imaging_text=_doc_imaging or "",
                 procedure_findings=(_hpi_pf.procedure_findings if _hpi_pf else []),
                 treatment_naive=(_hpi_pf.treatment_naive if _hpi_pf else True),
+                # Treatment course already assembled by patient_status_facts.
+                # The structured PSH/MEDS/PATH extractors return empty on
+                # narrative oncology-consult inputs; these fields are what
+                # keep the HPI from collapsing to a "new patient" stub.
+                clinical_timeline=(_hpi_pf.clinical_timeline if _hpi_pf else []),
+                current_active_treatments=(_hpi_pf.current_active_treatments if _hpi_pf else []),
+                confirmed_urologic_treatments=(_hpi_pf.confirmed_urologic_treatments if _hpi_pf else []),
+                cancer_status=(_hpi_pf.cancer_status if _hpi_pf else ""),
+                narrative_text=(clinical_document or ""),
+                # Multi-cancer anchor + prior-note template (see hpi_json_prompt
+                # rules 12-14): the non-prostate GU primary (renal mass, bladder
+                # tumor) and the most-recent prior HPI/Plan, so the HPI is built
+                # around the real diagnosis and continues the established story
+                # rather than collapsing to a prostate-only / empty stub.
+                other_gu_diagnoses=(_hpi_pf.other_gu_diagnoses if _hpi_pf else []),
+                prior_hpi=_prior_hpi_text,
+                prior_plan=_prior_plan_text,
             )
             result = generate_hpi_v2(gt, _llm_call, max_retries=2,
                                      v1_fallback_text=v1_text)
@@ -897,9 +1209,60 @@ def build_urology_note(
 
     # Capture document_pathology in closure
     _doc_path = document_pathology
-    synthesis_tasks['pathology'] = lambda: synthesize_pathology(_doc_path, gu_notes)
+
+    def _pathology_task():
+        # LLM-forward Pathology composer: reads the WHOLE chart (not the regex
+        # slice) and runs a completeness-repair loop against the organ-agnostic
+        # finding ledger, so no documented finding is dropped and every cancer's
+        # pathology (prostate Gleason, renal grade, penile SCC, ...) is covered.
+        # Falls back to the regex synthesizer on any miss / when disabled.
+        from .agents.pathology_agent import ensure_pathology_completeness
+        try:
+            from .agents.pathology_composer import compose_pathology
+            from .llm_helper import synthesize_with_llm
+
+            def _call(p: str) -> str:
+                # High ceiling: deepseek/kimi are THINKING models, so a tight cap
+                # lets reasoning starve the composed pathology and drop specimens.
+                return synthesize_with_llm(prompt=p, temperature=0.0,
+                                           task_config=None, max_tokens=16000)
+
+            composed = compose_pathology(clinical_document, _call)
+            if composed:
+                # Deterministic backstop: restore any critical documented finding
+                # (stage / margin / PNI / LVI) the LLM composer dropped, checked
+                # against the deterministic regex extraction. Keeps the granular
+                # pathology guaranteed-complete IN THE PATHOLOGY SECTION so the
+                # holistic HPI can stay cohesive without restating it.
+                return ensure_pathology_completeness(composed, _doc_path or "")
+        except Exception as _pe:  # noqa: BLE001
+            logger.warning(f"Pathology composer error (using regex synth): {_pe}")
+        return ensure_pathology_completeness(
+            synthesize_pathology(_doc_path, gu_notes), _doc_path or "")
+
+    synthesis_tasks['pathology'] = _pathology_task
 
     synthesis_tasks['testosterone'] = lambda: synthesize_testosterone(gu_notes)
+
+    # ADT status + injection scheduler (deterministic, prostate-only). Standalone
+    # section: classifies the ADT course (completed / finite-in-progress /
+    # continuous / intermittent-on / intermittent-holding / discontinued / new
+    # course for recurrence) and determines whether a depot injection is due at
+    # THIS visit — with the agent, dose, route, interval, and the evidence.
+    def _adt_task():
+        import os as _os_adt
+        if _os_adt.environ.get("VAUCDA_ADT_SECTION", "1") != "1":
+            return ""
+        try:
+            from .adt_status import build_adt_status, render_adt_section
+            _st = build_adt_status(_raw_clinical_text or clinical_document or "",
+                                   visit_date=_visit_date, psa_data=_doc_psa or "",
+                                   facts=_hpi_pf)
+            return render_adt_section(_st) if _st.present else ""
+        except Exception as _ae:  # noqa: BLE001
+            logger.warning(f"ADT section skipped: {_ae}")
+            return ""
+    synthesis_tasks['adt'] = _adt_task
 
     # Capture document_medications in closure
     _doc_meds = document_medications
@@ -915,6 +1278,53 @@ def build_urology_note(
     synthesis_tasks['imaging'] = lambda: synthesize_imaging(
         _doc_imaging, gu_notes, procedure_findings=_proc_findings,
     )
+
+    # LLM-forward dated lesion-size trajectory table (VAUCDA_LESION_TABLE, off by
+    # default). The LLM associates each size with the imaging STUDY it came from
+    # and every point is grounded verbatim to the source; a CHANGING lesion gets a
+    # dated table, a stable one a one-line summary. Flagged for provider review.
+    def _lesion_table_task():
+        import os as _os
+        if _os.environ.get("VAUCDA_LESION_TABLE", "1") != "1":
+            return ""
+        try:
+            from .agents.lesion_series import extract_lesion_series, render_lesion_table
+            from .llm_helper import synthesize_with_llm as _synth_ls
+
+            def _ls_call(p: str) -> str:
+                return _synth_ls(prompt=p, temperature=0.0, task_config=None, max_tokens=1200)
+
+            # RAW text, not the normalizer output: the VistA->CPRS normalizer
+            # drops narrative size mentions (e.g. RIVERA's "measures 8.5 cm"),
+            # same as it strips PSA TOTAL. Extract from raw so no measurement is
+            # lost before grounding.
+            return render_lesion_table(extract_lesion_series(_raw_clinical_text, _ls_call))
+        except Exception as _le:  # noqa: BLE001
+            logger.warning(f"lesion-size table skipped: {_le}")
+            return ""
+
+    synthesis_tasks['lesion_table'] = _lesion_table_task
+
+    # LLM-forward PSMA PET tracking (VAUCDA_PSMA_TABLE, off by default). Tracks
+    # avid disease SITES + SUVmax + impression per dated study (significance is
+    # avidity/PSMA-RADS, not size). Every entry grounded; provider-verify.
+    def _psma_table_task():
+        import os as _os
+        if _os.environ.get("VAUCDA_PSMA_TABLE", "1") != "1":
+            return ""
+        try:
+            from .agents.psma_pet_series import extract_psma_series, render_psma_table
+            from .llm_helper import synthesize_with_llm as _synth_ps
+
+            def _ps_call(p: str) -> str:
+                return _synth_ps(prompt=p, temperature=0.0, task_config=None, max_tokens=1200)
+
+            return render_psma_table(extract_psma_series(_raw_clinical_text, _ps_call))
+        except Exception as _pe:  # noqa: BLE001
+            logger.warning(f"PSMA PET table skipped: {_pe}")
+            return ""
+
+    synthesis_tasks['psma_table'] = _psma_table_task
 
     synthesis_tasks['ros'] = lambda: synthesize_ros(gu_notes, non_gu_notes)
 
@@ -958,6 +1368,62 @@ def build_urology_note(
     # Extract results to named variables
     cc = results.get('cc', '')
     hpi = results.get('hpi', '')
+    # Deterministic fact guard on the generated HPI output (symmetry with the
+    # Stage 2 Assessment/Plan guard): strip positive prostate-cancer / treatment
+    # assertions that contradict the ground truth for an ABSENT / female /
+    # treatment-naive patient. Negated ("no prostate cancer") and workup
+    # ("mpMRI to evaluate rising PSA") mentions are preserved.
+    if hpi and _hpi_pf is not None:
+        hpi, _hpi_dropped = sanitize_context_against_facts(hpi, _hpi_pf)
+        if _hpi_dropped:
+            print(f"      ✂ HPI fact-guard dropped {len(_hpi_dropped)} contradicting sentence(s)")
+    # Temporal-validity repair on the HPI (symmetry with the Stage-2
+    # Assessment/Plan pass): latest-wins / staleness / vague-recency. Catches a
+    # current recurrence/rising-PSA claim contradicted by an undetectable PSA
+    # (MORENO: "second biochemical recurrence in 2026" while PSA <0.01), so the
+    # HPI can't disagree with the Assessment. Safe-degrade when disabled/on error.
+    if hpi and _hpi_pf is not None:
+        try:
+            from .temporal_checks import finalize_temporal as _finalize_temporal_hpi
+            from .llm_helper import synthesize_with_llm as _synth_hpi_temporal
+
+            def _hpi_temporal_call(_p: str) -> str:
+                # High token ceiling: deepseek/kimi are THINKING models, so
+                # num_predict caps thinking + answer COMBINED — a low cap (1600)
+                # lets the reasoning eat the budget and truncates the rewritten
+                # HPI mid-sentence. Match the note's configured output budget.
+                return _synth_hpi_temporal(prompt=_p, temperature=0.0,
+                                           task_config=task_config, max_tokens=16000)
+
+            _hpi_before = hpi
+            _hpi_fixed = _finalize_temporal_hpi(
+                _hpi_before, _hpi_pf, _doc_psa or "", _hpi_temporal_call,
+                "HPI", ref_note=clinical_document or "")
+            # Length-preservation guard: accept the temporal rewrite ONLY when it
+            # keeps essentially the whole HPI. A materially shorter result means the
+            # thinking-model rewrite truncated or over-condensed the narrative —
+            # keep the complete original rather than ship a truncated HPI. (The
+            # deterministic vague-recency scrub trims only a few words, so a real
+            # fix stays well above the 0.9 floor; MORENO's fix was longer.)
+            if _hpi_fixed and len(_hpi_fixed) >= 0.9 * len(_hpi_before):
+                hpi = _hpi_fixed
+            elif _hpi_fixed and _hpi_fixed != _hpi_before:
+                logger.warning(
+                    f"HPI temporal rewrite rejected (len {len(_hpi_fixed)} < "
+                    f"0.9×{len(_hpi_before)}) — keeping complete original HPI")
+        except Exception as _hte:  # noqa: BLE001
+            logger.warning(f"HPI temporal finalize skipped: {_hte}")
+    # Objective-weight anchor: if the HPI reports a (patient-reported) weight
+    # loss but states no measured value, append the most-recent measured weight
+    # + date from the chart vitals so the reader can reconcile report vs. trend.
+    if hpi:
+        from .agents.hpi_agent import anchor_measured_weight
+        hpi = anchor_measured_weight(hpi, clinical_document or "")
+    # Readability: collapse a choppy one-sentence-per-line HPI into flowing
+    # prose (whitespace-only — does not change any clinical content).
+    if hpi:
+        from .agents.hpi_agent import reflow_hpi
+        hpi = reflow_hpi(hpi)
     ipss = results.get('ipss', '')
     dhx = results.get('dhx', '')
     pmh = results.get('pmh', '')
@@ -971,9 +1437,12 @@ def build_urology_note(
     sexual = results.get('sexual', '')
     pathology = results.get('pathology', '')
     testosterone = results.get('testosterone', '')
+    adt = results.get('adt', '')
     medications = results.get('medications', '')
     allergies = results.get('allergies', '')
     imaging = results.get('imaging', '')
+    lesion_table = results.get('lesion_table', '')
+    psma_table = results.get('psma_table', '')
     ros = results.get('ros', '')
     pe = results.get('pe', '')
 
@@ -998,6 +1467,7 @@ def build_urology_note(
         family=family,
         sexual=sexual,
         psa=psa,
+        adt=adt,
         pathology=pathology,
         testosterone=testosterone,
         medications=medications,
@@ -1006,6 +1476,8 @@ def build_urology_note(
         stone=stone,
         labs=labs,
         imaging=imaging,
+        lesion_table=lesion_table,
+        psma_table=psma_table,
         ros=ros,
         pe=pe,
         is_consult=is_consult,
@@ -1275,6 +1747,10 @@ def assemble_note(**sections) -> str:
     if not is_female and sections.get("psa"):
         note_parts.append(f"PSA CURVE:\n{sections['psa']}\n")
 
+    # ADT status + injection scheduler (prostate cancer on hormone therapy)
+    if not is_female and sections.get("adt"):
+        note_parts.append(f"\n{'='*74}\nANDROGEN DEPRIVATION THERAPY (ADT):\n{sections['adt']}\n")
+
     # Medications
     if sections.get("medications"):
         note_parts.append(f"MEDICATIONS:\n{sections['medications']}\n")
@@ -1325,6 +1801,15 @@ def assemble_note(**sections) -> str:
     # Imaging — narrowed by 4 (2 each side of title) for CPRS width
     if sections.get("imaging"):
         note_parts.append(f"\n{'='*36} IMAGING {'='*30}\n{sections['imaging']}\n")
+
+    # Dated lesion-size trajectory (auto-extracted, provider-verify) — sits with
+    # imaging so the size history is next to the reports it came from.
+    if sections.get("lesion_table"):
+        note_parts.append(f"\n{sections['lesion_table']}\n")
+
+    # Dated PSMA PET tracking (avid sites + SUVmax; provider-verify).
+    if sections.get("psma_table"):
+        note_parts.append(f"\n{sections['psma_table']}\n")
 
     # ROS — narrowed by 4 chars for CPRS width
     if sections.get("ros"):

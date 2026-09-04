@@ -1,0 +1,14 @@
+# L1 M3 fine-tuning deps (single H100 / CUDA 12.x). Install into a dedicated
+# venv. medgemma-27b is GATED — accept the license on HuggingFace and
+# `huggingface-cli login` first.
+# Versions are floors known to expose SFTConfig(assistant_only_loss=...,
+# max_length=...) and the PEFT/bitsandbytes QLoRA path; newer is generally fine,
+# but pin if an API shifts.
+torch>=2.4
+transformers>=4.50
+trl>=0.13
+peft>=0.13
+bitsandbytes>=0.44
+accelerate>=1.0
+datasets>=3.0
+sentencepiece

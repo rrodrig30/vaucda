@@ -231,7 +231,7 @@ def synthesize_with_llm(
             raise LLMProviderError(f"Failed to connect to Ollama at {url}: timeout")
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
-            if status in (429, 500) and attempt < max_retries:
+            if status in (410, 429, 500) and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
                     f"LLM {status} (attempt {attempt}/{max_retries}), "
@@ -341,7 +341,10 @@ def _call_ollama_sync(
             raise LLMProviderError(f"Ollama timeout for model {config.model}")
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
-            if status in (429, 500, 502, 503, 504) and attempt < max_retries:
+            # 410 Gone = transient Ollama Cloud model-instance rotation (recovers
+            # in seconds); retry it like other transient upstream errors so a
+            # brief cloud blip doesn't fail the whole note/batch.
+            if status in (410, 429, 500, 502, 503, 504) and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
                     f"Ollama {status} (attempt {attempt}/{max_retries}), "
@@ -350,7 +353,7 @@ def _call_ollama_sync(
                 time.sleep(delay)
                 continue
             logger.error(f"Ollama HTTP error: {e}")
-            if status in (502, 503, 504):
+            if status in (410, 502, 503, 504):
                 raise LLMProviderError(
                     f"LLM upstream unavailable ({status}) for model "
                     f"{config.model}. The provider is overloaded or down. "
@@ -418,7 +421,10 @@ async def _call_ollama_async(
             raise LLMProviderError(f"Ollama timeout for model {config.model}")
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            if status in (429, 500, 502, 503, 504) and attempt < max_retries:
+            # 410 Gone = transient Ollama Cloud model-instance rotation (recovers
+            # in seconds); retry it like other transient upstream errors so a
+            # brief cloud blip doesn't fail the whole note/batch.
+            if status in (410, 429, 500, 502, 503, 504) and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
                     f"Ollama async {status} (attempt {attempt}/{max_retries}), "
@@ -427,7 +433,7 @@ async def _call_ollama_async(
                 await asyncio.sleep(delay)
                 continue
             logger.error(f"Ollama async HTTP error: {e}")
-            if status in (502, 503, 504):
+            if status in (410, 502, 503, 504):
                 raise LLMProviderError(
                     f"LLM upstream unavailable ({status}) for model "
                     f"{config.model}. The provider is overloaded or down. "

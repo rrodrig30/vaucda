@@ -120,6 +120,62 @@ def _ground_truth_block(gt: GroundTruth) -> str:
         f"BANNER: name={gt.name!r}, age={gt.age}, sex={gt.sex!r}, visit_date={gt.visit_date!r}",
         "",
     ]
+    # GU diagnoses beyond prostate cancer (renal mass, bladder tumor, adrenal
+    # nodule, cyst, etc.). Whether these are the PRIMARY anchor or merely
+    # SECONDARY/incidental depends on whether the patient has confirmed
+    # prostate cancer: for a prostate-cancer patient an incidental renal cyst
+    # must NOT hijack the HPI framing (the FOSTER regression); for a
+    # non-cancer patient the renal mass IS the primary problem (ASHFORD).
+    _has_pca = (gt.cancer_status or "").upper() in {
+        "PRESENT", "TREATED", "METASTATIC", "RECURRENT", "NED",
+        "REMISSION", "ACTIVE",
+    }
+    if getattr(gt, "other_gu_diagnoses", None):
+        if _has_pca:
+            lines.append(
+                "SECONDARY / INCIDENTAL UROLOGIC FINDINGS (the PRIMARY "
+                "diagnosis is the prostate cancer described elsewhere in this "
+                "ground truth — these are pertinent secondary problems only. "
+                "Do NOT set prior_diagnosis.primary_dx to one of these and do "
+                "NOT frame the visit around them; mention them as secondary "
+                "issues if relevant):"
+            )
+        else:
+            lines.append(
+                "PRIMARY UROLOGIC DIAGNOSES (authoritative — set "
+                "prior_diagnosis.primary_dx and frame the entire HPI around "
+                "the diagnosis below; each is confirmed by the cited "
+                "evidence):"
+            )
+        for d in gt.other_gu_diagnoses:
+            organ = getattr(d, "organ", "") or ""
+            category = getattr(d, "category", "") or ""
+            name = getattr(d, "name", "") or ""
+            grade = getattr(d, "grade", "") or ""
+            status = getattr(d, "status", "") or ""
+            evidence = getattr(d, "evidence", "") or ""
+            bits = [b for b in (
+                f"organ={organ}", f"category={category}",
+                (f"grade={grade}" if grade else ""),
+                (f"status={status}" if status else ""),
+                (f"evidence={evidence!r}" if evidence else ""),
+            ) if b]
+            lines.append(f"  - {name} ({', '.join(bits)})")
+        lines.append(
+            "  NOTE: 'indeterminate' means the lesion is NOT yet proven "
+            "benign or malignant — describe it as 'of uncertain significance' "
+            "/ 'indeterminate', never as confirmed cancer."
+        )
+        lines.append("")
+    if gt.cancer_status:
+        lines.append(
+            f"PROSTATE_CANCER_STATUS: {gt.cancer_status}. "
+            "If ABSENT, the patient does NOT have prostate cancer — do NOT "
+            "state or imply a prostate-cancer or metastatic-prostate-cancer "
+            "diagnosis anywhere in the HPI (an elevated PSA alone is NOT "
+            "prostate cancer)."
+        )
+        lines.append("")
     if gt.psa_entries:
         lines.append("PSA CURVE (newest first — every PSA value you cite MUST be in this list):")
         for e in gt.psa_entries[:25]:
@@ -127,14 +183,46 @@ def _ground_truth_block(gt: GroundTruth) -> str:
         lines.append("")
     if gt.confirmed_treatment_modalities:
         lines.append(
-            f"CONFIRMED PRIOR TREATMENTS (from PSH/pathology — only these "
-            f"may be cited as 'completed' / 'ongoing'):"
+            f"CONFIRMED PRIOR TREATMENTS (from PSH/pathology/timeline — only "
+            f"these may be cited as 'completed' / 'ongoing'):"
         )
         for m in sorted(gt.confirmed_treatment_modalities):
             lines.append(f"  - {m}")
         lines.append("")
-    else:
+    elif gt.treatment_naive:
         lines.append("CONFIRMED PRIOR TREATMENTS: (none — patient is treatment-naive)")
+        lines.append("")
+    else:
+        # Treated patient whose specific modalities didn't map to the
+        # canonical vocabulary. Do NOT tell the LLM the patient is
+        # treatment-naive — that is the bug that collapsed treated
+        # patients to a "new patient" HPI. The timeline below carries
+        # the detail.
+        lines.append(
+            "CONFIRMED PRIOR TREATMENTS: this patient HAS been treated "
+            "(NOT treatment-naive)"
+            + (f" — cancer status: {gt.cancer_status}" if gt.cancer_status else "")
+            + ". Narrate the treatment course from the TREATMENT TIMELINE below."
+        )
+        lines.append("")
+    # Treatment / diagnosis timeline assembled from the clinical record.
+    # This is the primary anchor for the HPI's disease-course narrative on
+    # narrative oncology inputs where structured sections are empty.
+    if gt.treatment_timeline:
+        lines.append(
+            "TREATMENT / DIAGNOSIS TIMELINE (oldest→newest as documented; "
+            "narrate the disease course from these events — do NOT omit the "
+            "treatment history):"
+        )
+        for line in gt.treatment_timeline[:40]:
+            lines.append(f"  - {line}")
+        lines.append("")
+    if gt.current_active_treatments:
+        lines.append(
+            "CURRENTLY ACTIVE TREATMENTS (the patient is presently on these):"
+        )
+        for t in gt.current_active_treatments[:20]:
+            lines.append(f"  - {t}")
         lines.append("")
     if gt.gleason_scores or gt.grade_groups:
         lines.append("PATHOLOGY FACTS:")
@@ -164,6 +252,33 @@ def _ground_truth_block(gt: GroundTruth) -> str:
     if gt.psh_text:
         snippet = gt.psh_text[:400].strip()
         lines.append(f"PAST SURGICAL HISTORY (excerpt):\n{snippet}")
+        lines.append("")
+    if getattr(gt, "imaging_text", "").strip():
+        snippet = gt.imaging_text[:700].strip()
+        lines.append(
+            "IMAGING (source excerpt — the primary evidence for a renal / "
+            "bladder / adrenal lesion; summarize relevant findings):\n"
+            f"{snippet}")
+        lines.append("")
+    # PRIOR HPI as a template + PRIOR PLAN for continuity. The LLM adapts the
+    # prior HPI for today rather than regenerating from scratch, and reflects
+    # the prior plan (pending workup, surveillance interval).
+    if getattr(gt, "prior_hpi", "").strip():
+        snippet = gt.prior_hpi.strip()[:1800]
+        lines.append(
+            "PRIOR HPI (most recent — USE THIS AS YOUR TEMPLATE. Preserve its "
+            "accurate history and structure, update it for today's visit, and "
+            "CONFIRM every diagnosis it states against the authoritative facts "
+            "above; correct or drop anything not supported — especially do NOT "
+            "carry forward a cancer diagnosis the facts mark ABSENT/"
+            "indeterminate):\n" + snippet)
+        lines.append("")
+    if getattr(gt, "prior_plan", "").strip():
+        snippet = gt.prior_plan.strip()[:1200]
+        lines.append(
+            "PRIOR ASSESSMENT/PLAN (reflect the established plan — pending "
+            "studies, surveillance interval, deferred workup — in "
+            "interval_status.summary and today_reason):\n" + snippet)
         lines.append("")
     return "\n".join(lines)
 
@@ -285,11 +400,36 @@ def build_hpi_json_prompt(
         "prior urology visit. Include a 1-2-sentence summary of the "
         "interval (symptoms, treatment continuation, any changes) "
         "anchored to the last visit date, and a 'denies' list of "
-        "pertinent negatives the source documents.",
+        "pertinent negatives the source documents. Do NOT begin the summary "
+        "with 'Since the last visit'/'since the DATE visit'/'since the "
+        "evaluation' — the renderer already prepends that anchor; start the "
+        "summary directly with the interval content (e.g. 'the patient "
+        "reports ...').",
         "  12. Fill prior_diagnosis whenever the patient has a known "
         "urologic diagnosis (prostate cancer, RCC, bladder cancer, BPH, "
         "stones, etc.) — not just for cancer. The renderer uses this "
-        "to anchor the HPI's clinical framing.",
+        "to anchor the HPI's clinical framing. When the ground truth lists "
+        "PRIMARY UROLOGIC DIAGNOSES, set prior_diagnosis.primary_dx to that "
+        "diagnosis and build the HPI around it (e.g. a right renal mass "
+        "under active surveillance). But when the list is labeled SECONDARY "
+        "/ INCIDENTAL, keep the prostate cancer as the primary_dx and treat "
+        "those findings as secondary problems only.",
+        "  13. TEMPLATE: When a PRIOR HPI is provided, use it as your "
+        "starting template — preserve its accurate clinical history, "
+        "presenting story, and interval structure, then update it for "
+        "today's visit. Do NOT discard the established narrative and "
+        "emit a sparse stub. BUT every diagnosis carried from the prior "
+        "HPI MUST be re-confirmed against the authoritative ground truth: "
+        "correct or drop any diagnosis the facts do not support (a prior "
+        "note that speculated 'possible metastatic disease' does NOT make "
+        "it a confirmed diagnosis). Also do NOT copy PSA numbers from the "
+        "prior HPI/plan — every PSA value comes ONLY from the PSA CURVE "
+        "block above (a prior note's PSA may be stale or erroneous).",
+        "  14. CONTINUITY: When a PRIOR ASSESSMENT/PLAN is provided, "
+        "reflect its active plan — pending studies (e.g. 'pending renal "
+        "MRI'), surveillance interval, and deferred workup — in "
+        "interval_status.summary and today_reason, so the HPI reads as a "
+        "continuation of the established care, not an isolated snapshot.",
         "",
         _schema_block(),
         "",

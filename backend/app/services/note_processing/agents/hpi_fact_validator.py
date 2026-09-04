@@ -57,6 +57,22 @@ class GroundTruth:
     confirmed_treatment_modalities: Set[str] = field(default_factory=set)
     treatment_naive: bool = True
 
+    # Narrative treatment course derived from patient_status_facts /
+    # clinical_timeline. These exist precisely because the structured
+    # PSH/MEDS/PATH extractors return EMPTY on narrative oncology-consult
+    # inputs; without them the v2 HPI collapses a heavily-treated patient
+    # to a "new patient" stub. Readable dated events, e.g.
+    # "2008: prostatectomy (completed)".
+    treatment_timeline: List[str] = field(default_factory=list)
+    # Currently-active systemic/local therapies (e.g. ["abiraterone", "leuprolide"]).
+    current_active_treatments: List[str] = field(default_factory=list)
+    # Authoritative cancer status from PatientStatusFacts
+    # ("TREATED" / "ACTIVE" / "NED" / "TREATMENT_NAIVE" / ...).
+    cancer_status: str = ""
+    # Source narrative text (sanitized) so the fact validator can verify
+    # treatments that are documented in prose rather than structured sections.
+    narrative_text: str = ""
+
     # Pathology
     pathology_text: str = ""  # raw PATHOLOGY section text
     gleason_scores: Set[str] = field(default_factory=set)  # {"3+3", "3+4", ...}
@@ -76,6 +92,21 @@ class GroundTruth:
 
     # Imaging text
     imaging_text: str = ""
+
+    # Multi-cancer / non-prostate GU primary diagnoses (renal mass, bladder
+    # tumor, etc.) from patient_status_facts.other_gu_diagnoses. Each item is
+    # a GUDiagnosis-like object with .organ, .category, .name, .grade,
+    # .status, .evidence. These anchor the HPI for a non-prostate primary so
+    # it does not collapse to a prostate-only (or empty) narrative.
+    other_gu_diagnoses: List[Any] = field(default_factory=list)
+
+    # Prior clinic-note narrative used as a TEMPLATE to adapt for today's
+    # visit. prior_hpi is the most-recent prior HPI prose; prior_plan is its
+    # Assessment/Plan. The LLM updates the prior HPI for the current encounter
+    # and confirms every diagnosis against the ground truth above, rather than
+    # regenerating from scratch and losing the established history.
+    prior_hpi: str = ""
+    prior_plan: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +310,17 @@ def _validate_treatment_history(events: List[Dict], gt: GroundTruth,
                                 errors: List[FactValidationError]) -> None:
     if not events:
         return
-    truth_lc = (gt.psh_text + "\n" + gt.pathology_text + "\n" + gt.pmh_text).lower()
+    # Include narrative + derived treatment timeline so treatments documented
+    # in prose (not just structured PSH/PATH/PMH) can be verified. Without
+    # this, a treated patient's prostatectomy/radiation/ADT — captured by
+    # patient_status_facts but absent from the empty structured sections —
+    # would be wrongly rejected as TREATMENT_UNSUPPORTED.
+    truth_lc = (
+        gt.psh_text + "\n" + gt.pathology_text + "\n" + gt.pmh_text + "\n"
+        + "\n".join(gt.treatment_timeline) + "\n"
+        + "\n".join(gt.current_active_treatments) + "\n"
+        + gt.narrative_text
+    ).lower()
     for i, evt in enumerate(events):
         modality = evt.get("modality", "")
         status = evt.get("status", "")
@@ -302,6 +343,16 @@ def _validate_treatment_history(events: List[Dict], gt: GroundTruth,
                     f"PSH/pathology/PMH",
                     found=modality, expected=sorted(gt.confirmed_treatment_modalities),
                 ))
+        # A treatment that is a CONFIRMED given modality cannot also be
+        # "declined" — declined means it was NOT administered. Catches an LLM
+        # status flip ("He declined ADT" for a patient who received ADT).
+        if status == "declined" and modality in gt.confirmed_treatment_modalities:
+            errors.append(FactValidationError(
+                f"{path}.status", "TREATMENT_DECLINED_BUT_GIVEN",
+                f"'{modality}' is a confirmed administered treatment — status "
+                f"must be completed/ongoing, not 'declined'",
+                found=status, expected="completed",
+            ))
 
 
 def _modality_mentioned_in_text(modality: str, text_lc: str) -> bool:

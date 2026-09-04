@@ -58,6 +58,7 @@ from datetime import date, datetime
 from typing import List, Optional, Tuple
 
 from .patient_status_facts import (
+    _HEDGING_RE,
     _PROSTATE_CONTEXT_RE,
     _in_prostate_context,
     _preceded_by_negation,
@@ -78,6 +79,41 @@ class TimelineEvent:
     modality: str = ""          # "ADT" / "EBRT" / "abiraterone" / "cystoscopy" / "PSMA PET" etc.
     detail: str = ""            # short, readable detail (the finding / value / context)
     source_quote: str = ""      # the original quote from source (for provenance)
+    # Temporal-validity metadata (see _classify_event). source_tier ranks
+    # trustworthiness: 1 = structured dated result (path / imaging / lab /
+    # procedure), 2 = dated history (treatment course), 3 = narrative.
+    # assertion_class: "durable" facts persist once true; "volatile" facts
+    # (disease status, on-treatment status, a measured value, an imaging
+    # impression) are true only AS OF their date and must be re-anchored to the
+    # latest observation, never carried forward as a standing truth.
+    source_tier: int = 2
+    assertion_class: str = ""   # "durable" | "volatile" | ""
+
+
+# Source-reliability tier by event type (1 = most trustworthy point-in-time
+# fact). Assertion class by event type: a completed/declined treatment, a
+# diagnosis, a pathology report and a procedure are DURABLE historical facts; an
+# imaging impression, a lab value, a staging decision and an ongoing-treatment
+# start/restart are VOLATILE (true only as of their date).
+_TIER_BY_TYPE = {
+    "PATHOLOGY": 1, "IMAGING": 1, "PROCEDURE": 1, "LAB_TREND": 1,
+    "DIAGNOSIS": 1, "STAGING_DECISION": 1,
+    "TREATMENT_STARTED": 2, "TREATMENT_COMPLETED": 2,
+    "TREATMENT_RESTARTED": 2, "TREATMENT_DECLINED": 2, "VISIT": 3,
+}
+_VOLATILE_TYPES = {"IMAGING", "LAB_TREND", "STAGING_DECISION",
+                   "TREATMENT_STARTED", "TREATMENT_RESTARTED"}
+_DURABLE_TYPES = {"DIAGNOSIS", "PATHOLOGY", "PROCEDURE",
+                  "TREATMENT_COMPLETED", "TREATMENT_DECLINED"}
+
+
+def _classify_event(e: "TimelineEvent") -> "TimelineEvent":
+    e.source_tier = _TIER_BY_TYPE.get(e.event_type, 2)
+    if e.event_type in _VOLATILE_TYPES:
+        e.assertion_class = "volatile"
+    elif e.event_type in _DURABLE_TYPES:
+        e.assertion_class = "durable"
+    return e
 
 
 EVENT_TYPES = (
@@ -168,6 +204,39 @@ def _date_in_window(text: str, center: int, window: int = 80) -> Optional[Tuple[
     return _parse_date_from_text(snippet)
 
 
+# Any date-like token, used to pick the date NEAREST a keyword (by position)
+# rather than the first-by-format-priority date _parse_date_from_text returns.
+_ANY_DATE_TOKEN = re.compile(
+    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|"
+    r"\b[A-Za-z]{3,9}\s+\d{0,2},?\s*\d{4}\b|"
+    r"\b\d{1,2}/\d{4}\b|"
+    r"\b(?:19[89]\d|20\d\d)\b")
+
+
+def _date_forward(text: str, pos: int, span: int = 40) -> Optional[Tuple[str, str]]:
+    """The POSITIONALLY-FIRST date in a TIGHT window immediately AFTER ``pos``.
+    Position-based (not _parse_date_from_text's format-priority) so 'radiation
+    therapy 4/2022. Pathology 12/15/2021' dates to 4/2022 — the date adjacent to
+    the treatment word — not the full-format pathology stamp just after it."""
+    seg = text[pos:pos + span]
+    for mm in _ANY_DATE_TOKEN.finditer(seg):
+        d = _parse_date_from_text(mm.group(0))
+        if d:
+            return d
+    return None
+
+
+def _date_before_nearest(text: str, pos: int, span: int = 70) -> Optional[Tuple[str, str]]:
+    """The date CLOSEST before ``pos`` (rightmost in the preceding segment) —
+    positionally nearest, not first-by-format."""
+    seg = text[max(0, pos - span):pos]
+    for mm in reversed(list(_ANY_DATE_TOKEN.finditer(seg))):
+        d = _parse_date_from_text(mm.group(0))
+        if d:
+            return d
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Pattern catalogs
 # ---------------------------------------------------------------------------
@@ -236,6 +305,21 @@ _PROCEDURE_VOCAB = (
 )
 
 
+# Qualifiers that FOLLOW a staging phrase and mark it unconfirmed /
+# speculative, e.g. "metastatic disease, though this has not been
+# confirmed", "... has not been confirmed", "... is unlikely",
+# "... versus ablation", "... cannot be excluded".
+_TRAILING_HEDGE_RE = re.compile(
+    r"\b(?:"
+    r"(?:has\s+)?not\s+(?:been\s+)?(?:confirmed|established|proven)|"
+    r"unconfirmed|unlikely|cannot\s+be\s+(?:excluded|confirmed|ruled)|"
+    r"remains?\s+(?:to\s+be\s+|un)?(?:confirmed|determined)|"
+    r"is\s+(?:possible|suspected|uncertain)|versus\b|vs\.?\b|"
+    r"if\s+there\s+is\s+evidence"
+    r")",
+    re.IGNORECASE,
+)
+
 # Staging / progression decision vocabulary
 _STAGING_PATTERNS = (
     (r"\bmCRPC\b|metastatic\s+castration[\s\-]?resistant\s+prostate\s+cancer|"
@@ -243,7 +327,13 @@ _STAGING_PATTERNS = (
      "metastatic castration-resistant prostate cancer (mCRPC)"),
     (r"\bmHSPC\b|metastatic\s+hormone[\s\-]?sensitive\s+prostate\s+cancer",
      "metastatic hormone-sensitive prostate cancer (mHSPC)"),
-    (r"\bmetastatic\s+(?:prostate\s+)?(?:cancer|adenocarcinoma|disease)\b",
+    # NOTE: an explicit "prostate" anchor is REQUIRED. Bare "metastatic
+    # disease" in a renal/skeletal workup ("concern for possible metastatic
+    # disease") must NOT be specialized into "metastatic prostate cancer"
+    # (see ASHFORD: renal-mass patient with no prostate cancer). Confirmed
+    # prostate cases that say only "metastatic disease" are still covered
+    # via cancer_status downstream.
+    (r"\bmetastatic\s+prostate\s+(?:cancer|adenocarcinoma|disease)\b",
      "metastatic prostate cancer"),
     (r"biochemical\s+recurrence|biochemical\s+failure|biochemical\s+relapse",
      "biochemical recurrence"),
@@ -300,9 +390,14 @@ def _find_treatment_events(
                     continue
             if not _in_prostate_context(text, m.start()):
                 continue
-            # Date can be on either side, prefer following (~50 chars after)
-            d = (_date_in_window(text, m.end(), window=60)
-                 or _date_in_window(text, m.start(), window=80))
+            # Date association: a treatment's date is the one adjacent to the
+            # treatment word — prefer a date immediately FOLLOWING it ("radiation
+            # therapy 4/2022"), then the NEAREST date before it. The old centered
+            # ±60 window returned the first-by-format date, so a diagnosis/MRI
+            # date one clause back hijacked the treatment (WHITEHEAD: radiation
+            # 4/2022 mis-dated to the 12/2021 diagnosis).
+            d = (_date_forward(text, m.end(), span=40)
+                 or _date_before_nearest(text, m.start(), span=70))
             if not d:
                 continue
             date_key, date_display = d
@@ -350,6 +445,26 @@ def _preceding_note_date(raw_text: str, anchor: int, window: int = 20000) -> Opt
       5. Bare "MM/DD/YYYY HH:MM" at line start
     """
     preceding = raw_text[max(0, anchor - window):anchor]
+    # 0. Closest inline PATHOLOGY/specimen date header ("Pathology 3/6/2023",
+    #    "Path Report: MM/DD/YYYY", "PATHOLOGY: ...", "Collected: ...", "Date
+    #    Spec taken: MMM DD, YYYY"). These sit at the top of a copy-forward path
+    #    block and ARE the finding's true date — take the CLOSEST one within a
+    #    tight window so a pathology finding isn't dated to a far, unrelated
+    #    note header (BILEK: 3/6/2023 biopsy findings mis-dated to a 6/1/2011
+    #    orthopedics "DATE OF NOTE" stamp).
+    tight = raw_text[max(0, anchor - 1500):anchor]
+    path_best = None
+    for m in re.finditer(
+        r"(?i)(?:patholog\w*|path\s*report|collected|date\s+spec\s+taken|"
+        r"accession(?:ed)?)\s*:?\s*"
+        r"((?:\d{1,2}/\d{1,2}/\d{4})|(?:[A-Z]{3,9}\s+\d{1,2},?\s+\d{4}))",
+        tight,
+    ):
+        path_best = m  # last = closest to the anchor
+    if path_best is not None:
+        d = _parse_date_from_text(path_best.group(1))
+        if d:
+            return d
     best = None
     # 1. "MM/DD/YYYY HH:MM Local Title:" (most-specific)
     for m in re.finditer(
@@ -391,6 +506,44 @@ def _preceding_note_date(raw_text: str, anchor: int, window: int = 20000) -> Opt
     return _parse_date_from_text(best.group(1))
 
 
+# PROSTATE-qualified pathology-collection dating. VistA charts interleave many
+# copy-forward specimens (prostate, colon, skin); the nearest "Collected:" header
+# to a prostate biopsy can belong to a DIFFERENT specimen (BILEK: a colon TUBULAR
+# ADENOMA "Collected: 06/01/2011" hijacking the 2019 prostate adenocarcinoma).
+# Only a collection header whose specimen block is prostate counts.
+_PROSTATE_PATH_CTX = re.compile(r"prostat|gleason|grade\s+group|\bGG[1-5]\b", re.I)
+_PATH_COLLECT_RE = re.compile(
+    r"(?i)(?:collected|received|date\s+spec(?:imen)?\s+taken|pathology|path\s*report|"
+    r"reported)\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Z]{3,9}\s+\d{1,2},?\s+\d{4})")
+
+
+def _prostate_pathology_date_before(
+    raw_text: str, anchor: int, window: int = 1800,
+) -> Optional[Tuple[str, str]]:
+    """Closest PROSTATE-qualified collection date heading the block before
+    ``anchor`` (the collection header whose specimen description is prostate)."""
+    seg = raw_text[max(0, anchor - window):anchor]
+    best = None
+    for m in _PATH_COLLECT_RE.finditer(seg):
+        block = seg[m.start():min(len(seg), m.end() + 300)]
+        if _PROSTATE_PATH_CTX.search(block):
+            best = m  # last = closest to the anchor
+    return _parse_date_from_text(best.group(1)) if best else None
+
+
+def _prostate_pathology_date_keys(raw_text: str) -> set:
+    """date_keys of every PROSTATE-qualified pathology collection date — the true
+    prostate biopsy dates, used to anchor the copy-forward collapse."""
+    keys = set()
+    for m in _PATH_COLLECT_RE.finditer(raw_text):
+        block = raw_text[m.start():min(len(raw_text), m.end() + 300)]
+        if _PROSTATE_PATH_CTX.search(block):
+            d = _parse_date_from_text(m.group(1))
+            if d:
+                keys.add(d[0])
+    return keys
+
+
 def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
     """Surface key findings from urologic procedures.
 
@@ -419,9 +572,17 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
             #      the preceding ~2500 chars (catches "UROLOGY PROCEDURE
             #      NOTE" headers that sit hundreds of chars above the
             #      procedure-specific keyword).
-            d = (_date_in_window(raw_text, m.start(), window=80)
-                 or _date_in_window(raw_text, m.end(), window=80)
-                 or _preceding_note_date(raw_text, m.start()))
+            if proc_label == "prostate biopsy":
+                # Date a prostate biopsy by ITS OWN prostate report's collection
+                # header, not a coincidental nearer non-prostate specimen date.
+                d = (_prostate_pathology_date_before(raw_text, m.start())
+                     or _date_in_window(raw_text, m.start(), window=80)
+                     or _date_in_window(raw_text, m.end(), window=80)
+                     or _preceding_note_date(raw_text, m.start()))
+            else:
+                d = (_date_in_window(raw_text, m.start(), window=80)
+                     or _date_in_window(raw_text, m.end(), window=80)
+                     or _preceding_note_date(raw_text, m.start()))
             date_key = d[0] if d else ""
             date_display = d[1] if d else "(undated)"
             # Skip purely planning-context mentions ("consider cystoscopy"),
@@ -498,6 +659,49 @@ def extract_procedure_findings(raw_text: str) -> List[ProcedureFinding]:
                 finding=finding[:200],
                 source_quote=re.sub(r"\s+", " ", q).strip()[:300],
             ))
+
+    # Collapse copied-forward prostate-biopsy pathology. The diagnostic biopsy
+    # result is pasted into every subsequent clinic note, so a per-occurrence
+    # date attaches PHANTOM biopsies to later note-header dates (JELLSEY: 9
+    # "prostatic adenocarcinoma" biopsies dated 2022→2025, HPI then renders the
+    # newest, "biopsy 10/29/2025", after XRT finished in 2022). A given biopsy
+    # RESULT is a single historical event: keep one per distinct finding, dated
+    # by an EXPLICIT biopsy-date anchor ("8/16/2022 Prostate Biopsy") when one
+    # exists, else the earliest observed date. A genuinely different repeat
+    # biopsy has different finding text and is preserved as its own event.
+    bx = [f for f in findings if f.procedure == "prostate biopsy"]
+    if len(bx) > 1:
+        explicit_bx_dates = set()
+        for bm in _BIOPSY_DATE_RE.finditer(raw_text):
+            pd = _parse_date_from_text(bm.group(1))
+            if pd:
+                explicit_bx_dates.add(pd[0])
+        # Prostate-qualified pathology collection dates are authoritative biopsy
+        # anchors — they exclude non-prostate specimen dates (colon adenoma).
+        explicit_bx_dates |= _prostate_pathology_date_keys(raw_text)
+
+        def _norm_find(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "").lower()).strip()[:60]
+
+        from collections import Counter
+        groups: dict = {}
+        for f in bx:
+            groups.setdefault(_norm_find(f.finding), []).append(f)
+        collapsed: List[ProcedureFinding] = []
+        for grp in groups.values():
+            anchored = [f for f in grp if f.date_key in explicit_bx_dates]
+            pick_from = anchored or grp
+            # Copy-forward pastes the SAME pathology block into many later notes,
+            # so the CORRECT biopsy date recurs across copies, while a copy whose
+            # date mis-resolved to an unrelated note header (BILEK: a 3/6/2023
+            # biopsy block that fell back to a 6/1/2011 orthopedics stamp) appears
+            # once. Pick the MOST COMMON date; tie-break by earliest (preserves the
+            # JELLSEY phantom-biopsy fix, where distinct copy dates all tie -> the
+            # earliest, closest-to-the-real-diagnosis, wins).
+            counts = Counter(f.date_key for f in pick_from)
+            best = min(counts, key=lambda dk: (-counts[dk], dk or "9999"))
+            collapsed.append(next(f for f in pick_from if f.date_key == best))
+        findings = [f for f in findings if f.procedure != "prostate biopsy"] + collapsed
 
     findings.sort(key=lambda f: (f.date_key or "0", f.procedure), reverse=True)
     return findings
@@ -872,6 +1076,16 @@ def _extract_staging_events(raw_text: str) -> List[TimelineEvent]:
         for m in re.finditer(pat, raw_text, re.IGNORECASE):
             if _preceded_by_negation(raw_text, m.start()):
                 continue
+            # Hedged / speculative staging ("possible metastatic prostate
+            # cancer", "concern for biochemical recurrence", "evaluate for
+            # ...") is NOT a confirmed staging decision. Check a wide window
+            # on BOTH sides — the qualifier can trail ("... metastatic
+            # disease, though not confirmed" / "... versus ablation").
+            _lo = max(0, m.start() - 90)
+            _hi = min(len(raw_text), m.end() + 90)
+            if _HEDGING_RE.search(raw_text[_lo:m.start()]) or \
+                    _TRAILING_HEDGE_RE.search(raw_text[m.end():_hi]):
+                continue
             d = _date_in_window(raw_text, m.start(), 100)
             date_key = d[0] if d else ""
             date_display = d[1] if d else "(undated)"
@@ -925,6 +1139,126 @@ def extract_psa_trajectory(raw_text: str) -> List[Tuple[str, str, float]]:
 # ---------------------------------------------------------------------------
 # Master extractor
 # ---------------------------------------------------------------------------
+# Named oncologic agents / discrete procedures for which a dated mention in
+# a prostate-cancer context is sufficient evidence of a real treatment event
+# — NO started/completed trigger verb required. This is what catches the
+# numbered "Treatment." narrative lists in oncology consults that the
+# trigger-gated _find_treatment_events misses. Generic words
+# ("radiation therapy", bare "ADT") stay on the trigger-gated path to avoid
+# false positives from planning / discussion language. The 3rd field forces
+# a status for one-time procedures (always COMPLETED if dated in the past).
+_TX_NAMED_VOCAB = (
+    (r"radical\s+(?:retropubic\s+)?prostatectomy|\bprostatectomy\b|\bRALP\b|\bRARP\b|\bRRP\b",
+     "prostatectomy", "COMPLETED"),
+    (r"external\s+beam\s+radiation|radiation\s+therapy|\bEBRT\b|\bIMRT\b|\bSBRT\b|\bXRT\b|\bIGRT\b|radiotherapy",
+     "radiation therapy", None),
+    (r"androgen\s+deprivation(?:\s+therapy)?|\bADT\b", "ADT", None),
+    (r"\bbrachytherapy\b|seed\s+implant", "brachytherapy", "COMPLETED"),
+    (r"\babiraterone\b|\bZytiga\b", "abiraterone", None),
+    (r"\benzalutamide\b|\bXtandi\b", "enzalutamide", None),
+    (r"\bapalutamide\b|apaluatimide|\bErleada\b", "apalutamide", None),
+    (r"\bdarolutamide\b|\bNubeqa\b", "darolutamide", None),
+    (r"\bbicalutamide\b|\bCasodex\b", "bicalutamide", None),
+    (r"\b(?:Lupron|Eligard|leuprolide|degarelix|goserelin|relugolix|Firmagon|Orgovyx)\b",
+     "Eligard / leuprolide", None),
+    (r"\bdocetaxel\b|\bcabazitaxel\b|\bTaxotere\b|\bJevtana\b", "chemotherapy", None),
+    (r"\bsipuleucel(?:-T)?\b|\bProvenge\b", "Provenge", "COMPLETED"),
+    (r"\bradium[\s\-]?223\b|\bXofigo\b", "Ra-223", "COMPLETED"),
+    (r"\b(?:177\s*Lu|Lu[\s\-]?177|Lutetium[\s\-]?177|Pluvicto)\b", "Lu-177 PSMA", "COMPLETED"),
+)
+
+# Local context that forces a COMPLETED classification for the otherwise
+# ambiguous named drugs (no forced status). E.g. "Abiraterone April 2019 -
+# dcd December 2021", "Docetaxel ... -November 2022".
+# Strong, treatment-specific completion signals only. Deliberately EXCLUDES
+# "until"/"through" — in these narratives those usually qualify a PSA value
+# ("PSA stable until Jul 2014"), not treatment completion, and were
+# mislabeling ongoing ADT as completed.
+_COMPLETED_CTX_RE = re.compile(
+    r"complet|stopped|\bd/?c'?d\b|\bdcd\b|discontinu|finished|\bs/?p\b|status\s+post|"
+    r"ceased|off\s+therapy",
+    re.IGNORECASE,
+)
+
+
+def _iter_numbered_items(raw_text: str):
+    """Yield (item_text, offset) for each item in a numbered list
+    ("1. ...", "2. ...") anywhere in the document.
+
+    Item boundaries are the NEXT numbered-line marker, so adjacent
+    list lines (no blank line between them — the norm in these
+    oncology 'Treatment' lists) are split correctly. The final item is
+    cut at the first blank line (section break) so it doesn't run away
+    into the following paragraph.
+    """
+    matches = list(re.finditer(r"(?m)^[ \t]*\d{1,3}\.\s+", raw_text))
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw_text)
+        item = raw_text[start:end]
+        cut = item.find("\n\n")
+        if cut != -1:
+            item = item[:cut]
+        yield item, start
+
+
+def _first_date_after(item_text: str, pos: int):
+    """First parseable date at/after `pos` within the item, else first
+    date anywhere in the item. Returns (date_key, date_display) or None."""
+    return (_date_in_window(item_text, pos, window=len(item_text) + 1)
+            or _date_in_window(item_text, 0, window=len(item_text) + 1))
+
+
+def _extract_narrative_treatment_list(raw_text: str) -> List[TimelineEvent]:
+    """Catch named oncologic treatments documented in narrative HPI
+    'Treatment' lists where the trigger-verb-gated extractor fails.
+
+    Parses NUMBERED list items so each treatment is anchored to the date
+    in ITS OWN item — not a date that happens to be nearby in a dense
+    list or a later summary sentence. A named agent/procedure (from
+    _TX_NAMED_VOCAB) in a prostate-cancer context, not negated, is taken
+    as a real treatment event.
+    """
+    events: List[TimelineEvent] = []
+    seen = set()
+    for item_text, item_offset in _iter_numbered_items(raw_text):
+        for tx_pattern, tx_display, forced_status in _TX_NAMED_VOCAB:
+            m = re.search(tx_pattern, item_text, re.IGNORECASE)
+            if not m:
+                continue
+            if _preceded_by_negation(item_text, m.start()):
+                continue
+            # prostate-cancer context evaluated against the full document
+            # at this item's location. Use a wide window: a numbered
+            # treatment list spans hundreds of chars and the prostate
+            # anchor (item 1 "prostatectomy", or "PSMA Therapy for
+            # Prostate Cancer") may be far from a middle item.
+            if not _in_prostate_context(raw_text, item_offset + m.start(),
+                                        window=2000):
+                continue
+            d = _first_date_after(item_text, m.end())
+            if not d:
+                continue
+            date_key, date_display = d
+            if forced_status:
+                etype = "TREATMENT_" + forced_status
+            else:
+                etype = ("TREATMENT_COMPLETED"
+                         if _COMPLETED_CTX_RE.search(item_text)
+                         else "TREATMENT_STARTED")
+            key = (date_key, tx_display.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            detail = re.sub(r"\s+", " ", item_text).strip()
+            events.append(TimelineEvent(
+                date_key=date_key, date_display=date_display,
+                event_type=etype, modality=tx_display,
+                detail=detail[:140], source_quote=detail[:200],
+            ))
+    return events
+
+
 def extract_clinical_timeline(
     raw_text: str,
     today: Optional[date] = None,
@@ -940,9 +1274,53 @@ def extract_clinical_timeline(
     events += _find_treatment_events(raw_text, _COMPLETION_TRIGGERS, "TREATMENT_COMPLETED")
     events += _find_treatment_events(raw_text, _RESTART_TRIGGERS, "TREATMENT_RESTARTED")
     events += _find_treatment_events(raw_text, _DECLINE_TRIGGERS, "TREATMENT_DECLINED")
+    narrative_tx = _extract_narrative_treatment_list(raw_text)
+    events += narrative_tx
     events += _extract_pathology_events(raw_text)
     events += _extract_imaging_events(raw_text)
     events += _extract_staging_events(raw_text)
+
+    # The narrative numbered-list parser anchors each treatment to the date
+    # in its own item; the trigger-gated _find_treatment_events uses fuzzy
+    # char windows and garbles dense lists (grabbing a neighbor's date or
+    # spanning items). When the narrative parser found a modality, treat it
+    # as authoritative: drop trigger-gated events for that SAME modality so
+    # the wrong-date duplicate doesn't survive.
+    _narrative_modalities = {e.modality.lower() for e in narrative_tx if e.modality}
+
+    # Dedup treatment events by (date, modality); prefer the more definitive
+    # status (COMPLETED/RESTARTED over STARTED) for the same modality+date.
+    _TX_PRIORITY = {"TREATMENT_COMPLETED": 3, "TREATMENT_RESTARTED": 3,
+                    "TREATMENT_DECLINED": 2, "TREATMENT_STARTED": 1}
+    _best: dict = {}
+    _passthrough: List[TimelineEvent] = []
+    _dx_best: dict = {}
+    _narrative_ids = {id(e) for e in narrative_tx}
+    for e in events:
+        if e.event_type.startswith("TREATMENT_") and e.modality:
+            mod = e.modality.lower()
+            # Suppress trigger-gated events for modalities the narrative
+            # parser already covers authoritatively.
+            if mod in _narrative_modalities and id(e) not in _narrative_ids:
+                continue
+            k = (e.date_key, mod)
+            cur = _best.get(k)
+            if cur is None or _TX_PRIORITY.get(e.event_type, 0) > _TX_PRIORITY.get(cur.event_type, 0):
+                _best[k] = e
+        elif e.event_type == "DIAGNOSIS" and e.modality:
+            # A cancer is diagnosed ONCE. The extractor emits a DIAGNOSIS
+            # event every time "<cancer> diagnosed" appears near a date —
+            # including later encounter/note dates — which lets the HPI pick
+            # a recent encounter date (EVERETT: "diagnosed Nov 26 2025")
+            # instead of the true diagnosis (2023). Keep only the EARLIEST
+            # date per cancer modality.
+            mod = e.modality.lower()
+            cur = _dx_best.get(mod)
+            if cur is None or (e.date_key or "9999") < (cur.date_key or "9999"):
+                _dx_best[mod] = e
+        else:
+            _passthrough.append(e)
+    events = _passthrough + list(_best.values()) + list(_dx_best.values())
 
     # PROCEDURE events from the findings extractor
     for pf in extract_procedure_findings(raw_text):
@@ -954,6 +1332,9 @@ def extract_clinical_timeline(
             detail=pf.finding,
             source_quote=pf.source_quote,
         ))
+
+    # Tag each event with its source tier + assertion class (temporal validity).
+    events = [_classify_event(e) for e in events]
 
     # Sort: events with dates ascend chronologically; dateless to the end.
     def sort_key(e: TimelineEvent):
@@ -1063,39 +1444,113 @@ _ONCOLOGIC_MED_HINTS = (
 )
 
 
-def detect_current_active_treatments(raw_text: str) -> List[str]:
-    """Return a short list of meds the patient is currently taking, anchored
-    to the most-recent medications list block in the source.
+# Strong, unambiguous discontinuation verbs. Deliberately EXCLUDES bare
+# "completed" (a chemo CYCLE can be "completed" while the drug continues) —
+# the goal is to stop the Plan from saying "Continue abiraterone" when the
+# narrative says the patient STOPPED it, without falsely dropping a drug the
+# patient is still on.
+_MED_DISCONT_VERB = (
+    r"(?:stop(?:ped|ping)?|discontinu\w+|\bd/?c'?d\b|\bdc'?d\b|held|"
+    r"no\s+longer\s+(?:on|taking|using)|taken\s+off|came\s+off|"
+    r"\boff\s+(?:of\s+)?(?:the\s+)?|ceased|declined|elected\s+to\s+stop)"
+)
 
-    Without this, the HPI/Plan agents have only an unordered set of "drugs
-    mentioned somewhere" and can flip-flop on whether the patient is still
-    on ADT (which is the Ketnick failure mode).
+
+def _drug_discontinued_in_narrative(drug: str, text_lc: str) -> bool:
+    """True if the narrative explicitly says `drug` was stopped/discontinued.
+    Checks both verb→drug ("stopped abiraterone") and drug→verb
+    ("abiraterone was discontinued") within a short window."""
+    d = re.escape(drug)
+    if re.search(_MED_DISCONT_VERB + r"\s+(?:\w+[\s,]+){0,4}?" + d, text_lc):
+        return True
+    if re.search(d + r"\b[^.\n]{0,40}?\b(?:was\s+|is\s+|been\s+|now\s+)?"
+                 + _MED_DISCONT_VERB, text_lc):
+        return True
+    return False
+
+
+def _scan_block_for_meds(block: str) -> List[str]:
+    """Pull oncologic / urologic med lines out of one medication block."""
+    out: List[str] = []
+    seen = set()
+    for line in block.split("\n"):
+        line_l = line.lower()
+        for hint in _ONCOLOGIC_MED_HINTS:
+            if hint in line_l:
+                quote = re.sub(r"\s+", " ", line).strip()
+                if quote and quote not in seen:
+                    seen.add(quote)
+                    out.append(quote[:160])
+                break
+    return out
+
+
+def detect_current_active_treatments(raw_text: str) -> List[str]:
+    """Return the patient's CURRENT medications from the AUTHORITATIVE VistA
+    RXOP active-outpatient list (rendered by the normalizer with
+    ``RXOP_AUTHORITATIVE_SENTINEL``).
+
+    The VistA "OUTPT RX-ACTIVE ONLY" list is the active meds AS OF COLLECTION
+    and is authoritative above all other sources. We read ONLY that block —
+    NOT the stale "Active Outpatient Medications" med-reconciliation snapshots
+    embedded in older notes (which is what caused the Plan to "continue"
+    long-finished drugs). The list is taken as-is; narrative "stopped X"
+    statements do NOT override it.
+
+    EXCEPTION — Eligard/ADT: an LHRH agonist is dosed intermittently in-clinic
+    and is frequently ABSENT from the active outpatient Rx list even when the
+    patient is on ongoing ADT. So ADT active/completed status must come from
+    the treatment timeline / administration dates / course-completion language
+    (see patient_status_facts.treatment_active_status), NOT from this list's
+    presence or absence of Eligard.
     """
     if not raw_text:
         return []
-    out: List[str] = []
-    seen = set()
-    for m in _MED_LIST_HEADER_RE.finditer(raw_text):
-        block = raw_text[m.end():m.end() + 2000]
-        # Stop at next ALL-CAPS header / separator
-        stop_m = re.search(r"^\s*(?:[A-Z]{4,}:\s*$|={5,})", block, re.MULTILINE)
-        if stop_m:
-            block = block[:stop_m.start()]
-        for line in block.split("\n"):
-            line_l = line.lower()
-            for hint in _ONCOLOGIC_MED_HINTS:
-                if hint in line_l:
-                    quote = re.sub(r"\s+", " ", line).strip()
-                    if quote and quote not in seen:
-                        seen.add(quote)
-                        out.append(quote[:160])
-                    break
-    return out
+    from .source_normalizers.vista_to_cprs import RXOP_AUTHORITATIVE_SENTINEL
+    idx = raw_text.find(RXOP_AUTHORITATIVE_SENTINEL)
+    if idx != -1:
+        block = raw_text[idx + len(RXOP_AUTHORITATIVE_SENTINEL):]
+        # The RXOP block uses "====" lines as separators BETWEEN med entries,
+        # so we must NOT stop on those. The block ends at the next real
+        # section — a VistA dash-bar ("---- SURGICAL PATHOLOGY ----") or an
+        # ALL-CAPS CPRS section header.
+        stop_m = re.search(r"\n(?:-{3,}\s*[A-Z]|[A-Z][A-Z /]{4,}:)", block)
+        block = block[:stop_m.start()] if stop_m else block[:4000]
+        return _scan_block_for_meds(block)
+
+    # Fallback (non-VistA / cprs input with no authoritative block): use the
+    # most-recent med-list block only, rather than aggregating every stale
+    # snapshot across the document.
+    headers = list(_MED_LIST_HEADER_RE.finditer(raw_text))
+    if not headers:
+        return []
+    m = headers[-1]
+    block = raw_text[m.end():m.end() + 2000]
+    stop_m = re.search(r"^\s*(?:[A-Z]{4,}:\s*$|={5,})", block, re.MULTILINE)
+    if stop_m:
+        block = block[:stop_m.start()]
+    return _scan_block_for_meds(block)
 
 
 # ---------------------------------------------------------------------------
 # Rendering for the prompt
 # ---------------------------------------------------------------------------
+_TX_FILLER_RE = re.compile(
+    r"\b(completed?|start(?:ed)?|initiat(?:ed|e)|underwent|received|ongoing|"
+    r"discontinued|therapy|treatment|course|for|prostate|cancer|adenocarcinoma|"
+    r"of|the|a|an|on|to|with|status|post|s/?p)\b", re.IGNORECASE)
+
+
+def _detail_is_redundant(detail: str, modality: str) -> bool:
+    """True when ``detail`` conveys nothing beyond ``modality`` + status words
+    (so appending it would just duplicate the treatment phrase)."""
+    def core(s: str) -> set:
+        s = _TX_FILLER_RE.sub(" ", (s or "").lower())
+        return set(re.sub(r"[^a-z0-9]+", " ", s).split())
+    dw, mw = core(detail), core(modality)
+    return not dw or dw <= mw
+
+
 def format_timeline_for_prompt(events: List[TimelineEvent], limit: int = 30) -> str:
     """Render the timeline as a dated bullet list for inclusion in the
     GROUND TRUTH prompt block. Sorted oldest -> newest so the narrative
@@ -1105,6 +1560,15 @@ def format_timeline_for_prompt(events: List[TimelineEvent], limit: int = 30) -> 
     lines: List[str] = []
     # Show up to `limit` events. If overflow, summarize.
     show = events[-limit:] if len(events) > limit else events
+    # A definitive treatment that has a COMPLETED event does not also need its
+    # STARTED event — the two read as a redundant "initiated ... completed", and
+    # an undated START sorts AFTER the completion ("initiated after completed").
+    # Keep the completion; drop the same-modality START.
+    _completed_mods = {(e.modality or "").strip().lower()
+                       for e in show if e.event_type == "TREATMENT_COMPLETED"}
+    show = [e for e in show if not (
+        e.event_type == "TREATMENT_STARTED"
+        and (e.modality or "").strip().lower() in _completed_mods)]
     for e in show:
         date_disp = e.date_display or "(undated)"
         type_lbl = e.event_type.replace("_", " ").title()
@@ -1113,7 +1577,14 @@ def format_timeline_for_prompt(events: List[TimelineEvent], limit: int = 30) -> 
         parts = [f"[{date_disp}]", type_lbl]
         if modality:
             parts.append(f"- {modality}")
-        if detail and detail.lower() != modality.lower():
+        # For TREATMENT_* events the detail is the raw matched phrase (e.g.
+        # "radiation therapy completed"), which just repeats the type + modality
+        # and makes the HPI render "completed radiation therapy on DATE -
+        # radiation therapy completed". Only append detail when it ADDS
+        # information (diagnosis/pathology/procedure/imaging findings) and isn't
+        # a rewording of the modality + status.
+        if detail and not e.event_type.startswith("TREATMENT") \
+                and not _detail_is_redundant(detail, modality):
             parts.append(f": {detail}")
         lines.append("  " + " ".join(parts))
     if len(events) > limit:

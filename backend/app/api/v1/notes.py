@@ -462,11 +462,24 @@ async def generate_initial_note(
             clinical_input_with_date = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
 
         _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        # Compute the authoritative PatientStatusFacts ONCE (multi-cancer ground
+        # truth + optional L1 enrichment) and feed it to Stage 1 so the CC/HPI
+        # agents anchor on the correct primary. Stage 2 (generate-final) derives
+        # the same facts from the same clinical input.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts, clinical_input_with_date, _src_fmt,
+            stage1_config,  # holistic GU diagnosis pass uses this LLM
+        )
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
             clinical_text=clinical_input_with_date,
             task_config=stage1_config,
             source_format=_src_fmt,
+            patient_facts=_shared_facts,
+            note_type=request.note_type,
         )
 
         logger.info(f"Agent-based note builder complete: {len(preliminary_note)} chars generated")
@@ -714,6 +727,22 @@ async def generate_final_note(
         # When implemented, this will contain real-time provider-patient conversation
         ambient_transcript = None
 
+        # Compute the authoritative PatientStatusFacts from the SAME raw clinical
+        # input Stage 1 used (multi-cancer ground truth + optional L1), so the
+        # Assessment/Plan ground on those facts instead of re-deriving a divergent
+        # picture from the rendered Stage 1 note.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        _final_input = request.clinical_input
+        if request.visit_date:
+            _final_input = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts, _final_input, _src_fmt,
+            stage2_config,  # holistic GU diagnosis pass uses this LLM
+        )
+
         # Build Stage 2 note with task-specific LLM config
         # Pass non_gu_notes for cross-specialty urologic content extraction
         complete_note = build_stage2_note(
@@ -726,7 +755,8 @@ async def generate_final_note(
             task_config=stage2_config,
             note_type=request.note_type,
             patient_name=request.patient_name,
-            ssn_last4=request.ssn_last4
+            ssn_last4=request.ssn_last4,
+            patient_facts=_shared_facts,
         )
 
         logger.info("Stage 2 agent-based note generation complete")
@@ -837,11 +867,26 @@ async def generate_express_note(
 
         logger.info("Express Step 1: Building Stage 1 preliminary note...")
         _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        # Phase 1: compute the authoritative PatientStatusFacts ONCE and feed
+        # the same object to Stage 1 and Stage 2, so the Assessment grounds on
+        # the same facts as the HPI instead of re-deriving (and inventing) a
+        # divergent timeline/status from the rendered note.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts,
+            clinical_input_with_date,
+            _src_fmt,
+            stage1_config,  # holistic GU diagnosis pass uses this LLM
+        )
         preliminary_note = await asyncio.to_thread(
             build_urology_note,
             clinical_text=clinical_input_with_date,
             task_config=stage1_config,
             source_format=_src_fmt,
+            patient_facts=_shared_facts,
+            note_type=request.note_type,
         )
         logger.info(
             f"Express: preliminary note ready ({len(preliminary_note)} chars)"
@@ -939,6 +984,7 @@ async def generate_express_note(
             note_type=request.note_type,
             patient_name=request.patient_name,
             ssn_last4=request.ssn_last4,
+            patient_facts=_shared_facts,  # Phase 1: shared authoritative facts
         )
 
         generation_time = time.time() - start_time
@@ -1064,11 +1110,22 @@ async def generate_express_note_stream(
                 )
 
             _src_fmt = await _get_user_source_format(current_user.user_id, db)
+            # Authoritative PatientStatusFacts computed ONCE (multi-cancer ground
+            # truth + optional L1), shared by Stage 1 and Stage 2 below.
+            from app.services.note_processing.note_builder import (
+                build_authoritative_patient_facts,
+            )
+            _shared_facts = await asyncio.to_thread(
+                build_authoritative_patient_facts, clinical_input_with_date, _src_fmt,
+            stage1_config,  # holistic GU diagnosis pass uses this LLM
+            )
             preliminary_note = await asyncio.to_thread(
                 build_urology_note,
                 clinical_text=clinical_input_with_date,
                 task_config=stage1_config,
                 source_format=_src_fmt,
+                patient_facts=_shared_facts,
+                note_type=note_type,
             )
             t_stage1 = _time.time() - t0
 
@@ -1178,6 +1235,7 @@ async def generate_express_note_stream(
                 note_type=note_type,
                 patient_name=patient_name_v,
                 ssn_last4=ssn_last4_v,
+                patient_facts=_shared_facts,
             )
             t_stage2 = _time.time() - t1
             yield _sse("stage2_complete", {
@@ -1498,6 +1556,22 @@ async def generate_stage2_agent(
         # When implemented, this will contain real-time provider-patient conversation
         ambient_transcript = None
 
+        # Compute the authoritative PatientStatusFacts from the SAME raw clinical
+        # input Stage 1 used (multi-cancer ground truth + optional L1), so the
+        # Assessment/Plan ground on those facts instead of re-deriving a divergent
+        # picture from the rendered Stage 1 note.
+        from app.services.note_processing.note_builder import (
+            build_authoritative_patient_facts,
+        )
+        _src_fmt = await _get_user_source_format(current_user.user_id, db)
+        _final_input = request.clinical_input
+        if request.visit_date:
+            _final_input = f"VISIT DATE: {request.visit_date}\n\n{request.clinical_input}"
+        _shared_facts = await asyncio.to_thread(
+            build_authoritative_patient_facts, _final_input, _src_fmt,
+            stage2_config,  # holistic GU diagnosis pass uses this LLM
+        )
+
         # Build Stage 2 note with task-specific LLM config
         # Pass non_gu_notes for cross-specialty urologic content extraction
         complete_note = build_stage2_note(
@@ -1510,7 +1584,8 @@ async def generate_stage2_agent(
             task_config=stage2_config,
             note_type=request.note_type,
             patient_name=request.patient_name,
-            ssn_last4=request.ssn_last4
+            ssn_last4=request.ssn_last4,
+            patient_facts=_shared_facts,
         )
 
         logger.info("Stage 2 agent-based note generation complete")
@@ -1661,6 +1736,7 @@ def _sse_event(event_type: str, data: dict) -> str:
 async def batch_upload_and_process(
     files: list[UploadFile] = File(..., description="Clinical .txt files to batch process"),
     visit_date: Optional[str] = Form(None, description="Visit date (YYYY-MM-DD) for IPSS and age calculation"),
+    note_type_override: Optional[str] = Form(None, description="Force a note type for ALL files (e.g. 'cystoscopy'); 'auto'/empty = detect from filename"),
     http_request: Request = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
@@ -1758,6 +1834,7 @@ async def batch_upload_and_process(
                 clinical_text=clinical_input,
                 task_config=stage1_config,
                 source_format=_src_fmt,
+                note_type=note_type,
             )
 
         async def stage2_func(preliminary_note, clinical_input, note_type):
@@ -1832,8 +1909,11 @@ async def batch_upload_and_process(
                 end_patient_session()
 
         try:
+            _ov = (note_type_override or "").strip().lower()
             for idx, filename in enumerate(saved_files):
-                note_type = detect_note_type(filename)
+                # Explicit override (from the batch note-type dropdown) wins over
+                # filename-based auto-detection.
+                note_type = _ov if _ov and _ov != "auto" else detect_note_type(filename)
                 output_name = Path(filename).stem + ".vaucda"
                 file_path = Path(batch_temp_dir) / filename
 
@@ -1865,8 +1945,17 @@ async def batch_upload_and_process(
                     except asyncio.TimeoutError:
                         error_msg = f"Timed out after {file_timeout}s"
                         purge_all_patient_data()
+                        # Fail-fast: don't retry a timeout (would burn another full
+                        # window). Mark failed and move to the next note.
+                        break
                     except Exception as e:
                         error_msg = f"Processing error: {type(e).__name__}"
+                        # Log the full traceback (message + stack) so batch
+                        # failures are diagnosable; the UI only sees the type.
+                        logger.exception(
+                            f"[{idx + 1}/{len(saved_files)}] {filename} attempt "
+                            f"{attempt} FAILED: {type(e).__name__}: {e}"
+                        )
                         purge_all_patient_data()
 
                     if attempt < max_retries:
@@ -2012,6 +2101,7 @@ async def batch_process_folder(
                 clinical_text=clinical_input,
                 task_config=stage1_config,
                 source_format=_src_fmt,
+                note_type=note_type,
             )
 
         # Define Stage 2 processing function
@@ -2253,6 +2343,7 @@ async def batch_process_folder_stream(
             clinical_text=clinical_input,
             task_config=stage1_config,
             source_format=_src_fmt,
+            note_type=note_type,
         )
 
     async def stage2_func(
@@ -2419,8 +2510,14 @@ async def batch_process_folder_stream(
                     except asyncio.TimeoutError:
                         result['error_message'] = f"Timed out after {file_timeout}s"
                         purge_func()
+                        # Fail-fast: don't retry a timeout; move to the next note.
+                        break
                     except Exception as e:
                         result['error_message'] = f"Processing error: {type(e).__name__}"
+                        logger.exception(
+                            f"Batch note FAILED (attempt {attempt}): "
+                            f"{type(e).__name__}: {e}"
+                        )
                         purge_func()
 
                     if attempt < max_retries:

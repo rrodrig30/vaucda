@@ -313,6 +313,37 @@ def _is_valid_lab_line(line: str) -> bool:
         if pattern in line_upper:
             return False
 
+    # Filter out IV-infusion / medication-administration and appointment / plan
+    # lines that carry numbers but are NOT labs ("OVER 30 Minutes IVPB Q8H",
+    # "ALM GU PRO ADVANCED, 3 MONTHS to assess PSA response and symptom check").
+    admin_noise_patterns = [
+        'IVPB', 'IV PIGGYBACK', 'IV PUSH', 'INFUSE', 'INFUSION', 'BOLUS',
+        'OVER 30 MINUTES', 'OVER 60 MINUTES', 'OVER 15 MINUTES',
+        'GU PRO ADVANCED', 'ALM GU', 'RTC ', 'RETURN TO CLINIC',
+        'FOLLOW UP', 'FOLLOW-UP', 'TO ASSESS', 'SYMPTOM CHECK',
+        'APPOINTMENT', 'CLINIC VISIT', 'MONTHS TO', 'WEEKS TO',
+    ]
+    for pattern in admin_noise_patterns:
+        if pattern in line_upper:
+            return False
+    # Dosing-frequency tokens mark a medication/administration order, not a lab.
+    if re.search(r'\bQ\d{1,2}H\b|\bQ(?:AM|PM|HS|D|OD)\b|\b(?:BID|TID|QID|QHS|QAM|PRN)\b',
+                 line_upper):
+        return False
+
+    # Multi-column lab-table rows ("PH 5.5 6.0 6.0 5 - 8" from a 3-date
+    # URINALYSIS grid; "PROTEIN Negative Negative Negative") mangle into one
+    # garbled value — skip. The dated single-column labs elsewhere in the chart
+    # capture the same data cleanly. Signature: 3+ repeated result tokens.
+    if len(re.findall(r'(?i)\bNegative\b', line)) >= 3:
+        return False
+    # 3+ CONSECUTIVE whitespace-separated numbers = the same result flattened
+    # across date-columns ("PH  5.5  6.0  6.0  5 - 8"). A real single lab always
+    # has a unit or a dash between the value and its reference range, so its
+    # numbers are never 3-in-a-row separated only by spaces.
+    if re.search(r'\d+\.?\d*(?:\s+\d+\.?\d*){2,}', line):
+        return False
+
     # Filter out ENDOCRINE LABS - these should appear in ENDOCRINE LABS section, not general LABS
     # This prevents duplication with endocrine_extractor.py
     endocrine_markers = [

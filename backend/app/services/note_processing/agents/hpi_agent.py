@@ -282,6 +282,180 @@ def _strip_nonurologic_sentences(hpi: str) -> str:
     return result if result else hpi
 
 
+# --- deterministic HPI readability post-processors (accuracy-preserving) ---
+
+# Redundant dash-appended treatment elaborations the LLM sometimes emits, e.g.
+# "completed radical prostatectomy in 2000 - Radical retropubic prostatectomy
+# performed in 2000". The clause after the dash merely restates a treatment
+# already named in the sentence, so removing it drops no clinical fact.
+#
+# The detail runs only to the next CLAUSE boundary, not the sentence end, so a
+# chained sentence ("... prostatectomy in 2000 - radical retropubic
+# prostatectomy, radiation on Nov 5 2021 - ..., ADT ...") loses only each dash
+# clause and keeps every real treatment. A clause boundary is a comma NOT
+# followed by a 4-digit year (so it doesn't split "November 5, 2021"), or a
+# period / newline / end of string.
+_DASH_TX_RE = re.compile(
+    r"\s+[-‐-―]\s+[^.\n]*?\b(prostatectomy|radiation|radiotherapy|IMRT|EBRT|SBRT|"
+    r"brachytherapy|ADT|androgen|leuprolide|lupron|eligard|degarelix|"
+    r"bicalutamide|orchiectomy|TURBT|resection|cystectomy|nephrectomy|"
+    r"therapy|ablation|surveillance|biops(?:y|ies)|cystoscopy|tumou?r|"
+    r"Gleason)\b[^.\n]*?"
+    r"(?=\s*,(?!\s*\d{4})|[.\n]|$)",
+    re.IGNORECASE,
+)
+
+# Leading verb phrases that mark a history "beat" the LLM renders as its own
+# staccato "He ..." sentence. A run of these is chained into one flowing
+# sentence; a verb repeated consecutively is stated once (e.g. six TURBTs).
+_HE_RUN_RE = re.compile(
+    r"^He\s+(was\s+diagnosed|completed|underwent|is\s+currently\s+undergoing|"
+    r"has\s+been\s+managed\s+with|has\s+been|received|initiated|started|"
+    r"is\s+s/p|is\s+status\s+post)\b",
+    re.IGNORECASE,
+)
+_HE_VERBS = [
+    "is currently undergoing", "was diagnosed with", "has been managed with",
+    "completed", "underwent", "received", "has been", "initiated", "started",
+]
+
+
+def _strip_dash_elaborations(text: str) -> str:
+    return _DASH_TX_RE.sub("", text)
+
+
+def _split_lead_verb(clause: str):
+    for v in _HE_VERBS:
+        m = re.match(rf"({re.escape(v)})\s+(.*)", clause, re.IGNORECASE)
+        if m:
+            return m.group(1), m.group(2)
+    return None, clause
+
+
+def _merge_he_history_run(text: str) -> str:
+    """Chain a run of consecutive "He <verb> ..." history sentences into one.
+
+    Drops only the repeated leading "He" (and a leading verb when it repeats
+    back-to-back) — every date, modality and clinical detail is preserved, so
+    the transform improves flow without altering facts.
+    """
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    out: list = []
+    run: list = []
+
+    def flush():
+        if not run:
+            return
+        if len(run) == 1:
+            out.append(run[0])
+            run.clear()
+            return
+        bodies = [re.sub(r"^He\s+", "", s.rstrip("."), flags=re.IGNORECASE)
+                  for s in run]
+        clauses: list = []
+        prev = None
+        for b in bodies:
+            v, rest = _split_lead_verb(b)
+            clauses.append(rest if (v and prev and v.lower() == prev.lower())
+                           else b)
+            prev = v
+        joined = ((", ".join(clauses[:-1]) + ", and " + clauses[-1])
+                  if len(clauses) > 1 else clauses[0])
+        out.append("He " + joined + ".")
+        run.clear()
+
+    for s in sents:
+        if _HE_RUN_RE.match(s):
+            run.append(s)
+        else:
+            flush()
+            out.append(s)
+    flush()
+    return " ".join(out)
+
+
+# Dated measured weight in CPRS/VistA vitals, e.g.
+#   "WT: 154.5 lb [70.08 kg] (05/27/2026 11:00)"
+#   "Weight: 152.8 lb [69.31 kg] (04/25/2024 13:39)"
+#   "150 lb [68.04 kg] (01/08/2025 09:15)"
+_MEASURED_WT_RE = re.compile(
+    r"(\d{2,3}(?:\.\d+)?)\s*lb\s*\[[^\]]*\]\s*\((\d{1,2})/(\d{1,2})/(\d{4})",
+    re.IGNORECASE)
+# The HPI carries a (patient-reported) weight-loss statement.
+_WT_LOSS_MENTION_RE = re.compile(
+    r"\b(?:unintentional\s+)?weight\s+loss\b|\blost\s+(?:approximately\s+|about\s+)?"
+    r"\d+\s*(?:lb|lbs|pound)", re.IGNORECASE)
+# An objective, dated weight value is ALREADY present in the HPI prose.
+_WT_MEASURED_IN_HPI_RE = re.compile(
+    r"\bmeasured\s+weight\b|\bweigh(?:s|ed|t\s+was)\b[^.]*\d{2,3}(?:\.\d+)?\s*lb",
+    re.IGNORECASE)
+
+
+def anchor_measured_weight(hpi: str, clinical_document: Optional[str]) -> str:
+    """When the HPI reports weight loss but states no objective value, append the
+    most-recent MEASURED weight+date from the chart vitals so the reader can
+    reconcile a patient-reported loss against the measured trend.
+
+    Deterministic and conservative: fires only when (a) the HPI mentions weight
+    loss, (b) it does not already state a measured lb value, and (c) the chart has
+    at least one dated weight. Adds one factual sentence; never removes content.
+    """
+    import os
+    if os.environ.get("VAUCDA_HPI_WEIGHT_ANCHOR", "1") != "1":
+        return hpi
+    if not hpi or not clinical_document:
+        return hpi
+    if not _WT_LOSS_MENTION_RE.search(hpi) or _WT_MEASURED_IN_HPI_RE.search(hpi):
+        return hpi
+    best = None  # (sort_key, value_str, mm, dd, yyyy)
+    for m in _MEASURED_WT_RE.finditer(clinical_document):
+        val, mm, dd, yyyy = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        if not (1 <= mm <= 12 and 1 <= dd <= 31 and 1900 <= yyyy <= 2100):
+            continue
+        key = (yyyy, mm, dd)
+        if best is None or key > best[0]:
+            best = (key, val, mm, dd, yyyy)
+    if best is None:
+        return hpi
+    _, val, mm, dd, yyyy = best
+    sentence = (f"His most recently measured weight was {val} lb "
+                f"({mm:02d}/{dd:02d}/{yyyy}).")
+    body = hpi.rstrip()
+    # Insert before the closing "Today's visit ..." beat if present, else append.
+    m = re.search(r"(Today'?s visit\b)", body, re.IGNORECASE)
+    if m:
+        return body[:m.start()].rstrip() + " " + sentence + " " + body[m.start():]
+    sep = "" if body.endswith((".", "!", "?")) else "."
+    return body + sep + " " + sentence
+
+
+def reflow_hpi(hpi: str) -> str:
+    """Collapse a choppy one-sentence-per-line HPI into flowing prose.
+
+    Readability normalization that preserves every clinical fact (dates,
+    modalities, values): joins one-sentence-per-line beats into a connected
+    paragraph, strips the LLM's redundant dash-appended treatment restatements,
+    chains a run of staccato "He ..." history sentences into one flowing
+    sentence, and keeps the closing "Today's visit ..." line as its own short
+    paragraph.
+    """
+    if not hpi or not hpi.strip():
+        return hpi
+    body = hpi.strip()
+    label = ""
+    m = re.match(r"^(HPI:\s*)", body, re.IGNORECASE)
+    if m:
+        label, body = m.group(1), body[m.end():]
+    body = re.sub(r"\s*\n+\s*", " ", body)      # all internal breaks -> spaces
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    body = _strip_dash_elaborations(body)
+    body = _merge_he_history_run(body)
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    # 2-paragraph shape: put the closing visit-reason sentence on its own line.
+    body = re.sub(r"\s+(Today'?s visit\b)", r"\n\n\1", body, count=1)
+    return label + body
+
+
 def _dedupe_hpi_sentences(hpi: str) -> str:
     """Remove sentence-level redundancy that survives the LLM prompt.
 
@@ -1316,6 +1490,19 @@ def synthesize_hpi(
             "'Phoenix criteria', 'nadir+2', 'salvage', or 'post-treatment'.\n"
             "Rising PSA in such a patient is a workup question for new\n"
             "disease, not recurrence of treated disease.\n"
+            "\n"
+            "MULTI-CANCER: PROSTATE_CANCER_STATUS is organ-specific — ABSENT\n"
+            "does NOT mean the patient is cancer-free. If an\n"
+            "OTHER_UROLOGIC_DIAGNOSES block is present, those renal / bladder /\n"
+            "other non-prostate diagnoses are frequently the PRIMARY reason for\n"
+            "the visit: CENTER the HPI on them (the mass/tumor, its size and\n"
+            "trajectory, imaging, biopsy/pathology status, and management) and\n"
+            "do NOT default to a prostate/PSA narrative. An 'indeterminate'\n"
+            "mass is NEITHER cancer NOR benign — call it a mass/lesion of\n"
+            "uncertain significance; NEVER call an unbiopsied mass 'benign'.\n"
+            "If PATIENT_SEX is female, prostate cancer, PSA screening,\n"
+            "prostatectomy and ADT are anatomically IMPOSSIBLE — never write\n"
+            "any prostate-cancer narrative for her.\n"
         )
 
     # PHASE 2 directive: when a deterministic skeleton was provided, the
@@ -1336,8 +1523,11 @@ def synthesize_hpi(
             "  1. Walk skeleton sections 1-7 IN ORDER. Do not reorder them\n"
             "     and do not skip a section that has content.\n"
             "  2. Every TREATMENT HISTORY bullet must appear in the prose,\n"
-            "     with its date and verb. A RESTARTED event MUST be\n"
-            "     rendered as a restart — never as 'continued' or\n"
+            "     with its date and verb, but COMBINE the bullets into flowing\n"
+            "     compound sentences (chain them with commas/semicolons in\n"
+            "     chronological order) — do NOT write one short sentence per\n"
+            "     bullet and do NOT start each with 'He'. A RESTARTED event\n"
+            "     MUST be rendered as a restart — never as 'continued' or\n"
             "     'completed' or 'finished'. A DECLINED event MUST be\n"
             "     rendered as a decline — never as 'received'.\n"
             "  3. Every entry in CURRENT REGIMEN must be acknowledged in\n"
@@ -1352,14 +1542,42 @@ def synthesize_hpi(
             "     findings, or clinical decisions that are not in the\n"
             "     skeleton. If you would otherwise need to do so, omit\n"
             "     the claim.\n"
-            "  7. Output 1-2 paragraphs of fluent narrative prose. No\n"
-            "     bullets, no meta-commentary. Start directly with the\n"
-            "     INTRO sentence.\n"
+            "  7. Output 1-2 paragraphs of CONTINUOUS, connected narrative\n"
+            "     prose (compound sentences that chain related events). Do\n"
+            "     NOT place each fact on its own line, do NOT begin multiple\n"
+            "     consecutive sentences with 'He', no bullets, no\n"
+            "     meta-commentary. Start directly with the INTRO sentence.\n"
         )
 
     # Use LLM to synthesize comprehensive HPI
     instructions = f"""
 Create a current, comprehensive UROLOGY HPI that synthesizes all available urologic information from the source notes into a cohesive narrative for TODAY'S visit.
+
+HPI STRUCTURE & STYLE (write for a clinician to read quickly — non-negotiable):
+- Write flowing, connected NARRATIVE PROSE — the SAME readable style as a good
+  Assessment paragraph. Do NOT write a staccato list of short sentences that
+  each begin with "He" ("He was diagnosed... He completed... He is
+  currently..."), do NOT put each fact on its own line, and do NOT produce
+  bullets or "X on DATE - X completed". State each fact exactly ONCE.
+- CHAIN the diagnosis and treatment course into ONE OR TWO compound sentences
+  using commas and semicolons, in CHRONOLOGICAL order. Example of the required
+  style: "Mr. Foster is an 82-year-old man with prostate adenocarcinoma
+  diagnosed in 2000 (Gleason 4+3, cT2N0M0/pT3aN0), treated with radical
+  prostatectomy that year, with biochemical recurrence in 2021 managed by
+  external-beam radiation completed in November 2021, and androgen-deprivation
+  therapy plus a second radiation course initiated in July 2024 for metastatic
+  disease." Combine treatments that share a date or episode into a single
+  clause rather than a separate sentence each.
+- OPEN with that diagnosis-and-stage sentence: the cancer, date of diagnosis,
+  grade (Gleason/Grade Group for prostate, Fuhrman for renal, WHO grade for
+  bladder), and BOTH clinical and pathologic stage when available. Do not bury
+  the stage later.
+- For a definitive treatment report its COMPLETION; do NOT also list a separate
+  initiation date for that same course, and never state an initiation AFTER its
+  completion.
+- Then the PSA trajectory (lead with the current value), then today's visit
+  reason and interval status — as continuous prose, not a list. Be concise and
+  precise, with no repetition.
 
 {clinical_context}
 {authoritative_directive}

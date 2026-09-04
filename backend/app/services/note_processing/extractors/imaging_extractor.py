@@ -117,6 +117,42 @@ def _strip_dexa_boilerplate(report: str) -> str:
     return f'{head.rstrip()}{sep}{body}' if sep else head.rstrip()
 
 
+# Non-clinical boilerplate VA radiology reports append to impressions:
+# attending/resident attestations, CT dose-metric footers, and journal
+# citation footnotes. Stripped from EVERY report so the IMAGING section carries
+# the clinical impression only.
+_REPORT_BOILERPLATE = [
+    re.compile(r"\s*I,?\s+the\s+attending\s+(?:physician|radiologist)?,?\s*"
+               r"have\s+personally\s+reviewed[^\n]*", re.I),
+    re.compile(r"\s*(?:I|We)\s+have\s+personally\s+reviewed\s+(?:the\s+)?image[^\n]*", re.I),
+    re.compile(r"\s*(?:This\s+study\s+was|Images?\s+were)\s+(?:personally\s+)?"
+               r"reviewed\s+by\s+the\s+attending[^\n]*", re.I),
+    re.compile(r"\s*Approval\s+of\s+this\s+report\s+by\s+the\s+teaching\s+physician[^\n]*", re.I),
+    re.compile(r"\s*Up-to-date\s+CT\s+equipment[^\n]*", re.I),
+    re.compile(r"\s*CTDIvol:[^\n]*", re.I),
+    re.compile(r"\s*DLP:\s*[\d.]+\s*mGy[- ]?cm\.?", re.I),
+    re.compile(r"\s*This\s+(?:CT\s+)?exam\s+was\s+performed\s+using[^\n]*", re.I),
+    re.compile(r"\s*(?:Radiation\s+)?dose\s+reduction\s+techniques[^\n]*", re.I),
+    # journal citation footnote: "* Silverman, S. et al. ... Radiology 2019; 292:475-488."
+    re.compile(r"\s*\*?\s*[A-Z][A-Za-z]+,\s+[A-Z]\.[^\n]*?"
+               r"(?:Radiology|Radiographics|J\s*Urol|AJR|Eur\s*Urol|Urology)\s+\d{4}[^\n]*",
+               re.I),
+]
+
+
+def _strip_report_boilerplate(report: str) -> str:
+    """Remove non-clinical attestation / dose-metric / citation boilerplate from
+    a single imaging report, keeping the clinical impression."""
+    if not report:
+        return report
+    for pat in _REPORT_BOILERPLATE:
+        report = pat.sub("", report)
+    report = re.sub(r"[ \t]{2,}", " ", report)
+    report = re.sub(r"[ \t]+\n", "\n", report)
+    report = re.sub(r"\s+([.,;])", r"\1", report)
+    return report.rstrip()
+
+
 def extract_imaging(clinical_document: str) -> str:
     """
     Extract imaging reports from clinical documents.
@@ -243,7 +279,8 @@ def extract_imaging(clinical_document: str) -> str:
     # VA DXA impressions always tail with the same FRAX/WHO/NOF
     # paragraphs and a generic RECOMMENDATIONS list — text that clutters
     # the rendered note without changing clinical decision making.
-    unique_reports = [_strip_dexa_boilerplate(r) for r in unique_reports]
+    unique_reports = [_strip_report_boilerplate(_strip_dexa_boilerplate(r))
+                      for r in unique_reports]
 
     # Sort reverse chronologically — most recent study at the top of the
     # IMAGING section. Reports with an unparseable / missing date sort

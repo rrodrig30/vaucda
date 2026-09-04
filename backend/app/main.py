@@ -35,6 +35,14 @@ from database.neo4j_client import Neo4jClient, Neo4jConfig
 import redis
 
 
+# HIPAA: install the PHI-safe logging boundary BEFORE basicConfig so the
+# logging StreamHandler binds the redaction-wrapped stderr. This scrubs
+# structured identifiers (SSN/MRN/phone/DOB/email) from everything written to
+# the console — which start.sh persists to logs/backend.log — as a backstop to
+# the source discipline of never emitting patient content to logs.
+from app.core.phi_redaction import install_phi_safe_logging
+install_phi_safe_logging()
+
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL),

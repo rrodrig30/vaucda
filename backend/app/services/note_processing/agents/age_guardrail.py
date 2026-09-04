@@ -30,8 +30,20 @@ from typing import Optional
 # Comorbidity markers that, when present, substantially reduce life
 # expectancy regardless of age. Each entry is (regex, label).
 _LIFE_LIMITING_FLAGS = (
-    (re.compile(r"\bmetastatic\b(?!\s+prostate)", re.IGNORECASE),
-     "metastatic non-prostate malignancy"),
+    # Only a NAMED non-prostate metastatic cancer counts. A bare
+    # "metastatic" matched metastatic PROSTATE cancer phrased with
+    # intervening words ("metastatic castration-resistant prostate cancer")
+    # or a prostate met SITE ("metastatic ... neoplasm to liver"),
+    # falsely flagging a second malignancy and seeding hallucinated
+    # "very limited life expectancy due to metastatic non-prostate cancer".
+    (re.compile(
+        r"\bmetastatic\s+(?:lung|pancrea\w+|colorectal|colon|gastric|"
+        r"hepatocellular|esophageal|renal\s+cell|urothelial|bladder|"
+        r"breast|melanoma|lymphoma|leukemia|small[-\s]cell|"
+        r"non[-\s]small[-\s]cell|cholangio\w+|ovarian|"
+        r"head\s+and\s+neck)\b",
+        re.IGNORECASE,
+    ), "metastatic non-prostate malignancy"),
     (re.compile(
         r"\b(?:stage\s+iv|advanced)\s+(?:lung|pancreatic|liver|"
         r"gastric|hepatocellular|colorectal|esophageal)\s+(?:cancer|"
@@ -239,6 +251,44 @@ def build_age_guardrail_block(stage1_note: str) -> str:
             "screening question)."
         )
 
+    # Patients with KNOWN prostate cancer are NOT in the screening
+    # population. PSA here is a disease-monitoring marker, not a screening
+    # test — telling the LLM to "stop PSA surveillance" for an mCRPC patient
+    # (HOLES) is clinically wrong and drove context-blind Plan recs. These
+    # variants apply the life-expectancy lens to INTENSITY of intervention
+    # without discontinuing appropriate disease monitoring.
+    rules_by_bucket_known_pc = {
+        "VERY_LIMITED": [
+            "RULES FOR THIS PATIENT (known prostate cancer; life "
+            "expectancy estimated <5 yr):",
+            "- PSA here is a DISEASE-MONITORING marker for the established "
+            "  cancer, NOT a screening test. Do NOT recommend stopping PSA "
+            "  monitoring and do NOT cite screening-cessation guidelines.",
+            "- DO continue appropriate disease monitoring (PSA, symptom "
+            "  assessment) at a cadence matched to the treatment plan.",
+            "- Calibrate INTENSITY of intervention to life expectancy: "
+            "  favor symptom control, quality of life, and goals-of-care "
+            "  discussion over aggressive diagnostics/treatment unlikely "
+            "  to benefit within the remaining life expectancy.",
+            "- Do NOT order NEW detection workup unrelated to the known "
+            "  cancer (e.g., screening for a different organ).",
+            "- Do NOT invent a life-expectancy figure or a non-prostate "
+            "  terminal diagnosis that is not documented in the source.",
+        ],
+        "LIMITED": [
+            "RULES FOR THIS PATIENT (known prostate cancer; life "
+            "expectancy ~5-10 yr):",
+            "- PSA is disease monitoring for the established cancer, not "
+            "  screening — continue it; do NOT apply screening-cessation "
+            "  language.",
+            "- Weigh the intensity of further treatment/diagnostics against "
+            "  life expectancy and competing comorbidity, but keep "
+            "  appropriate monitoring of the known cancer in place.",
+            "- Name an explicit rationale for the surveillance interval "
+            "  (functional status, treatment phase, patient preference).",
+        ],
+    }
+
     rules_by_bucket = {
         "VERY_LIMITED": [
             "AUA Early Detection of Prostate Cancer (2023) language:",
@@ -298,6 +348,12 @@ def build_age_guardrail_block(stage1_note: str) -> str:
         ],
     }
 
-    body = rules_by_bucket.get(bucket, rules_by_bucket["STANDARD"])
+    # Known-PC patients get the disease-monitoring variant (no screening-
+    # cessation) for the life-expectancy-sensitive buckets; STANDARD is the
+    # same either way.
+    if has_pc and bucket in rules_by_bucket_known_pc:
+        body = rules_by_bucket_known_pc[bucket]
+    else:
+        body = rules_by_bucket.get(bucket, rules_by_bucket["STANDARD"])
 
     return "\n".join(header + [""] + body) + "\n=== END AGE / LIFE-EXPECTANCY GUARDRAIL ===\n"
