@@ -816,8 +816,15 @@ def _summarize_procedure_finding(
             r"\bwith\s+(?:bilateral\s+|right\s+|left\s+)?retrograde|"
             r"\bwith\s+(?:laser\s+)?lithotripsy|"
             r"\bwith\s+stent\s+placement|"
-            # Paragraph break / new labeled section
-            r"\n\s*\n|"
+            # A LARGE paragraph break (two or more consecutive blank lines).
+            # A single blank line is NOT a terminator: structured cysto reports
+            # routinely separate their labeled fields ("Anterior Urethra:",
+            # "Bulbous: pinpoint stricture", ...) with one blank line, and
+            # cutting at the first blank line discards every finding and leaves
+            # only the CPT code (STARKS: "Cystoscopy (52000):" -> "(52000)").
+            # Leakage into co-occurring procedures is still caught by the
+            # explicit section markers below.
+            r"\n[ \t]*\n[ \t]*\n|"
             r"\n\s*(?:Bilateral\s+retrograde|retrograde\s+pyelogram|"
             r"Indications?\s+for\s+Operation|Complications|"
             r"Description\s+of\s+(?:Operation|Procedure)|"
@@ -860,11 +867,25 @@ def _summarize_procedure_finding(
             "Prostatic Urethra",
             "Stricture",
             "Hutchison Diverticulum",
+            # Urethral sub-segments — some cysto templates report the urethra as
+            # a header ("Anterior Urethra:") followed by per-segment findings.
+            # These carry stricture findings that were otherwise lost.
+            "Meatus",
+            "Fossa navicularis",
+            "Pendulous",
+            "Bulbous",
+            "Bulbar",
+            "Membranous urethra",
+            "Bladder Scan",
         )
         structured_bits: List[str] = []
         for label in structured_fields:
             mm = re.search(
-                rf"^\s*{re.escape(label)}\s*:\s*([^\n]{{2,120}})$",
+                # Value must be on the SAME line as the label ([ \t]* after the
+                # colon, not \s* — the latter lets a header with an empty value
+                # ("Anterior Urethra:\n\nMeatus: ...") swallow the next field's
+                # line as its own value).
+                rf"^\s*{re.escape(label)}\s*:[ \t]*([^\n]{{2,120}})$",
                 tail_clean if "\n" in tail_clean else tail,  # keep newlines for line-anchored match
                 re.IGNORECASE | re.MULTILINE,
             )
