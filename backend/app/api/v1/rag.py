@@ -748,6 +748,7 @@ _GRAPHRAG_BUILD: Dict[str, Any] = {
     "result": None,            # run_full_pipeline stage summary
     "error": None,
     "models": None,
+    "baseline": None,          # coverage snapshot at build start (for progress %)
 }
 _GRAPHRAG_BUILD_LOCK = asyncio.Lock()
 _GRAPHRAG_TASK: Optional[asyncio.Task] = None  # keep a ref so it isn't GC'd
@@ -795,6 +796,10 @@ async def _run_graphrag_build(neo4j_client) -> None:
     from rag.graphrag_pipeline import GraphRAGPipeline
 
     gr = settings.graphrag_model_config()
+    # Snapshot coverage BEFORE the build so the UI can show a real progress bar
+    # ("X of Y new chunks processed") rather than a global coverage % that barely
+    # moves. Progress = baseline.chunks_pending - current.chunks_pending.
+    baseline = await _graphrag_coverage(neo4j_client)
     _GRAPHRAG_BUILD.update({
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -803,9 +808,10 @@ async def _run_graphrag_build(neo4j_client) -> None:
         "result": None,
         "error": None,
         "models": gr,
+        "baseline": baseline,
     })
     t0 = time.time()
-    logger.info(f"GraphRAG rebuild starting with models={gr}")
+    logger.info(f"GraphRAG rebuild starting with models={gr}, baseline={baseline}")
     try:
         pipeline = GraphRAGPipeline(
             neo4j_client=neo4j_client,
@@ -885,4 +891,31 @@ async def graphrag_status(
     coverage = await _graphrag_coverage(neo4j_client)
     state = {k: v for k, v in _GRAPHRAG_BUILD.items()}
     state["coverage"] = coverage
+
+    # Live elapsed while running (finished builds keep their final elapsed).
+    if state.get("status") == "running" and state.get("started_at"):
+        try:
+            from datetime import datetime, timezone
+            started = datetime.fromisoformat(state["started_at"])
+            state["elapsed_seconds"] = round(
+                (datetime.now(timezone.utc) - started).total_seconds(), 1
+            )
+        except Exception:
+            pass
+
+    # Derive processed/target from the baseline so the client has a ready-made
+    # progress figure (entity-extraction phase). Once processed == target, the
+    # remaining time is community detection + summarization.
+    base = state.get("baseline") or {}
+    base_pending = base.get("chunks_pending")
+    cur_pending = coverage.get("chunks_pending")
+    if isinstance(base_pending, int) and isinstance(cur_pending, int) and base_pending > 0:
+        processed = max(0, base_pending - cur_pending)
+        state["progress"] = {
+            "target_chunks": base_pending,
+            "processed_chunks": processed,
+            "percent": round(100.0 * processed / base_pending, 1),
+        }
+    else:
+        state["progress"] = None
     return state

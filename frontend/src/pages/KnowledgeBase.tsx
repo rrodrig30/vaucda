@@ -51,6 +51,7 @@ export const KnowledgeBase: React.FC = () => {
   const [graphStatus, setGraphStatus] = useState<any>(null)
   const [isRebuilding, setIsRebuilding] = useState(false)
   const graphPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [, setTick] = useState(0)  // 1s re-render so the elapsed clock ticks
 
   const fetchGraphStatus = async () => {
     try {
@@ -70,6 +71,35 @@ export const KnowledgeBase: React.FC = () => {
       if (graphPollRef.current) clearInterval(graphPollRef.current)
     }
   }, [])
+
+  // While a build is running, tick every second so the elapsed clock advances
+  // between the 5s status polls.
+  React.useEffect(() => {
+    if (graphStatus?.status !== 'running') return
+    const id = setInterval(() => setTick((t) => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [graphStatus?.status])
+
+  // If a build is already running when the page loads (e.g. after a reload),
+  // resume polling automatically.
+  React.useEffect(() => {
+    if (graphStatus?.status === 'running' && !graphPollRef.current) {
+      startGraphPolling()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graphStatus?.status])
+
+  const formatElapsed = (): string => {
+    let secs = 0
+    if (graphStatus?.started_at) {
+      secs = Math.max(0, Math.floor((Date.now() - Date.parse(graphStatus.started_at)) / 1000))
+    } else if (typeof graphStatus?.elapsed_seconds === 'number') {
+      secs = Math.floor(graphStatus.elapsed_seconds)
+    }
+    const m = Math.floor(secs / 60)
+    const s = secs % 60
+    return `${m}m ${String(s).padStart(2, '0')}s`
+  }
 
   const startGraphPolling = () => {
     if (graphPollRef.current) clearInterval(graphPollRef.current)
@@ -442,8 +472,37 @@ export const KnowledgeBase: React.FC = () => {
           </div>
 
           {graphStatus?.status === 'running' && (
-            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg text-sm text-blue-800 dark:text-blue-300">
-              Build in progress (entity extraction → community detection → summarization). This can take a while for large uploads; coverage updates every few seconds.
+            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg text-sm text-blue-800 dark:text-blue-300 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-medium">GraphRAG rebuild in progress</span>
+                <span className="font-mono">⏱ {formatElapsed()}</span>
+              </div>
+
+              {graphStatus?.progress ? (
+                <>
+                  {graphStatus.progress.percent < 100 ? (
+                    <div className="text-xs">
+                      Phase 1 — entity extraction: <span className="font-semibold">
+                        {graphStatus.progress.processed_chunks.toLocaleString()} of {graphStatus.progress.target_chunks.toLocaleString()}
+                      </span> new chunks processed ({graphStatus.progress.percent}%)
+                    </div>
+                  ) : (
+                    <div className="text-xs">
+                      Entity extraction complete — detecting communities &amp; regenerating summaries…
+                    </div>
+                  )}
+                  <div className="w-full h-2 bg-blue-100 dark:bg-blue-800/40 rounded-full overflow-hidden">
+                    <div
+                      className="h-2 bg-blue-500 dark:bg-blue-400 rounded-full transition-all duration-500"
+                      style={{ width: `${Math.min(100, graphStatus.progress.percent)}%` }}
+                    />
+                  </div>
+                </>
+              ) : (
+                <div className="text-xs">
+                  Extracting entities → detecting communities → summarizing. Coverage updates every few seconds.
+                </div>
+              )}
             </div>
           )}
           {graphStatus?.status === 'success' && (
