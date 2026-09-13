@@ -864,11 +864,31 @@ async def _run_graphrag_build(neo4j_client, llm_model_override: Optional[str] = 
             compute_embeddings=True,
             progress_callback=_on_progress,
         )
-        _GRAPHRAG_BUILD.update({
-            "status": "success",
-            "result": results.get("stages", results),
-        })
-        logger.info("GraphRAG rebuild completed successfully")
+        # Silent-failure guard: if chunks were pending but extraction produced
+        # zero entities, the GraphRAG model almost certainly failed on every call
+        # (typically an Ollama Cloud usage-limit / HTTP 429, or an unreachable
+        # model) and the per-chunk safety net swallowed it. Report an error
+        # instead of a misleading "success" with unchanged coverage.
+        ee = (results.get("stages") or {}).get("entity_extraction") or {}
+        if ee.get("total_chunks", 0) > 0 and ee.get("extracted_entities", 0) == 0:
+            _GRAPHRAG_BUILD.update({
+                "status": "error",
+                "error": (
+                    f"Entity extraction produced 0 entities from {ee.get('total_chunks')} "
+                    f"pending chunks — the GraphRAG model '{gr['llm_model']}' failed on every "
+                    f"call (commonly an Ollama Cloud usage limit / HTTP 429, or an unreachable "
+                    f"model). Add credits, or select a local GraphRAG model in Settings, then "
+                    f"rebuild."
+                ),
+                "result": results.get("stages", results),
+            })
+            logger.error("GraphRAG rebuild produced 0 entities — flagging as error (likely LLM 429/quota)")
+        else:
+            _GRAPHRAG_BUILD.update({
+                "status": "success",
+                "result": results.get("stages", results),
+            })
+            logger.info("GraphRAG rebuild completed successfully")
     except Exception as e:
         logger.error(f"GraphRAG rebuild failed: {e}", exc_info=True)
         _GRAPHRAG_BUILD.update({"status": "error", "error": str(e)})
