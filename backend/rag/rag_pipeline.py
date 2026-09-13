@@ -262,24 +262,16 @@ class RAGPipeline:
         try:
             import os
 
-            # Resolve config from app settings (which loads .env).
-            # GRAPHRAG_LLM_MODEL is the dedicated knob for map-reduce
-            # speed; defaults to a fast cloud model. The previous
-            # default (llama3.1:8b) caused 30s+ per LLM call which made
-            # the 10-call map-reduce multi-minute per query.
+            # Resolve config from app settings (which load .env) via the single
+            # source of truth. GRAPHRAG_LLM_MODEL is the dedicated knob for
+            # map-reduce speed/quality; the build path uses the SAME resolver so
+            # retrieval and build never diverge (rules.txt: config via .env only).
             try:
                 from app.config import settings as _app_settings
-                ollama_url = (
-                    _app_settings.OLLAMA_BASE_URL
-                    or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-                )
-                llm_model = getattr(
-                    _app_settings, "GRAPHRAG_LLM_MODEL", None
-                ) or os.getenv("GRAPHRAG_LLM_MODEL", "gpt-oss:120b-cloud")
-                embedding_model = (
-                    _app_settings.OLLAMA_EMBEDDING_MODEL
-                    or os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-                )
+                gr = _app_settings.graphrag_model_config()
+                ollama_url = gr["ollama_base_url"]
+                llm_model = gr["llm_model"]
+                embedding_model = gr["embedding_model"]
             except Exception:
                 # Fallback to env if settings import is somehow broken
                 ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")

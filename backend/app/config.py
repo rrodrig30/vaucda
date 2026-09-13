@@ -193,6 +193,24 @@ class Settings(BaseSettings):
     def OCR_MODEL(self) -> str:
         return self.OCR_LLM_MODEL
 
+    def graphrag_model_config(self) -> dict:
+        """Single source of truth for the GraphRAG build/retrieval model
+        configuration. Resolves from settings (which load .env), never from a
+        hardcoded model literal at the call site — so the build path uses the
+        same configured model as the runtime retrieval path (rules.txt: no
+        hardcoded elements, all configuration via .env).
+
+        Returns keys: ``ollama_base_url``, ``llm_model``, ``embedding_model``.
+        """
+        return {
+            "ollama_base_url": self.OLLAMA_BASE_URL or "http://localhost:11434",
+            # Dedicated GraphRAG knob (GRAPHRAG_LLM_MODEL); NOT OLLAMA_DEFAULT_MODEL
+            # (llama3.1:8b), which is the weak local default the build path used
+            # to hardcode.
+            "llm_model": self.GRAPHRAG_LLM_MODEL,
+            "embedding_model": self.OLLAMA_EMBEDDING_MODEL,
+        }
+
     # LLM Concurrency & Retry
     OLLAMA_LOCAL_CONCURRENCY: int = 4  # Max concurrent requests to local Ollama models (prevents GPU contention)
     LLM_MAX_RETRIES: int = 5  # Max retries on 429 Too Many Requests

@@ -168,8 +168,8 @@ Return ONLY the merged description text, nothing else."""
 
     def __init__(
         self,
-        ollama_base_url: str = "http://localhost:11434",
-        model: str = "llama3.1:8b",
+        ollama_base_url: Optional[str] = None,
+        model: Optional[str] = None,
         entity_types: Optional[List[str]] = None,
         relationship_types: Optional[List[str]] = None,
         max_concurrent: int = 5,
@@ -179,13 +179,24 @@ Return ONLY the merged description text, nothing else."""
         Initialize the entity extractor.
 
         Args:
-            ollama_base_url: Ollama API base URL
-            model: LLM model to use
+            ollama_base_url: Ollama API base URL. None -> resolve from settings.
+            model: LLM model to use. None -> resolve from settings
+                (GRAPHRAG_LLM_MODEL); never a hardcoded weak-model literal
+                (rules.txt: config via .env only).
             entity_types: List of entity types to extract
             relationship_types: List of relationship types to extract
             max_concurrent: Max concurrent extraction requests
             timeout: Request timeout in seconds
         """
+        if ollama_base_url is None or model is None:
+            try:
+                from app.config import settings as _app_settings
+                gr = _app_settings.graphrag_model_config()
+            except Exception:
+                gr = {"ollama_base_url": "http://localhost:11434",
+                      "llm_model": "gpt-oss:120b-cloud"}
+            ollama_base_url = ollama_base_url or gr["ollama_base_url"]
+            model = model or gr["llm_model"]
         self.ollama_url = ollama_base_url
         self.model = model
         self.entity_types = entity_types or CLINICAL_ENTITY_TYPES

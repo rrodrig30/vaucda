@@ -215,9 +215,9 @@ ANSWER:"""
     def __init__(
         self,
         neo4j_client,
-        ollama_base_url: str = "http://localhost:11434",
-        llm_model: str = "llama3.1:8b",
-        embedding_model: str = "nomic-embed-text",
+        ollama_base_url: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        embedding_model: Optional[str] = None,
         max_concurrent: int = 5,
         llm_timeout: int = 180
     ):
@@ -226,12 +226,30 @@ ANSWER:"""
 
         Args:
             neo4j_client: Neo4j client for database operations
-            ollama_base_url: Ollama API base URL
-            llm_model: LLM model for text generation
-            embedding_model: Model for embeddings
+            ollama_base_url: Ollama API base URL. None -> resolve from settings.
+            llm_model: LLM model for text generation. None -> resolve from
+                settings (GRAPHRAG_LLM_MODEL). Never falls back to a hardcoded
+                weak model literal (rules.txt: config via .env only).
+            embedding_model: Model for embeddings. None -> resolve from settings.
             max_concurrent: Max concurrent LLM requests
             llm_timeout: LLM request timeout
         """
+        # Resolve any unspecified model config from settings (.env-backed) so a
+        # caller that omits them never silently gets the old llama3.1:8b default.
+        if ollama_base_url is None or llm_model is None or embedding_model is None:
+            try:
+                from app.config import settings as _app_settings
+                gr = _app_settings.graphrag_model_config()
+            except Exception:
+                gr = {
+                    "ollama_base_url": "http://localhost:11434",
+                    "llm_model": "gpt-oss:120b-cloud",
+                    "embedding_model": "nomic-embed-text",
+                }
+            ollama_base_url = ollama_base_url or gr["ollama_base_url"]
+            llm_model = llm_model or gr["llm_model"]
+            embedding_model = embedding_model or gr["embedding_model"]
+
         self.neo4j = neo4j_client
         self.ollama_url = ollama_base_url
         self.llm_model = llm_model
