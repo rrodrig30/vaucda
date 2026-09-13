@@ -18,7 +18,7 @@ import uuid
 import logging
 import asyncio
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -380,12 +380,20 @@ ANSWER:"""
     async def extract_entities_from_database(
         self,
         batch_size: int = 100,
-        max_chunks: Optional[int] = None
+        max_chunks: Optional[int] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         """
         Extract entities from all chunks in the database.
 
         This is Phase 1 of the GraphRAG pipeline.
+
+        Args:
+            progress_callback: optional ``fn(phase, done, total)`` invoked as each
+                chunk's extraction completes. Entities are written to Neo4j in a
+                single batch at the END of this phase, so chunk-level coverage
+                can't be derived from the DB mid-phase — this callback is the only
+                live signal of entity-extraction progress.
         """
         from .entity_extractor import EntityExtractor, store_entities_in_neo4j
 
@@ -414,9 +422,17 @@ ANSWER:"""
         )
 
         # Extract entities
+        def _on_chunk(done: int, total: int) -> None:
+            logger.info(f"Progress: {done}/{total}")
+            if progress_callback:
+                try:
+                    progress_callback("entity_extraction", done, total)
+                except Exception:
+                    pass
+
         result = await extractor.extract_from_chunks(
             [{"id": c["id"], "content": c["content"]} for c in chunks],
-            progress_callback=lambda done, total: logger.info(f"Progress: {done}/{total}")
+            progress_callback=_on_chunk
         )
 
         # Store in Neo4j
@@ -1299,7 +1315,8 @@ ANSWER:"""
         detect_communities: bool = True,
         generate_summaries: bool = True,
         compute_embeddings: bool = True,
-        max_chunks_for_extraction: Optional[int] = None
+        max_chunks_for_extraction: Optional[int] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         """
         Run the complete GraphRAG pipeline.
@@ -1310,10 +1327,20 @@ ANSWER:"""
             generate_summaries: Whether to generate community summaries
             compute_embeddings: Whether to compute community embeddings
             max_chunks_for_extraction: Limit chunks for entity extraction
+            progress_callback: optional ``fn(phase, done, total)`` for live
+                progress reporting. Called per-chunk during entity extraction
+                and once at the start of each subsequent phase
+                (``community_detection`` / ``summarization`` / ``embeddings``).
 
         Returns:
             Pipeline execution results
         """
+        def _phase(name: str) -> None:
+            if progress_callback:
+                try:
+                    progress_callback(name, 0, 0)
+                except Exception:
+                    pass
         results = {
             'started_at': datetime.utcnow().isoformat(),
             'stages': {}
@@ -1327,7 +1354,8 @@ ANSWER:"""
             logger.info("PHASE 1: Entity Extraction")
             logger.info("=" * 50)
             extraction_result = await self.extract_entities_from_database(
-                max_chunks=max_chunks_for_extraction
+                max_chunks=max_chunks_for_extraction,
+                progress_callback=progress_callback,
             )
             results['stages']['entity_extraction'] = extraction_result
 
@@ -1336,6 +1364,7 @@ ANSWER:"""
             logger.info("=" * 50)
             logger.info("PHASE 2: Community Detection")
             logger.info("=" * 50)
+            _phase("community_detection")
             communities = await self.detect_communities()
             stored = await self.store_communities(communities)
             results['stages']['community_detection'] = {
@@ -1348,6 +1377,7 @@ ANSWER:"""
             logger.info("=" * 50)
             logger.info("PHASE 3: Hierarchical Summarization")
             logger.info("=" * 50)
+            _phase("summarization")
             summarized = await self.generate_community_summaries()
             results['stages']['summarization'] = {
                 'summaries_generated': summarized
@@ -1358,6 +1388,7 @@ ANSWER:"""
             logger.info("=" * 50)
             logger.info("PHASE 4: Community Embeddings")
             logger.info("=" * 50)
+            _phase("embeddings")
             embedded = await self.compute_community_embeddings()
             results['stages']['embeddings'] = {
                 'embeddings_computed': embedded

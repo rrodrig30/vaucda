@@ -749,6 +749,7 @@ _GRAPHRAG_BUILD: Dict[str, Any] = {
     "error": None,
     "models": None,
     "baseline": None,          # coverage snapshot at build start (for progress %)
+    "progress": None,          # live phase progress set by the pipeline callback
 }
 _GRAPHRAG_BUILD_LOCK = asyncio.Lock()
 _GRAPHRAG_TASK: Optional[asyncio.Task] = None  # keep a ref so it isn't GC'd
@@ -809,9 +810,40 @@ async def _run_graphrag_build(neo4j_client) -> None:
         "error": None,
         "models": gr,
         "baseline": baseline,
+        "progress": None,
     })
     t0 = time.time()
     logger.info(f"GraphRAG rebuild starting with models={gr}, baseline={baseline}")
+
+    # Live progress from the pipeline. Entity extraction writes to Neo4j in a
+    # single batch at the end of phase 1, so DB coverage can't show phase-1
+    # progress — this callback is the only per-chunk signal.
+    _PHASE_LABEL = {
+        "entity_extraction": "Extracting entities",
+        "community_detection": "Detecting communities",
+        "summarization": "Regenerating summaries",
+        "embeddings": "Computing community embeddings",
+    }
+
+    def _on_progress(phase: str, done: int, total: int) -> None:
+        if phase == "entity_extraction" and total:
+            _GRAPHRAG_BUILD["progress"] = {
+                "phase": phase,
+                "label": _PHASE_LABEL.get(phase, phase),
+                "target_chunks": total,
+                "processed_chunks": done,
+                "percent": round(100.0 * done / total, 1),
+            }
+        else:
+            # Phases 2-4 are global operations with no per-item count.
+            _GRAPHRAG_BUILD["progress"] = {
+                "phase": phase,
+                "label": _PHASE_LABEL.get(phase, phase),
+                "target_chunks": 0,
+                "processed_chunks": 0,
+                "percent": 100.0,
+            }
+
     try:
         pipeline = GraphRAGPipeline(
             neo4j_client=neo4j_client,
@@ -827,6 +859,7 @@ async def _run_graphrag_build(neo4j_client) -> None:
             detect_communities=True,
             generate_summaries=True,
             compute_embeddings=True,
+            progress_callback=_on_progress,
         )
         _GRAPHRAG_BUILD.update({
             "status": "success",
@@ -903,19 +936,20 @@ async def graphrag_status(
         except Exception:
             pass
 
-    # Derive processed/target from the baseline so the client has a ready-made
-    # progress figure (entity-extraction phase). Once processed == target, the
-    # remaining time is community detection + summarization.
-    base = state.get("baseline") or {}
-    base_pending = base.get("chunks_pending")
-    cur_pending = coverage.get("chunks_pending")
-    if isinstance(base_pending, int) and isinstance(cur_pending, int) and base_pending > 0:
-        processed = max(0, base_pending - cur_pending)
-        state["progress"] = {
-            "target_chunks": base_pending,
-            "processed_chunks": processed,
-            "percent": round(100.0 * processed / base_pending, 1),
-        }
-    else:
-        state["progress"] = None
+    # Progress: prefer the live pipeline callback (the only signal during
+    # entity extraction, which batches its Neo4j write at end-of-phase). Fall
+    # back to a coverage-derived figure only if the callback hasn't set one yet.
+    if state.get("status") == "running" and not state.get("progress"):
+        base = state.get("baseline") or {}
+        base_pending = base.get("chunks_pending")
+        cur_pending = coverage.get("chunks_pending")
+        if isinstance(base_pending, int) and isinstance(cur_pending, int) and base_pending > 0:
+            processed = max(0, base_pending - cur_pending)
+            state["progress"] = {
+                "phase": "entity_extraction",
+                "label": "Extracting entities",
+                "target_chunks": base_pending,
+                "processed_chunks": processed,
+                "percent": round(100.0 * processed / base_pending, 1),
+            }
     return state

@@ -480,18 +480,18 @@ export const KnowledgeBase: React.FC = () => {
 
               {graphStatus?.progress ? (
                 <>
-                  {graphStatus.progress.percent < 100 ? (
+                  {graphStatus.progress.phase === 'entity_extraction' && graphStatus.progress.percent < 100 ? (
                     <div className="text-xs">
-                      Phase 1 — entity extraction: <span className="font-semibold">
+                      Extracting entities: <span className="font-semibold">
                         {graphStatus.progress.processed_chunks.toLocaleString()} of {graphStatus.progress.target_chunks.toLocaleString()}
-                      </span> new chunks processed ({graphStatus.progress.percent}%)
+                      </span> new chunks ({graphStatus.progress.percent}%)
                     </div>
                   ) : (
                     <div className="text-xs">
-                      Entity extraction complete — detecting communities &amp; regenerating summaries…
+                      Entity extraction complete — {(graphStatus.progress.label || 'detecting communities & regenerating summaries').toLowerCase()}…
                     </div>
                   )}
-                  <div className="w-full h-2 bg-blue-100 dark:bg-blue-800/40 rounded-full overflow-hidden">
+                  <div className={`w-full h-2 bg-blue-100 dark:bg-blue-800/40 rounded-full overflow-hidden ${graphStatus.progress.phase !== 'entity_extraction' ? 'animate-pulse' : ''}`}>
                     <div
                       className="h-2 bg-blue-500 dark:bg-blue-400 rounded-full transition-all duration-500"
                       style={{ width: `${Math.min(100, graphStatus.progress.percent)}%` }}
