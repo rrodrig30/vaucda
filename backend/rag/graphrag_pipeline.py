@@ -397,10 +397,14 @@ ANSWER:"""
         """
         from .entity_extractor import EntityExtractor, store_entities_in_neo4j
 
-        # Get chunks from database
+        # Get chunks from database. Self-heal: any chunk that lacks a stable
+        # `id` (older ingestions created chunks without one) gets a persistent
+        # UUID now, so entity extraction can link entities back by provenance
+        # (Chunk-[:HAS_ENTITY]->Entity) instead of content-substring matching.
         query = """
         MATCH (c:Chunk)
         WHERE NOT EXISTS((c)-[:HAS_ENTITY]->(:Entity))
+        SET c.id = coalesce(c.id, randomUUID())
         RETURN c.id AS id, c.content AS content
         """
         if max_chunks:

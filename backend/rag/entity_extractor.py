@@ -115,6 +115,10 @@ class GraphExtractionResult:
     relationship_count: int
     chunk_count: int
     total_time_seconds: float
+    # Per-chunk provenance preserved BEFORE the by-name merge collapses it:
+    # (chunk_id, entity_name) pairs used to create Chunk-[:HAS_ENTITY]->Entity
+    # links by provenance rather than fragile content-substring matching.
+    mentions: List[Tuple[str, str]] = field(default_factory=list)
 
 
 class EntityExtractor:
@@ -564,17 +568,31 @@ Return ONLY the merged description text, nothing else."""
             if progress_callback:
                 progress_callback(completed, total)
 
+        # Capture (chunk_id, entity_name) provenance BEFORE the by-name merge
+        # collapses many chunks' mentions of the same entity into one node.
+        # This is what lets store_entities_in_neo4j link each chunk to exactly
+        # the entities extracted from it.
+        mentions = list({
+            (e.source_chunk_id, e.name)
+            for e in all_entities
+            if e.source_chunk_id and e.name
+        })
+
         # Merge duplicates (sync concat pass + async LLM-merge for the heavy hitters)
         merged_entities = self._merge_entities(all_entities)
         await self._llm_merge_descriptions_async(merged_entities)
         valid_entity_names = set(merged_entities.keys())
         merged_relationships = self._merge_relationships(all_relationships, valid_entity_names)
 
+        # Keep only mentions whose entity survived the merge (by name).
+        mentions = [(cid, name) for (cid, name) in mentions if name in valid_entity_names]
+
         elapsed = time.time() - start_time
 
         logger.info(
             f"Extracted {len(merged_entities)} entities and {len(merged_relationships)} "
-            f"relationships from {len(chunks)} chunks in {elapsed:.1f}s"
+            f"relationships from {len(chunks)} chunks in {elapsed:.1f}s "
+            f"({len(mentions)} chunk-entity mentions)"
         )
 
         return GraphExtractionResult(
@@ -583,7 +601,8 @@ Return ONLY the merged description text, nothing else."""
             entity_count=len(merged_entities),
             relationship_count=len(merged_relationships),
             chunk_count=len(chunks),
-            total_time_seconds=elapsed
+            total_time_seconds=elapsed,
+            mentions=mentions,
         )
 
 
@@ -734,6 +753,35 @@ async def store_entities_in_neo4j(
             )
 
     logger.info(f"Stored {stored} entities and {rels_total} relationships")
+
+    # Link chunks to their entities BY PROVENANCE (source_chunk_id captured at
+    # extraction), not by content-substring matching. Requires chunks to carry a
+    # stable `id` (set at ingestion / backfilled). An index on Chunk.id keeps the
+    # per-mention MATCH O(log n) instead of a full label scan.
+    mentions = getattr(extraction_result, "mentions", None) or []
+    if mentions:
+        try:
+            await neo4j_client.execute_query(
+                "CREATE INDEX chunk_id_index IF NOT EXISTS FOR (c:Chunk) ON (c.id)"
+            )
+        except Exception as idx_error:
+            logger.warning(f"Could not create Chunk.id index: {idx_error}")
+
+        link_query = """
+        UNWIND $pairs AS p
+        MATCH (c:Chunk {id: p.chunk_id})
+        MATCH (e:Entity {name: p.name})
+        MERGE (c)-[:HAS_ENTITY]->(e)
+        """
+        link_batch = 1000
+        pairs = [{"chunk_id": cid, "name": name} for (cid, name) in mentions]
+        linked = 0
+        for i in range(0, len(pairs), link_batch):
+            await neo4j_client.execute_query(link_query, {"pairs": pairs[i:i + link_batch]})
+            linked += len(pairs[i:i + link_batch])
+            if linked % 10000 == 0 or linked == len(pairs):
+                logger.info(f"Linked chunk-entity mentions: {linked} / {len(pairs)}")
+        logger.info(f"Created HAS_ENTITY links for {len(pairs)} mentions")
 
     return stored
 

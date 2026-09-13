@@ -4,6 +4,7 @@ Complete RAG workflow from query to augmented context
 """
 
 import logging
+import uuid
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -760,6 +761,10 @@ class RAGPipeline:
                 chunks_data = []
                 for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                     chunks_data.append({
+                        # Stable id so entity extraction can link entities back to
+                        # this chunk by provenance (Chunk-[:HAS_ENTITY]->Entity)
+                        # instead of fragile content-substring matching.
+                        'id': str(uuid.uuid4()),
                         'content': chunk.content,
                         'chunk_index': chunk.chunk_index,
                         'total_chunks': chunk.total_chunks,
@@ -772,6 +777,7 @@ class RAGPipeline:
                 MATCH (d:Document) WHERE id(d) = $doc_id
                 UNWIND $chunks AS chunk_data
                 CREATE (c:Chunk {
+                    id: chunk_data.id,
                     content: chunk_data.content,
                     chunk_index: chunk_data.chunk_index,
                     total_chunks: chunk_data.total_chunks,
