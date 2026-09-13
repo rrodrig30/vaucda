@@ -193,21 +193,26 @@ class Settings(BaseSettings):
     def OCR_MODEL(self) -> str:
         return self.OCR_LLM_MODEL
 
-    def graphrag_model_config(self) -> dict:
+    def graphrag_model_config(self, llm_model_override: Optional[str] = None) -> dict:
         """Single source of truth for the GraphRAG build/retrieval model
         configuration. Resolves from settings (which load .env), never from a
         hardcoded model literal at the call site — so the build path uses the
         same configured model as the runtime retrieval path (rules.txt: no
         hardcoded elements, all configuration via .env).
 
+        Args:
+            llm_model_override: a user-selected model (from the Settings page,
+                stored in UserPreferences.graphrag_llm_model). When set, it wins
+                over the env GRAPHRAG_LLM_MODEL default.
+
         Returns keys: ``ollama_base_url``, ``llm_model``, ``embedding_model``.
         """
         return {
             "ollama_base_url": self.OLLAMA_BASE_URL or "http://localhost:11434",
-            # Dedicated GraphRAG knob (GRAPHRAG_LLM_MODEL); NOT OLLAMA_DEFAULT_MODEL
-            # (llama3.1:8b), which is the weak local default the build path used
-            # to hardcode.
-            "llm_model": self.GRAPHRAG_LLM_MODEL,
+            # Precedence: explicit user selection > GRAPHRAG_LLM_MODEL env knob.
+            # NOT OLLAMA_DEFAULT_MODEL (llama3.1:8b), which is the weak local
+            # default the build path used to hardcode.
+            "llm_model": (llm_model_override or "").strip() or self.GRAPHRAG_LLM_MODEL,
             "embedding_model": self.OLLAMA_EMBEDDING_MODEL,
         }
 

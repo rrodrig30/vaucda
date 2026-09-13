@@ -69,6 +69,8 @@ export const Settings: React.FC = () => {
     stage2_use_rag: true,
     stage2_use_graphrag: true,
     stage2_rag_top_k: 5,
+    // GraphRAG knowledge-graph build/retrieval model (blank = server default)
+    graphrag_llm_model: '',
   })
 
   // Per-task "model max" hints from /llm/model-context-size, displayed under each input
@@ -267,6 +269,7 @@ export const Settings: React.FC = () => {
           stage2_use_rag: settingsData.stage2_llm?.use_rag ?? true,
           stage2_use_graphrag: settingsData.stage2_llm?.use_graphrag ?? true,
           stage2_rag_top_k: settingsData.stage2_llm?.rag_top_k ?? 5,
+          graphrag_llm_model: settingsData.graphrag_llm_model ?? '',
         }))
 
         // Populate the "Model max" hints once for whatever model the user
@@ -494,6 +497,7 @@ export const Settings: React.FC = () => {
         stage2_use_rag: taskLLMConfig.stage2_use_rag,
         stage2_use_graphrag: taskLLMConfig.stage2_use_graphrag,
         stage2_rag_top_k: taskLLMConfig.stage2_rag_top_k,
+        graphrag_llm_model: taskLLMConfig.graphrag_llm_model,
       }
 
       await settingsApi.updateSettings(updateRequest)
@@ -1185,6 +1189,28 @@ export const Settings: React.FC = () => {
                         helpText="Number of knowledge base results to retrieve"
                       />
                     )}
+
+                    <div>
+                      <label className="block text-sm font-medium mb-1">
+                        GraphRAG Knowledge-Graph Model
+                      </label>
+                      <input
+                        type="text"
+                        list="graphrag-model-options"
+                        value={taskLLMConfig.graphrag_llm_model}
+                        onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, graphrag_llm_model: e.target.value })}
+                        placeholder="e.g. gpt-oss:120b-cloud"
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-sm"
+                      />
+                      <datalist id="graphrag-model-options">
+                        {availableModels.map((m) => (<option key={m} value={m} />))}
+                      </datalist>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Model used to BUILD and query the knowledge graph (entity extraction,
+                        community summarization, map-reduce). Applies to "Rebuild GraphRAG Layer"
+                        in the Knowledge Base. Leave blank to use the server default.
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>

@@ -229,6 +229,8 @@ export interface UserSettings {
   ocr_llm?: TaskLLMConfig
   stage1_llm?: TaskLLMConfig
   stage2_llm?: Stage2LLMConfig
+  // GraphRAG knowledge-graph build/retrieval model (blank -> server default).
+  graphrag_llm_model?: string
   // Source EHR format of pasted/uploaded charts: 'cprs' (default) or 'vista'.
   source_format?: 'cprs' | 'vista'
   // LLM provider API keys — server never returns the key itself, only whether
@@ -291,6 +293,7 @@ export interface UpdateSettingsRequest {
   stage2_use_rag?: boolean
   stage2_use_graphrag?: boolean
   stage2_rag_top_k?: number
+  graphrag_llm_model?: string
   source_format?: 'cprs' | 'vista'
   // LLM provider API keys: send a value to set, '' to clear, omit to leave as-is.
   anthropic_api_key?: string

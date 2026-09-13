@@ -16,7 +16,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.security import get_optional_user, get_current_admin_user
 from app.config import settings
-from app.database.sqlite_models import User
+from app.database.sqlite_models import User, UserPreferences
+from app.database.sqlite_session import get_db
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.rag import (
     RAGSearchRequest,
     SearchResult,
@@ -790,13 +793,13 @@ async def _graphrag_coverage(neo4j_client) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-async def _run_graphrag_build(neo4j_client) -> None:
+async def _run_graphrag_build(neo4j_client, llm_model_override: Optional[str] = None) -> None:
     """Background task: run the full (incremental) GraphRAG pipeline."""
     import time
     from datetime import datetime, timezone
     from rag.graphrag_pipeline import GraphRAGPipeline
 
-    gr = settings.graphrag_model_config()
+    gr = settings.graphrag_model_config(llm_model_override)
     # Snapshot coverage BEFORE the build so the UI can show a real progress bar
     # ("X of Y new chunks processed") rather than a global coverage % that barely
     # moves. Progress = baseline.chunks_pending - current.chunks_pending.
@@ -879,6 +882,7 @@ async def _run_graphrag_build(neo4j_client) -> None:
 async def rebuild_graphrag(
     current_user: User = Depends(get_current_admin_user),
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    db: AsyncSession = Depends(get_db),
 ):
     """Trigger a (re)build of the GraphRAG layer for the knowledge base.
 
@@ -895,6 +899,18 @@ async def rebuild_graphrag(
             detail="GraphRAG rebuild requires Neo4j. It is not connected.",
         )
 
+    # Resolve the user-selected GraphRAG model (Settings page) if any; else the
+    # env GRAPHRAG_LLM_MODEL default.
+    model_override = None
+    try:
+        prefs = (await db.execute(
+            select(UserPreferences).where(UserPreferences.user_id == current_user.user_id)
+        )).scalar_one_or_none()
+        if prefs is not None:
+            model_override = getattr(prefs, "graphrag_llm_model", None)
+    except Exception as e:
+        logger.warning(f"Could not load graphrag_llm_model preference: {e}")
+
     async with _GRAPHRAG_BUILD_LOCK:
         if _GRAPHRAG_BUILD["status"] == "running":
             raise HTTPException(
@@ -903,13 +919,15 @@ async def rebuild_graphrag(
             )
         # Mark running synchronously so a rapid second POST is rejected.
         _GRAPHRAG_BUILD["status"] = "running"
-        _GRAPHRAG_TASK = asyncio.create_task(_run_graphrag_build(neo4j_client))
+        _GRAPHRAG_TASK = asyncio.create_task(
+            _run_graphrag_build(neo4j_client, llm_model_override=model_override)
+        )
 
     before = await _graphrag_coverage(neo4j_client)
     return {
         "status": "started",
         "message": "GraphRAG rebuild started in the background. Poll /rag/graphrag-status.",
-        "models": settings.graphrag_model_config(),
+        "models": settings.graphrag_model_config(model_override),
         "coverage_before": before,
     }
 

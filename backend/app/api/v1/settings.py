@@ -58,6 +58,13 @@ class UserSettingsResponse(BaseModel):
     stage1_llm: TaskLLMConfig = Field(..., description="Stage 1 note generation LLM configuration")
     stage2_llm: Stage2LLMConfig = Field(..., description="Stage 2 Assessment & Plan LLM configuration")
 
+    graphrag_llm_model: str = Field(
+        "",
+        description="Model used to BUILD/query the GraphRAG knowledge graph "
+                    "(entity extraction, community summarization, map-reduce). "
+                    "Empty falls back to the GRAPHRAG_LLM_MODEL env default.",
+    )
+
     module_defaults: Optional[Dict[str, Any]] = Field(None, description="Default modules configuration")
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
     openevidence_configured: bool = Field(False, description="Whether OpenEvidence is configured")
@@ -118,6 +125,10 @@ class UserSettingsUpdate(BaseModel):
     stage2_use_rag: Optional[bool] = Field(None, description="Enable RAG for Stage 2")
     stage2_use_graphrag: Optional[bool] = Field(None, description="Enable GraphRAG for Stage 2")
     stage2_rag_top_k: Optional[int] = Field(None, description="RAG top-k retrieval")
+
+    # GraphRAG knowledge-graph build/retrieval model. Empty string clears the
+    # override (falls back to GRAPHRAG_LLM_MODEL env default).
+    graphrag_llm_model: Optional[str] = Field(None, description="GraphRAG build/retrieval model")
 
     module_defaults: Optional[Dict[str, Any]] = Field(None, description="Default modules configuration")
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
@@ -204,6 +215,7 @@ async def get_settings(
                 anthropic_key_hint=key_hint("anthropic"),
                 openai_key_hint=key_hint("openai"),
                 source_format="cprs",
+                graphrag_llm_model=settings.GRAPHRAG_LLM_MODEL,
             )
 
         # Query user preferences
@@ -278,6 +290,7 @@ async def get_settings(
             anthropic_key_hint=key_hint("anthropic"),
             openai_key_hint=key_hint("openai"),
             source_format=(prefs.source_format or "cprs"),
+            graphrag_llm_model=(getattr(prefs, "graphrag_llm_model", None) or settings.GRAPHRAG_LLM_MODEL),
         )
 
     except Exception as e:
@@ -395,6 +408,9 @@ async def update_settings(
             prefs.stage2_use_graphrag = settings_update.stage2_use_graphrag
         if settings_update.stage2_rag_top_k is not None:
             prefs.stage2_rag_top_k = settings_update.stage2_rag_top_k
+        if settings_update.graphrag_llm_model is not None:
+            # Empty string clears the override -> fall back to env GRAPHRAG_LLM_MODEL.
+            prefs.graphrag_llm_model = settings_update.graphrag_llm_model.strip() or None
 
         if settings_update.module_defaults is not None:
             prefs.module_defaults = settings_update.module_defaults
@@ -484,6 +500,7 @@ async def update_settings(
             anthropic_key_hint=key_hint("anthropic"),
             openai_key_hint=key_hint("openai"),
             source_format=(prefs.source_format or "cprs"),
+            graphrag_llm_model=(getattr(prefs, "graphrag_llm_model", None) or settings.GRAPHRAG_LLM_MODEL),
         )
 
     except Exception as e:

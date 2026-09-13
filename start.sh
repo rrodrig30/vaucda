@@ -247,6 +247,9 @@ fi
 if [ -f "database/migrations/add_source_format_column.py" ]; then
     python database/migrations/add_source_format_column.py 2>/dev/null || echo -e "${YELLOW}  source_format migration script completed (or database not yet created)${NC}"
 fi
+if [ -f "database/migrations/add_graphrag_model_column.py" ]; then
+    python database/migrations/add_graphrag_model_column.py 2>/dev/null || echo -e "${YELLOW}  graphrag_llm_model migration script completed (or database not yet created)${NC}"
+fi
 echo -e "${GREEN}✓ Database migrations complete${NC}"
 
 # Check Neo4j (optional) - test actual connectivity
