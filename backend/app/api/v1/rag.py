@@ -725,3 +725,164 @@ async def get_knowledge_base_stats(
             "sources": ["User uploaded documents"],
             "status": "Knowledge base stats unavailable"
         }
+
+
+# ---------------------------------------------------------------------------
+# GraphRAG layer rebuild
+#
+# Document upload only populates the vector store (Document + Chunk + embeddings).
+# The GraphRAG layer (Entity extraction -> Leiden communities -> hierarchical
+# summaries -> community embeddings) is a SEPARATE build. After ingesting new
+# material, the operator triggers this rebuild so the new chunks join the graph.
+# Entity extraction is incremental (it skips chunks that already have entities),
+# so a rebuild only processes newly-added chunks, then re-detects communities and
+# summarizes. Models come from settings.graphrag_model_config() (.env-backed).
+# ---------------------------------------------------------------------------
+
+# In-process build state (single build at a time). Reset on server restart.
+_GRAPHRAG_BUILD: Dict[str, Any] = {
+    "status": "idle",          # idle | running | success | error
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": None,
+    "result": None,            # run_full_pipeline stage summary
+    "error": None,
+    "models": None,
+}
+_GRAPHRAG_BUILD_LOCK = asyncio.Lock()
+_GRAPHRAG_TASK: Optional[asyncio.Task] = None  # keep a ref so it isn't GC'd
+
+
+async def _graphrag_coverage(neo4j_client) -> Dict[str, Any]:
+    """Live GraphRAG coverage: how many chunks are in the graph layer, plus
+    entity/community/summary counts. Cheap enough to poll while a build runs."""
+    if neo4j_client is None:
+        return {}
+    try:
+        async with neo4j_client.driver.session() as session:
+            r = await (await session.run(
+                """
+                MATCH (c:Chunk)
+                WITH count(c) AS total,
+                     count(CASE WHEN EXISTS((c)-[:HAS_ENTITY]->(:Entity)) THEN 1 END) AS in_graph
+                RETURN total, in_graph
+                """
+            )).single()
+            total = r["total"] if r else 0
+            in_graph = r["in_graph"] if r else 0
+            ent = await (await session.run("MATCH (n:Entity) RETURN count(n) AS c")).single()
+            com = await (await session.run("MATCH (n:Community) RETURN count(n) AS c")).single()
+            summ = await (await session.run("MATCH (n:HierarchicalSummary) RETURN count(n) AS c")).single()
+        pct = round(100.0 * in_graph / total, 1) if total else 0.0
+        return {
+            "total_chunks": total,
+            "chunks_in_graph": in_graph,
+            "chunks_pending": max(0, total - in_graph),
+            "coverage_pct": pct,
+            "entities": ent["c"] if ent else 0,
+            "communities": com["c"] if com else 0,
+            "summaries": summ["c"] if summ else 0,
+        }
+    except Exception as e:
+        logger.warning(f"GraphRAG coverage query failed: {e}")
+        return {"error": str(e)}
+
+
+async def _run_graphrag_build(neo4j_client) -> None:
+    """Background task: run the full (incremental) GraphRAG pipeline."""
+    import time
+    from datetime import datetime, timezone
+    from rag.graphrag_pipeline import GraphRAGPipeline
+
+    gr = settings.graphrag_model_config()
+    _GRAPHRAG_BUILD.update({
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "elapsed_seconds": None,
+        "result": None,
+        "error": None,
+        "models": gr,
+    })
+    t0 = time.time()
+    logger.info(f"GraphRAG rebuild starting with models={gr}")
+    try:
+        pipeline = GraphRAGPipeline(
+            neo4j_client=neo4j_client,
+            ollama_base_url=gr["ollama_base_url"],
+            llm_model=gr["llm_model"],
+            embedding_model=gr["embedding_model"],
+            max_concurrent=12,
+            # Per-call LLM timeout for the build (entity extraction / summaries).
+            llm_timeout=settings.OLLAMA_TIMEOUT,
+        )
+        results = await pipeline.run_full_pipeline(
+            extract_entities=True,       # incremental: skips chunks already in graph
+            detect_communities=True,
+            generate_summaries=True,
+            compute_embeddings=True,
+        )
+        _GRAPHRAG_BUILD.update({
+            "status": "success",
+            "result": results.get("stages", results),
+        })
+        logger.info("GraphRAG rebuild completed successfully")
+    except Exception as e:
+        logger.error(f"GraphRAG rebuild failed: {e}", exc_info=True)
+        _GRAPHRAG_BUILD.update({"status": "error", "error": str(e)})
+    finally:
+        from datetime import datetime, timezone
+        _GRAPHRAG_BUILD["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _GRAPHRAG_BUILD["elapsed_seconds"] = round(time.time() - t0, 1)
+
+
+@router.post("/rebuild-graphrag")
+async def rebuild_graphrag(
+    current_user: User = Depends(get_current_admin_user),
+    rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+):
+    """Trigger a (re)build of the GraphRAG layer for the knowledge base.
+
+    **Admin only.** Runs in the background — poll ``GET /rag/graphrag-status``
+    for progress. Entity extraction is incremental, so this processes only chunks
+    added since the last build, then re-detects communities and regenerates
+    summaries. Models are resolved from settings (GRAPHRAG_LLM_MODEL).
+    """
+    global _GRAPHRAG_TASK
+    neo4j_client = getattr(rag_pipeline, "neo4j_client", None)
+    if neo4j_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GraphRAG rebuild requires Neo4j. It is not connected.",
+        )
+
+    async with _GRAPHRAG_BUILD_LOCK:
+        if _GRAPHRAG_BUILD["status"] == "running":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A GraphRAG rebuild is already running.",
+            )
+        # Mark running synchronously so a rapid second POST is rejected.
+        _GRAPHRAG_BUILD["status"] = "running"
+        _GRAPHRAG_TASK = asyncio.create_task(_run_graphrag_build(neo4j_client))
+
+    before = await _graphrag_coverage(neo4j_client)
+    return {
+        "status": "started",
+        "message": "GraphRAG rebuild started in the background. Poll /rag/graphrag-status.",
+        "models": settings.graphrag_model_config(),
+        "coverage_before": before,
+    }
+
+
+@router.get("/graphrag-status")
+async def graphrag_status(
+    current_user: Optional[User] = Depends(get_optional_user),
+    rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+):
+    """Current GraphRAG build state + live coverage of the graph layer."""
+    neo4j_client = getattr(rag_pipeline, "neo4j_client", None)
+    coverage = await _graphrag_coverage(neo4j_client)
+    state = {k: v for k, v in _GRAPHRAG_BUILD.items()}
+    state["coverage"] = coverage
+    return state
