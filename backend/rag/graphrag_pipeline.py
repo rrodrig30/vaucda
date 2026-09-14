@@ -17,6 +17,7 @@ References:
 import uuid
 import logging
 import asyncio
+import re
 import time
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import dataclass, field
@@ -182,6 +183,10 @@ Synthesize these answers into a single, comprehensive response that:
 3. Provides a well-structured answer
 4. Cites which communities contributed key information
 
+Write every name, term, and citation in plain English EXACTLY as it appears in
+the community answers above. Never encode, cipher, rotate, or otherwise transform
+any text; if unsure of a source's exact name, describe it rather than guessing.
+
 SYNTHESIZED ANSWER:"""
 
     LOCAL_SEARCH_ENTITY_PROMPT = """Extract the key entities from this query that should be used for graph traversal.
@@ -208,7 +213,9 @@ RELATIONSHIPS:
 SUPPORTING TEXT:
 {chunks}
 
-Provide a detailed answer based on the graph context above.
+Provide a detailed answer based on the graph context above. Write every entity
+and source name in plain English EXACTLY as it appears above — never encode,
+cipher, rotate, or otherwise transform any text.
 
 ANSWER:"""
 
@@ -1002,6 +1009,51 @@ ANSWER:"""
             return 0
         return max(0, min(100, v))
 
+    @staticmethod
+    def _repair_ciphered_text(text: str, *context_texts: str) -> str:
+        """Repair Caesar/ROT-shifted word runs the synthesis model occasionally
+        emits (a gpt-oss quirk) — e.g. it renders the entity 'Abdominal &
+        Intraperitoneal' as 'Degrplqdo & Lqwudshulwrqhdo' (a uniform +3 shift).
+
+        Grounded and conservative: a token is only rewritten when SOME single
+        uniform letter-shift of it exactly matches a word that appears in the
+        retrieved context (community answers / entities / chunks). Because a
+        real English word almost never uniform-shifts into an unrelated
+        domain term, legitimate text is left untouched — no dictionary and no
+        heuristic guessing.
+        """
+        if not text:
+            return text
+        vocab = set()
+        for ct in context_texts:
+            for w in re.findall(r"[A-Za-z]{4,}", ct or ""):
+                vocab.add(w.lower())
+        if not vocab:
+            return text
+
+        def _shift(w: str, n: int) -> str:
+            out = []
+            for ch in w:
+                if 'a' <= ch <= 'z':
+                    out.append(chr((ord(ch) - 97 + n) % 26 + 97))
+                elif 'A' <= ch <= 'Z':
+                    out.append(chr((ord(ch) - 65 + n) % 26 + 65))
+                else:
+                    out.append(ch)
+            return ''.join(out)
+
+        def _fix(m: "re.Match") -> str:
+            tok = m.group(0)
+            if len(tok) < 4 or tok.lower() in vocab:
+                return tok
+            low = tok.lower()
+            for n in range(1, 26):
+                if _shift(low, n) in vocab:
+                    return _shift(tok, n)  # same shift preserves original case
+            return tok
+
+        return re.sub(r"[A-Za-z]{4,}", _fix, text)
+
     async def global_search(
         self,
         query: str,
@@ -1177,6 +1229,11 @@ ANSWER:"""
 
             final_answer = await self._call_llm(reduce_prompt, temperature=0.3)
 
+        # Repair any Caesar/ROT-shifted names the synthesis model emitted,
+        # grounded against the community answers + query it was given.
+        _ctx = " ".join(a.get('response', '') for a in intermediate_answers) + " " + query
+        final_answer = self._repair_ciphered_text(final_answer or "", _ctx)
+
         elapsed = time.time() - start_time
 
         return MapReduceResult(
@@ -1296,6 +1353,12 @@ ANSWER:"""
         )
 
         context = await self._call_llm(response_prompt, temperature=0.3)
+
+        # Repair any Caesar/ROT-shifted names, grounded against the entity /
+        # relationship / chunk text that was fed to the model.
+        context = self._repair_ciphered_text(
+            context or "", entities_text, relationships_text, chunks_text, query
+        )
 
         elapsed = time.time() - start_time
 
