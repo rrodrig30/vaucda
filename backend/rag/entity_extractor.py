@@ -292,10 +292,52 @@ Return ONLY the merged description text, nothing else."""
         repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", repaired)
         try:
             return _extract(json.loads(repaired))
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON response (after repair): {e}")
+        except json.JSONDecodeError:
+            pass
 
+        # 4) Salvage: the model routinely emits an unescaped quote/newline inside
+        #    a `description`, which breaks strict JSON deep in a large response
+        #    ("Expecting ',' delimiter"). Rather than discard the whole chunk,
+        #    pull each flat object's key fields with per-object regex and ignore
+        #    the fragile description. name+type (and rel source/target) are all
+        #    the graph actually needs.
+        ents, rels = self._salvage_objects(cleaned)
+        if ents or rels:
+            return ents, rels
+
+        logger.warning("Failed to parse JSON response (unrecoverable after salvage)")
         return [], []
+
+    @staticmethod
+    def _salvage_objects(text: str) -> Tuple[List[Dict], List[Dict]]:
+        """Regex-salvage entities/relationships from malformed JSON. Flat
+        objects only (entity/relationship objects have no nested braces), so a
+        broken string value in one object never poisons the others."""
+        _str = r'"((?:[^"\\]|\\.)*)"'  # a JSON string body (handles escapes)
+
+        def _field(obj: str, key: str):
+            m = re.search(rf'"{key}"\s*:\s*{_str}', obj)
+            return m.group(1) if m else None
+
+        ents: List[Dict] = []
+        rels: List[Dict] = []
+        ent_region = re.search(r'"entities"\s*:\s*\[(.*?)\](?=\s*,\s*"relationship|\s*\})',
+                               text, re.DOTALL)
+        rel_region = re.search(r'"relationships"\s*:\s*\[(.*?)\]\s*\}?\s*$', text, re.DOTALL)
+        if ent_region:
+            for obj in re.findall(r'\{[^{}]*\}', ent_region.group(1)):
+                name = _field(obj, "name")
+                if name:
+                    ents.append({"name": name, "type": _field(obj, "type") or "Concept",
+                                 "description": _field(obj, "description") or ""})
+        if rel_region:
+            for obj in re.findall(r'\{[^{}]*\}', rel_region.group(1)):
+                src, tgt = _field(obj, "source"), _field(obj, "target")
+                if src and tgt:
+                    rels.append({"source": src, "target": tgt,
+                                 "type": _field(obj, "type") or "related_to",
+                                 "description": _field(obj, "description") or ""})
+        return ents, rels
 
     async def extract_from_chunk(
         self,
