@@ -310,9 +310,15 @@ Return ONLY the merged description text, nothing else."""
 
     @staticmethod
     def _salvage_objects(text: str) -> Tuple[List[Dict], List[Dict]]:
-        """Regex-salvage entities/relationships from malformed JSON. Flat
-        objects only (entity/relationship objects have no nested braces), so a
-        broken string value in one object never poisons the others."""
+        """Regex-salvage entities/relationships from malformed JSON.
+
+        Truncation-robust: scans EVERY flat object (entity/relationship objects
+        have no nested braces) across the whole response and classifies each by
+        its fields, rather than trying to isolate the entities[]/relationships[]
+        arrays — so a response cut off mid-array (num_predict limit) still yields
+        all of its complete objects. A broken string in one object can't poison
+        the others.
+        """
         _str = r'"((?:[^"\\]|\\.)*)"'  # a JSON string body (handles escapes)
 
         def _field(obj: str, key: str):
@@ -321,21 +327,22 @@ Return ONLY the merged description text, nothing else."""
 
         ents: List[Dict] = []
         rels: List[Dict] = []
-        ent_region = re.search(r'"entities"\s*:\s*\[(.*?)\](?=\s*,\s*"relationship|\s*\})',
-                               text, re.DOTALL)
-        rel_region = re.search(r'"relationships"\s*:\s*\[(.*?)\]\s*\}?\s*$', text, re.DOTALL)
-        if ent_region:
-            for obj in re.findall(r'\{[^{}]*\}', ent_region.group(1)):
-                name = _field(obj, "name")
-                if name:
-                    ents.append({"name": name, "type": _field(obj, "type") or "Concept",
-                                 "description": _field(obj, "description") or ""})
-        if rel_region:
-            for obj in re.findall(r'\{[^{}]*\}', rel_region.group(1)):
-                src, tgt = _field(obj, "source"), _field(obj, "target")
-                if src and tgt:
+        seen_ent, seen_rel = set(), set()
+        for obj in re.findall(r'\{[^{}]*\}', text):
+            src, tgt = _field(obj, "source"), _field(obj, "target")
+            if src and tgt:  # relationship object
+                key = (src, tgt, _field(obj, "type") or "")
+                if key not in seen_rel:
+                    seen_rel.add(key)
                     rels.append({"source": src, "target": tgt,
                                  "type": _field(obj, "type") or "related_to",
+                                 "description": _field(obj, "description") or ""})
+                continue
+            name = _field(obj, "name")
+            if name:  # entity object
+                if name not in seen_ent:
+                    seen_ent.add(name)
+                    ents.append({"name": name, "type": _field(obj, "type") or "Concept",
                                  "description": _field(obj, "description") or ""})
         return ents, rels
 
