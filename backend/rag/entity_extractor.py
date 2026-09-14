@@ -222,9 +222,17 @@ Return ONLY the merged description text, nothing else."""
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            # Constrain the model to emit syntactically valid JSON. Without this,
+            # gpt-oss/cloud models emit JSON with trailing commas / unescaped
+            # characters that json.loads rejects — which was silently dropping
+            # ~46% of chunks ("Failed to parse JSON response") and leaving them
+            # with zero entities.
+            "format": "json",
             "options": {
                 "temperature": 0.1,  # Low temperature for consistent extraction
-                "num_predict": 2048,
+                # Headroom so entity-rich clinical chunks aren't truncated
+                # mid-JSON (which format:json can't always close).
+                "num_predict": 4096,
                 "num_ctx": 8192,
             }
         }
@@ -246,18 +254,46 @@ Return ONLY the merged description text, nothing else."""
             return ""
 
     def _parse_extraction_response(self, response: str) -> Tuple[List[Dict], List[Dict]]:
-        """Parse LLM response into entities and relationships."""
-        # Try to extract JSON from response
+        """Parse LLM response into entities and relationships.
+
+        Robust to the ways models wrap/format JSON: markdown code fences, prose
+        around the object, and (the big one) trailing commas / minor syntax
+        slips that strict json.loads rejects. Tries progressively looser
+        strategies before giving up so a single stray comma doesn't discard an
+        entire chunk's entities.
+        """
+        if not response or not response.strip():
+            return [], []
+
+        def _extract(data) -> Tuple[List[Dict], List[Dict]]:
+            return data.get("entities", []) or [], data.get("relationships", []) or []
+
+        # Strip markdown code fences (```json ... ```), common with chat models.
+        cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", response.strip(),
+                         flags=re.IGNORECASE)
+
+        # 1) Direct parse — works when the model emits clean JSON (format:json).
         try:
-            # Find JSON block in response
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                data = json.loads(json_match.group())
-                entities = data.get("entities", [])
-                relationships = data.get("relationships", [])
-                return entities, relationships
+            return _extract(json.loads(cleaned))
+        except json.JSONDecodeError:
+            pass
+
+        # 2) Greedy brace slice (first '{' .. last '}') then parse.
+        json_match = re.search(r'\{[\s\S]*\}', cleaned)
+        candidate = json_match.group() if json_match else cleaned
+        try:
+            return _extract(json.loads(candidate))
+        except json.JSONDecodeError:
+            pass
+
+        # 3) Repair the most common offenders and retry: trailing commas before
+        #    a closing } or ], and stray control characters.
+        repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", repaired)
+        try:
+            return _extract(json.loads(repaired))
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON response: {e}")
+            logger.warning(f"Failed to parse JSON response (after repair): {e}")
 
         return [], []
 
