@@ -542,6 +542,21 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     holding = bool(_HOLDING_RE.search(raw_text))
     deferred_today = bool(_DEFER_TODAY_RE.search(raw_text))
     given_today = bool(_INJECTION_TODAY_RE.search(raw_text)) and not deferred_today
+
+    # An injection ADMINISTERED/GIVEN today is a dose on the visit date. It rarely
+    # carries an explicit date in the note ("Administered Eligard today"), so
+    # without this it's invisible to the date collector — and a patient with one
+    # earlier narrative dose then a dose today would show that earlier date as
+    # BOTH the first and the last dose. Add the visit date so today's dose extends
+    # the course (deduped downstream, so a lone first-dose-today stays a single dose).
+    if given_today:
+        # Use ONLY an explicit visit date (the render path passes one). Do NOT
+        # fall back to a scanned note date — that can grab an unrelated OLD note
+        # header and stamp it as today's dose (e.g. a 2011 date on a 2026 chart).
+        _vymd = _parse_visit_ymd(visit_date)
+        if _vymd:
+            dates.append((_vymd[0], _vymd[1], _vymd[2],
+                          f"{_vymd[1]:02d}/{_vymd[2]:02d}/{_vymd[0]}"))
     finite_done = bool(_FINITE_COMPLETED_RE.search(raw_text))
     disc_tox = bool(_DISCONTINUED_TOX_RE.search(raw_text))
     new_course = bool(_NEW_COURSE_RE.search(raw_text))
@@ -872,21 +887,31 @@ def render_adt_section(st: ADTStatus) -> str:
     if reg.strip():
         lines.append(_row("Agent", reg))
     if st.start_display:
-        lines.append(_row("Started", st.start_display))
         # Closing line for the (final) course. "Completed" only with affirmative
         # completion evidence; an ongoing or merely-lapsed course shows the factual
         # "Last dose given" instead of implying the course was intentionally ended.
         if st.restarted_display:
             # Two courses: course 1 completed (a restart followed), then restarted.
+            lines.append(_row("Started", st.start_display))
             lines.append(_row("Completed", st.completed_display))
             lines.append(_row("Restarted", st.restarted_display))
             _final_label = "Completed again" if (not st.is_active and st.completed_confident) \
                 else "Last dose given"
             lines.append(_row(_final_label, st.last_dose_display))
         else:
-            _label = "Completed" if (not st.is_active and st.completed_confident) \
-                else "Last dose given"
-            lines.append(_row(_label, st.last_dose_display or st.completed_display))
+            _closing = st.last_dose_display or st.completed_display
+            # Single distinct dose date (only one injection recorded): show ONE
+            # line, not the same date on both "Started" and "Last dose given".
+            if not _closing or _closing == st.start_display:
+                if not st.is_active and st.completed_confident:
+                    lines.append(_row("Completed", st.start_display))
+                else:
+                    lines.append(_row("Started", st.start_display))
+            else:
+                lines.append(_row("Started", st.start_display))
+                _label = "Completed" if (not st.is_active and st.completed_confident) \
+                    else "Last dose given"
+                lines.append(_row(_label, _closing))
     if st.oral_agents and st.agent not in st.oral_agents:
         # A first-generation antiandrogen (bicalutamide / flutamide / nilutamide)
         # given alongside an LHRH AGONIST is transient flare protection at ADT
