@@ -219,20 +219,32 @@ def classify_life_expectancy(stage1_note: str) -> dict:
     # Primary driver: NCCN/AUA SSA actuarial life expectancy adjusted by
     # comorbidity health quartile (replaces the coarse Charlson 10-yr survival).
     from .life_expectancy import (estimate_life_expectancy, parse_sex,
-                                   format_life_expectancy, compute_lee_index)
+                                   format_life_expectancy, compute_lee_index,
+                                   compute_schonberg_index)
     sex = parse_sex(stage1_note)
     excellent = bool(_EXCELLENT_HEALTH.search(stage1_note or "")) and n_flags == 0
     le = estimate_life_expectancy(age, sex, n_flags, excellent_health=excellent)
     # Lee 4-yr-mortality index — computed only when functional status is documented.
     lee = compute_lee_index(stage1_note, age, sex)
+    # Schonberg 9-yr-mortality index — PREFERRED (closest to 10-yr survival) when
+    # its self-report inputs are documented; else the SSA estimate governs.
+    schon = compute_schonberg_index(stage1_note, age, sex)
 
     if age is None or le is None:
         bucket = "UNKNOWN"
     else:
-        # Bucket from the estimated years: >=10 STANDARD, 5-10 LIMITED, <5 VERY.
-        # (This replaces the old blunt age-only cutoffs — a robust 80-year-old is
-        # no longer auto-LIMITED; the actuarial estimate decides.)
-        if le["years"] >= 10:
+        if schon is not None:
+            # Schonberg's own strata: 0-7 low, 8-13 medium, 14+ high mortality.
+            if schon["score"] <= 7:
+                bucket = "STANDARD"
+            elif schon["score"] <= 13:
+                bucket = "LIMITED"
+            else:
+                bucket = "VERY_LIMITED"
+        elif le["years"] >= 10:
+            # Bucket from the SSA estimated years: >=10 STANDARD, 5-10 LIMITED, <5.
+            # (Replaces the old blunt age-only cutoffs — a robust 80-year-old is
+            # no longer auto-LIMITED; the actuarial estimate decides.)
             bucket = "STANDARD"
         elif le["years"] >= 5:
             bucket = "LIMITED"
@@ -273,6 +285,18 @@ def classify_life_expectancy(stage1_note: str) -> dict:
                        f"4-year mortality"
                        + (f"; {drivers}" if drivers else "") + ").")
 
+    schon_summary = ""
+    if schon:
+        drivers = ", ".join(k for k in schon["contributors"] if k not in ("male",))
+        schon_summary = (
+            f"Schonberg index {schon['score']} pts: ~{schon['survival_9yr_pct']}% "
+            f"9-year survival (~{schon['mortality_9yr_pct']}% 9-year mortality"
+            + (f"; {drivers}" if drivers else "") + ").")
+
+    # Primary survival figure the synthesis prompt should cite: Schonberg when
+    # available (validated 9-yr, closest to 10-yr survival), else the SSA estimate.
+    primary_summary = schon_summary or le_summary
+
     return {
         "bucket": bucket,
         "age": age,
@@ -283,6 +307,9 @@ def classify_life_expectancy(stage1_note: str) -> dict:
         "life_expectancy_summary": le_summary,
         "lee_index": lee,                            # Lee 4-yr index dict (or None)
         "lee_index_summary": lee_summary,
+        "schonberg_index": schon,                    # Schonberg 9-yr index (or None)
+        "schonberg_index_summary": schon_summary,
+        "primary_survival_summary": primary_summary,
         "known_prostate_cancer": _has_known_prostate_cancer(stage1_note),
     }
 
@@ -313,7 +340,15 @@ def build_age_guardrail_block(stage1_note: str) -> str:
     ]
     # NCCN/AUA SSA-actuarial + comorbidity-quartile estimate (the survival
     # predictor — NOT the Charlson index). The LLM may cite this figure.
-    if info.get("life_expectancy_summary"):
+    if info.get("schonberg_index_summary"):
+        # Preferred survival predictor (validated 9-year, closest to 10-year).
+        header.append(info["schonberg_index_summary"]
+                      + " Cite this validated survival estimate (Schonberg index),"
+                        " NOT a Charlson 10-year-survival %.")
+        if info.get("life_expectancy_summary"):
+            header.append("Corroborating actuarial estimate: "
+                          + info["life_expectancy_summary"])
+    elif info.get("life_expectancy_summary"):
         header.append(info["life_expectancy_summary"]
                       + " Use this life-expectancy figure (per NCCN/AUA "
                         "actuarial method), not a Charlson 10-year-survival %.")

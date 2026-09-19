@@ -206,6 +206,113 @@ def compute_lee_index(note: str, age: Optional[int], sex: str = "male") -> Optio
             "contributors": contributors, "age": age}
 
 
+# ---------------------------------------------------------------------------
+# Schonberg index — validated 5- and 9-year mortality for community-dwelling
+# adults >=65. Exact point weights from Schonberg MA et al., J Gen Intern Med
+# 2009;24(10):1115-1122 (Table 2); 9-year mortality-by-score from the external
+# validation, J Am Geriatr Soc 2011;59(8):1444-1451 (Table 3, development
+# cohort). The 9-year horizon is the closest validated analogue to the "10-year
+# survival" prostate-decision question, so this is the PREFERRED estimate when
+# its self-report inputs (perceived health / functional status) are documented;
+# otherwise the SSA actuarial method governs.
+# ---------------------------------------------------------------------------
+_SCHON_AGE_BANDS = ((85, 7), (80, 5), (75, 3), (70, 1), (65, 0))
+# 9-year mortality % by total point score (upper bound of each band -> pct).
+_SCHON_9YR = ((1, 11), (3, 12), (5, 17), (7, 25), (9, 35),
+              (11, 53), (13, 60), (15, 71), (17, 82), (999, 89))
+
+_SCHON_CURRENT_SMOKER = _LEE_SMOKER
+_SCHON_FORMER_SMOKER = re.compile(r"former\s+smoker|ex[-\s]?smoker|quit\s+smok|"
+                                  r"former\s+tobacco|previous\s+(?:tobacco|smok)", re.I)
+_SCHON_COPD = re.compile(r"\bCOPD\b|chronic\s+obstructive|emphysema|chronic\s+bronchitis", re.I)
+_SCHON_PERCEIVED = re.compile(
+    r"(?:perceived|self[-\s]?rated|overall)\s+health\s*[:=]?\s*(\w+)|"
+    r"health\s+(?:is|was|as)\s+(excellent|very\s+good|good|fair|poor)|"
+    r"reports?\s+(excellent|very\s+good|good|fair|poor)\s+health|"
+    r"(fair|poor)\s+(?:overall\s+)?health", re.I)
+_SCHON_IADL = re.compile(
+    r"dependent\s+(?:in|for)\s+(?:at\s+least\s+)?(?:one|a|1|any|some|\d+)?\s*IADLs?|"
+    r"IADL\s+depend|"
+    r"difficulty\s+(?:managing|with)\s+(?:money|finances|medications?|shopping|"
+    r"transportation|cooking|housework|telephone|meals)|"
+    r"needs?\s+help\s+with\s+(?:shopping|finances|money|medications?|cooking|"
+    r"housework|transportation)|requires?\s+assistance\s+with\s+IADL", re.I)
+_SCHON_DIFF_QUARTER_MILE = re.compile(
+    r"difficulty\s+walking\s+(?:a\s+)?(?:quarter[-\s]?mile|1/4\s*mile|¼\s*mile|"
+    r"several\s+blocks|a\s+few\s+blocks)|unable\s+to\s+walk\s+(?:several\s+blocks|"
+    r"a\s+quarter\s+mile|¼\s*mile)", re.I)
+_SCHON_HOSP_MANY = re.compile(r"(?:two|three|2|3|multiple|several)\s+(?:hospitaliz|"
+                              r"admissions?|admitted)|hospitaliz\w*\s+(?:twice|"
+                              r"multiple\s+times)", re.I)
+_SCHON_HOSP_ONE = re.compile(r"hospitaliz|\badmitted\b|\badmission\b", re.I)
+_SCHON_HOSP_NONE = re.compile(r"no\s+hospitaliz|not\s+hospitaliz|denies?\s+hospitaliz|"
+                              r"no\s+(?:recent\s+)?admissions?", re.I)
+
+
+def _schonberg_data_present(note: str) -> bool:
+    """The index adds value over age+comorbidity only when its self-report
+    domains are documented. Require perceived health OR functional (IADL/walking)
+    status to be described; otherwise defer to the SSA estimate."""
+    return bool(_SCHON_PERCEIVED.search(note) or _LEE_FUNC_DOCUMENTED.search(note))
+
+
+def _schon_9yr_mortality(score: int) -> int:
+    for hi, pct in _SCHON_9YR:
+        if score <= hi:
+            return pct
+    return 89
+
+
+def compute_schonberg_index(note: str, age: Optional[int], sex: str = "male") -> Optional[Dict[str, Any]]:
+    """Schonberg 9-year-mortality index -> estimated 9-year survival %. None when
+    age <65 / unknown or the self-report inputs aren't documented."""
+    if age is None or age < 65 or not note or not _schonberg_data_present(note):
+        return None
+    pts = 0
+    for lo, p in _SCHON_AGE_BANDS:
+        if age >= lo:
+            pts += p
+            break
+    contributors = {}
+    if (sex or "").lower().startswith("m"):
+        pts += 3; contributors["male"] = 3
+    if _SCHON_CURRENT_SMOKER.search(note):
+        pts += 3; contributors["current smoker"] = 3
+    elif _SCHON_FORMER_SMOKER.search(note):
+        pts += 1; contributors["former smoker"] = 1
+    m = _LEE_BMI.search(note)
+    if m:
+        try:
+            if float(m.group(1)) < 25:
+                pts += 2; contributors["BMI<25"] = 2
+        except ValueError:
+            pass
+    for label, rx in (("COPD", _SCHON_COPD), ("diabetes", _LEE_DIABETES), ("cancer", _LEE_CANCER)):
+        if rx.search(note):
+            pts += 2; contributors[label] = 2
+    if _SCHON_HOSP_NONE.search(note):
+        pass
+    elif _SCHON_HOSP_MANY.search(note):
+        pts += 3; contributors["≥2 hospitalizations"] = 3
+    elif _SCHON_HOSP_ONE.search(note):
+        pts += 1; contributors["1 hospitalization"] = 1
+    # perceived health
+    pm = _SCHON_PERCEIVED.search(note)
+    if pm:
+        val = next((g for g in pm.groups() if g), "").lower()
+        if val in ("fair", "poor"):
+            pts += 2; contributors["fair/poor perceived health"] = 2
+        elif val == "good":
+            pts += 1; contributors["good perceived health"] = 1
+    if _SCHON_IADL.search(note):
+        pts += 2; contributors["IADL dependency"] = 2
+    if _difficulty_present(note, _SCHON_DIFF_QUARTER_MILE):
+        pts += 3; contributors["difficulty walking ¼ mile"] = 3
+    mort9 = _schon_9yr_mortality(pts)
+    return {"score": pts, "mortality_9yr_pct": mort9,
+            "survival_9yr_pct": 100 - mort9, "contributors": contributors, "age": age}
+
+
 def format_life_expectancy(le: Optional[Dict[str, Any]]) -> str:
     """One-line clinician-facing summary, or '' if unknown."""
     if not le:
