@@ -96,6 +96,30 @@ _LIFE_LIMITING_FLAGS = (
 )
 
 
+# Subset of the flags above that are TERMINAL (life expectancy typically well
+# under 5 years) — these force VERY_LIMITED regardless of the actuarial number,
+# because a health-quartile multiplier under-weights an end-stage condition.
+_TERMINAL_FLAG_LABELS = frozenset({
+    "metastatic non-prostate malignancy",
+    "advanced non-prostate cancer",
+    "hospice care",
+    "palliative care",
+    "advanced dementia",
+})
+
+# Positive evidence of excellent health — only then do we apply the "healthiest
+# quartile" (x1.5) uplift to the SSA life expectancy. Absence of severe flags
+# alone is NOT enough (over-estimating life expectancy drives over-treatment).
+_EXCELLENT_HEALTH = re.compile(
+    r"no\s+(?:significant\s+|major\s+|other\s+)?(?:comorbidit|chronic\s+"
+    r"(?:medical\s+)?(?:problems|conditions|illness))|excellent\s+health|"
+    r"very\s+active|physically\s+active|robust|no\s+(?:significant\s+)?PMH\b|"
+    r"no\s+past\s+medical\s+history|otherwise\s+healthy|healthy\s+"
+    r"(?:man|male|adult|woman|female)|ECOG\s+(?:performance\s+status\s+)?0\b",
+    re.IGNORECASE,
+)
+
+
 # Sentinel "do NOT use to discourage workup" markers. If any of these
 # appear in the stage-1 note, the patient has prostate cancer already
 # and is not in the screening population — guardrail rules about PSA
@@ -192,25 +216,53 @@ def classify_life_expectancy(stage1_note: str) -> dict:
     flags = _detect_life_limiting(stage1_note)
     n_flags = len(flags)
 
-    if age is None:
+    # Primary driver: NCCN/AUA SSA actuarial life expectancy adjusted by
+    # comorbidity health quartile (replaces the coarse Charlson 10-yr survival).
+    from .life_expectancy import estimate_life_expectancy, parse_sex, format_life_expectancy
+    sex = parse_sex(stage1_note)
+    excellent = bool(_EXCELLENT_HEALTH.search(stage1_note or "")) and n_flags == 0
+    le = estimate_life_expectancy(age, sex, n_flags, excellent_health=excellent)
+
+    if age is None or le is None:
         bucket = "UNKNOWN"
-    elif age >= 85:
-        bucket = "VERY_LIMITED"
-    elif n_flags >= 2:
-        bucket = "VERY_LIMITED"
-    elif age >= 75 and n_flags >= 1:
-        bucket = "VERY_LIMITED"
-    elif age >= 75:
-        bucket = "LIMITED"
-    elif age >= 70 and n_flags >= 1:
-        bucket = "LIMITED"
     else:
-        bucket = "STANDARD"
+        # Bucket from the estimated years: >=10 STANDARD, 5-10 LIMITED, <5 VERY.
+        # (This replaces the old blunt age-only cutoffs — a robust 80-year-old is
+        # no longer auto-LIMITED; the actuarial estimate decides.)
+        if le["years"] >= 10:
+            bucket = "STANDARD"
+        elif le["years"] >= 5:
+            bucket = "LIMITED"
+        else:
+            bucket = "VERY_LIMITED"
+        # Severe-end safety overrides the actuarial quartile can under-weight:
+        #  - a TERMINAL condition (hospice/palliative/metastatic non-prostate
+        #    cancer/advanced dementia) -> VERY_LIMITED at any age;
+        #  - >=2 severe flags (catastrophic burden) -> VERY_LIMITED;
+        #  - a severe flag in an elderly (>=75) patient -> VERY_LIMITED.
+        _terminal = any(f in _TERMINAL_FLAG_LABELS for f in flags)
+        if _terminal or n_flags >= 2 or (n_flags >= 1 and age >= 75):
+            bucket = "VERY_LIMITED"
+
+    # Honest summary: when a severe/terminal override forced VERY_LIMITED but the
+    # actuarial number is >=5 yr, the table under-weights the end-stage condition
+    # — so don't present that inflated figure; state the limiting driver instead.
+    le_summary = format_life_expectancy(le)
+    disp_years = le["years"] if le else None
+    if le and bucket == "VERY_LIMITED" and le["years"] >= 5:
+        drivers = ", ".join(flags) if flags else f"age {age}"
+        le_summary = (f"Life expectancy markedly limited (<5 years) given {drivers}; "
+                      f"the actuarial table under-weights end-stage disease.")
+        disp_years = None
 
     return {
         "bucket": bucket,
         "age": age,
+        "sex": sex,
         "life_limiting_flags": flags,
+        "life_expectancy": le,                       # SSA-based estimate dict (or None)
+        "life_expectancy_years": disp_years,
+        "life_expectancy_summary": le_summary,
         "known_prostate_cancer": _has_known_prostate_cancer(stage1_note),
     }
 
@@ -239,6 +291,12 @@ def build_age_guardrail_block(stage1_note: str) -> str:
         f"Patient age: {age}",
         f"Life-expectancy bucket: {bucket}",
     ]
+    # NCCN/AUA SSA-actuarial + comorbidity-quartile estimate (the survival
+    # predictor — NOT the Charlson index). The LLM may cite this figure.
+    if info.get("life_expectancy_summary"):
+        header.append(info["life_expectancy_summary"]
+                      + " Use this life-expectancy figure (per NCCN/AUA "
+                        "actuarial method), not a Charlson 10-year-survival %.")
     if flags:
         header.append("Life-limiting comorbidity flags detected: "
                       + ", ".join(flags))
