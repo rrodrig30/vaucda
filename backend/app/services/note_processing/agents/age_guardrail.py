@@ -354,8 +354,8 @@ def build_functional_status_section(stage1_note: str) -> str:
         m = _ECOG_RE.search(stage1_note)
         _row("ECOG performance status",
              m.group(1) if m else
-             "___  (0 fully active · 1 restricted strenuous · 2 ambulatory, "
-             "up >50% · 3 limited, in bed >50% · 4 bedbound)")
+             "___  (0 fully active | 1 restricted strenuous | 2 ambulatory, "
+             "up >50% | 3 limited, in bed >50% | 4 bedbound)")
 
     pm = _SCHON_PERCEIVED.search(stage1_note)
     if pm:
@@ -364,18 +364,18 @@ def build_functional_status_section(stage1_note: str) -> str:
         _row("Self-rated health", "___  (Excellent / Very good / Good / Fair / Poor)")
 
     if _SCHON_IADL.search(stage1_note):
-        _row("IADL status", "Dependent in ≥1 IADL")
+        _row("IADL status", "Dependent in >=1 IADL")
     elif _IADL_INDEPENDENT.search(stage1_note):
         _row("IADL status", "Independent")
     else:
-        _row("IADL status", "___  (Independent / Dependent in ≥1 IADL)")
+        _row("IADL status", "___  (Independent / Dependent in >=1 IADL)")
 
     if _difficulty_present(stage1_note, _SCHON_DIFF_QUARTER_MILE):
-        _row("Ambulation (¼ mile)", "Difficulty walking ¼ mile / several blocks")
+        _row("Ambulation (1/4 mile)", "Difficulty walking 1/4 mile / several blocks")
     elif _AMBULATES_OK.search(stage1_note):
-        _row("Ambulation (¼ mile)", "No difficulty")
+        _row("Ambulation (1/4 mile)", "No difficulty")
     else:
-        _row("Ambulation (¼ mile)", "___  (No difficulty / Difficulty walking ¼ mile)")
+        _row("Ambulation (1/4 mile)", "___  (No difficulty / Difficulty walking 1/4 mile)")
 
     body = "\n".join(rows)
     est = info.get("primary_survival_summary")
