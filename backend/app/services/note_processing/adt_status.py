@@ -356,6 +356,11 @@ class ADTStatus:
     # the closing date is shown as "Last dose given" (factual, no over-claim).
     completed_confident: bool = False
     last_dose_display: str = ""
+    # Whether the earliest date is an explicitly-documented START/first-injection
+    # (vs merely the earliest of last-injection/generic dates). Drives the single-
+    # date label so a lone "last Eligard injection 07/2024" is shown as
+    # "Last dose given", not mislabeled "Started".
+    start_is_documented: bool = False
 
 
 _STATUS_DISPLAY = {
@@ -424,27 +429,34 @@ def _collect_injection_dates(text: str) -> List[Tuple[int, int, int, str]]:
     directly adjacent to the date), most-recent last. Rejects lab / PSA /
     appointment dates that merely sit near the word 'injection'."""
     out = []
+    # (regex, kind). kind: 'start' (documented first/started), 'last' (documented
+    # last injection), 'generic' (agent+injection+date, side unknown).
     patterns = (
-        # "<agent> injection [was/in/on] <date>", "last injection <date>"
-        re.compile(r"(?:" + _AGENT_WORD + r")\s+injection\s+"
-                   r"(?:was\s+|in\s+|on\s+|dated\s+)?" + _DATE, re.I),
-        re.compile(r"(?:last|first|next)\s+injection\s+"
-                   r"(?:was\s+|in\s+|on\s+)?" + _DATE, re.I),
+        # "<agent> injection [was/in/on] <date>" — side unknown
+        (re.compile(r"(?:" + _AGENT_WORD + r")\s+injection\s+"
+                    r"(?:was\s+|in\s+|on\s+|dated\s+)?" + _DATE, re.I), "generic"),
+        # "first [agent] injection <date>" -> start ; "last [agent] injection
+        # <date>" -> last. (a "next injection" is a FUTURE dose — skip it.)
+        (re.compile(r"first\s+(?:\w+\s+){0,3}injection\s+(?:was\s+|in\s+|on\s+)?" + _DATE, re.I), "start"),
+        (re.compile(r"last\s+(?:\w+\s+){0,3}injection\s+(?:was\s+|in\s+|on\s+)?" + _DATE, re.I), "last"),
         # "started/initiated ADT/<agent> ... <date>"
-        re.compile(r"(?:start(?:ed)?|initiat\w+|began)\s+(?:on\s+)?"
-                   r"(?:adt|" + _AGENT_WORD + r")[^.\n]{0,18}?" + _DATE, re.I),
+        (re.compile(r"(?:start(?:ed)?|initiat\w+|began)\s+(?:on\s+)?"
+                    r"(?:adt|" + _AGENT_WORD + r")[^.\n]{0,18}?" + _DATE, re.I), "start"),
         # "<date>: started on ADT/<agent>"
-        re.compile(_DATE + r"[:\s\-]{1,3}(?:start\w*|initiat\w+)[^.\n]{0,18}?"
-                   r"(?:adt|" + _AGENT_WORD + r")", re.I),
+        (re.compile(_DATE + r"[:\s\-]{1,3}(?:start\w*|initiat\w+)[^.\n]{0,18}?"
+                    r"(?:adt|" + _AGENT_WORD + r")", re.I), "start"),
+        # "last dose/injection of Eligard ... <date>" / "most recent Eligard <date>"
+        (re.compile(r"(?:last|most\s+recent|prior|previous)\s+(?:dose\s+of\s+)?"
+                    r"(?:" + _AGENT_WORD + r")[^.\n]{0,18}?" + _DATE, re.I), "last"),
     )
-    for rx in patterns:
+    for rx, kind in patterns:
         for m in rx.finditer(text):
             if _DATE_NEG.search(m.group(0)):
                 continue
             g = m.groups()
             d = _parse_date(g[-3], g[-2], g[-1])
             if d:
-                out.append(d)
+                out.append((d[0], d[1], d[2], d[3], kind))
     return out
 
 
@@ -527,6 +539,8 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.interval_display = f"q{st.interval_months} month{'s' if st.interval_months != 1 else ''}"
 
     dates = _collect_injection_dates(raw_text)
+    # A documented START/first-injection date exists (vs only last/generic dates).
+    st.start_is_documented = any(len(d) > 4 and d[4] == "start" for d in dates)
     if dates:
         dates.sort(key=lambda d: (d[0], d[1], d[2]))
         st.start_display = dates[0][3]
@@ -556,7 +570,7 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         _vymd = _parse_visit_ymd(visit_date)
         if _vymd:
             dates.append((_vymd[0], _vymd[1], _vymd[2],
-                          f"{_vymd[1]:02d}/{_vymd[2]:02d}/{_vymd[0]}"))
+                          f"{_vymd[1]:02d}/{_vymd[2]:02d}/{_vymd[0]}", "last"))
     finite_done = bool(_FINITE_COMPLETED_RE.search(raw_text))
     disc_tox = bool(_DISCONTINUED_TOX_RE.search(raw_text))
     new_course = bool(_NEW_COURSE_RE.search(raw_text))
@@ -902,11 +916,17 @@ def render_adt_section(st: ADTStatus) -> str:
             _closing = st.last_dose_display or st.completed_display
             # Single distinct dose date (only one injection recorded): show ONE
             # line, not the same date on both "Started" and "Last dose given".
+            # Label it by what the date actually is: a documented start ->
+            # "Started"; otherwise it's the last/most-recent recorded dose ->
+            # "Last dose given" (so a lone "last Eligard injection 07/2024" isn't
+            # mislabeled as the start).
             if not _closing or _closing == st.start_display:
                 if not st.is_active and st.completed_confident:
                     lines.append(_row("Completed", st.start_display))
-                else:
+                elif st.start_is_documented or st.status == "INITIATING":
                     lines.append(_row("Started", st.start_display))
+                else:
+                    lines.append(_row("Last dose given", st.start_display))
             else:
                 lines.append(_row("Started", st.start_display))
                 _label = "Completed" if (not st.is_active and st.completed_confident) \
