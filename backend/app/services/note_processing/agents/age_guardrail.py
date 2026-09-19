@@ -162,6 +162,19 @@ def _parse_age(stage1_note: str) -> Optional[int]:
     return None
 
 
+_ECOG_RE = re.compile(
+    r"ECOG\s*(?:PS|performance\s+status)?\s*(?:of\s+|[:=]\s*)?([0-4])\b", re.IGNORECASE)
+
+
+def _parse_ecog(stage1_note: str) -> Optional[int]:
+    """ECOG performance status 0-4 from the note (the Functional Status intake
+    documents it for cancer patients), or None if not documented."""
+    if not stage1_note:
+        return None
+    m = _ECOG_RE.search(stage1_note)
+    return int(m.group(1)) if m else None
+
+
 def _detect_life_limiting(stage1_note: str) -> list:
     """Return the list of labels for life-limiting comorbidities found in
     the Stage-1 note."""
@@ -229,6 +242,7 @@ def classify_life_expectancy(stage1_note: str) -> dict:
     # Schonberg 9-yr-mortality index — PREFERRED (closest to 10-yr survival) when
     # its self-report inputs are documented; else the SSA estimate governs.
     schon = compute_schonberg_index(stage1_note, age, sex)
+    ecog = _parse_ecog(stage1_note)
 
     if age is None or le is None:
         bucket = "UNKNOWN"
@@ -266,6 +280,15 @@ def classify_life_expectancy(stage1_note: str) -> dict:
             bucket = "VERY_LIMITED"
         elif lee and lee["score"] >= 10 and bucket == "STANDARD":  # ~42%
             bucket = "LIMITED"
+        # ECOG performance status (captured in the Functional Status intake):
+        # ECOG 3-4 (in bed >50% of waking hours / bedbound) implies markedly
+        # limited survival at any age; ECOG 2 pulls a STANDARD bucket down to
+        # LIMITED. ECOG 0-1 does not downgrade (ECOG 0 already earns the
+        # healthiest-quartile uplift on the SSA estimate).
+        if ecog is not None and ecog >= 3:
+            bucket = "VERY_LIMITED"
+        elif ecog == 2 and bucket == "STANDARD":
+            bucket = "LIMITED"
 
     # Honest summary: when a severe/terminal override forced VERY_LIMITED but the
     # actuarial number is >=5 yr, the table under-weights the end-stage condition
@@ -273,7 +296,10 @@ def classify_life_expectancy(stage1_note: str) -> dict:
     le_summary = format_life_expectancy(le)
     disp_years = le["years"] if le else None
     if le and bucket == "VERY_LIMITED" and le["years"] >= 5:
-        drivers = ", ".join(flags) if flags else f"age {age}"
+        driver_bits = list(flags)
+        if ecog is not None and ecog >= 3 and not any("ECOG" in f for f in flags):
+            driver_bits.append(f"ECOG {ecog}")
+        drivers = ", ".join(driver_bits) if driver_bits else f"age {age}"
         le_summary = (f"Life expectancy markedly limited (<5 years) given {drivers}; "
                       f"the actuarial table under-weights end-stage disease.")
         disp_years = None
@@ -296,11 +322,18 @@ def classify_life_expectancy(stage1_note: str) -> dict:
     # Primary survival figure the synthesis prompt should cite: Schonberg when
     # available (validated 9-yr, closest to 10-yr survival), else the SSA estimate.
     primary_summary = schon_summary or le_summary
+    # ECOG 3-4 isn't an input to Schonberg/SSA but overrides the bucket, so annotate
+    # the figure to keep it consistent with a VERY_LIMITED classification.
+    if ecog is not None and ecog >= 3:
+        primary_summary = ((primary_summary + " ") if primary_summary else "") + \
+            (f"ECOG {ecog} indicates markedly limited performance status; "
+             f"survival correspondingly reduced.")
 
     return {
         "bucket": bucket,
         "age": age,
         "sex": sex,
+        "ecog": ecog,
         "life_limiting_flags": flags,
         "life_expectancy": le,                       # SSA-based estimate dict (or None)
         "life_expectancy_years": disp_years,
@@ -314,7 +347,6 @@ def classify_life_expectancy(stage1_note: str) -> dict:
     }
 
 
-_ECOG_RE = re.compile(r"ECOG\s*(?:PS|performance\s+status)?\s*[:=]?\s*([0-4])\b", re.I)
 _ANY_CANCER_RE = re.compile(
     r"\bcancer\b|carcinoma|malignan|adenocarcinoma|lymphoma|leukemia|sarcoma|"
     r"\bGleason\b|Grade\s+Group", re.IGNORECASE)
@@ -351,9 +383,9 @@ def build_functional_status_section(stage1_note: str) -> str:
         rows.append(f"  {(label + ':').ljust(28)}{value}")
 
     if is_cancer:
-        m = _ECOG_RE.search(stage1_note)
+        _e = _parse_ecog(stage1_note)
         _row("ECOG performance status",
-             m.group(1) if m else
+             str(_e) if _e is not None else
              "___  (0 fully active | 1 restricted strenuous | 2 ambulatory, "
              "up >50% | 3 limited, in bed >50% | 4 bedbound)")
 
