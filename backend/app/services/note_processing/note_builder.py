@@ -1838,6 +1838,18 @@ def assemble_note(**sections) -> str:
     if sections.get("pe"):
         note_parts.append(f"{sections['pe']}\n")
 
+    # Functional status & life-expectancy intake — captures the Schonberg
+    # self-report inputs and prompts ECOG for cancer patients. Deterministic;
+    # built from the note assembled so far (has the Age banner + PMH + ROS + PE).
+    try:
+        from .agents.age_guardrail import build_functional_status_section
+        _fs = build_functional_status_section('\n'.join(note_parts))
+        if _fs:
+            note_parts.append(
+                f"\n{'='*28} FUNCTIONAL STATUS {'='*27}\n{_fs}\n")
+    except Exception as _fe:  # never break note assembly
+        logger.warning(f"Functional-status section skipped: {_fe}")
+
     # Note: Assessment and Plan are NOT included in Stage 1 preliminary note
     # They will be added by the provider during/after the patient visit (Stage 2)
 

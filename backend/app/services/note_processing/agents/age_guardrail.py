@@ -314,6 +314,76 @@ def classify_life_expectancy(stage1_note: str) -> dict:
     }
 
 
+_ECOG_RE = re.compile(r"ECOG\s*(?:PS|performance\s+status)?\s*[:=]?\s*([0-4])\b", re.I)
+_ANY_CANCER_RE = re.compile(
+    r"\bcancer\b|carcinoma|malignan|adenocarcinoma|lymphoma|leukemia|sarcoma|"
+    r"\bGleason\b|Grade\s+Group", re.IGNORECASE)
+_IADL_INDEPENDENT = re.compile(
+    r"independent\s+(?:in|with)\s+(?:all\s+)?(?:IADL|instrumental)", re.IGNORECASE)
+_AMBULATES_OK = re.compile(
+    r"no\s+difficulty\s+walking|ambulat\w*\s+(?:independently|without\s+"
+    r"(?:difficulty|assist)|well)|walks?\s+without\s+(?:difficulty|assist)", re.IGNORECASE)
+
+
+def build_functional_status_section(stage1_note: str) -> str:
+    """Structured intake that (a) captures the Schonberg self-report inputs
+    (perceived health, IADL status, ambulation) and (b) prompts ECOG performance
+    status for cancer patients — so both the life-expectancy estimate and ECOG
+    are documented. Extracted values are shown when present; otherwise a labeled
+    fill-in template prompts the provider. Rendered only when relevant (cancer,
+    age >=65, or functional status already documented)."""
+    if not stage1_note:
+        return ""
+    from .life_expectancy import (_SCHON_PERCEIVED, _SCHON_IADL,
+                                  _SCHON_DIFF_QUARTER_MILE, _LEE_FUNC_DOCUMENTED,
+                                  _difficulty_present)
+    info = classify_life_expectancy(stage1_note)
+    age = info.get("age")
+    is_cancer = bool(_ANY_CANCER_RE.search(stage1_note)) or info.get("known_prostate_cancer")
+    relevant = is_cancer or (age is not None and age >= 65) \
+        or bool(_LEE_FUNC_DOCUMENTED.search(stage1_note))
+    if not relevant:
+        return ""
+
+    rows = []
+
+    def _row(label, value):
+        rows.append(f"  {(label + ':').ljust(28)}{value}")
+
+    if is_cancer:
+        m = _ECOG_RE.search(stage1_note)
+        _row("ECOG performance status",
+             m.group(1) if m else
+             "___  (0 fully active · 1 restricted strenuous · 2 ambulatory, "
+             "up >50% · 3 limited, in bed >50% · 4 bedbound)")
+
+    pm = _SCHON_PERCEIVED.search(stage1_note)
+    if pm:
+        _row("Self-rated health", (next((g for g in pm.groups() if g), "") or "").strip().title())
+    else:
+        _row("Self-rated health", "___  (Excellent / Very good / Good / Fair / Poor)")
+
+    if _SCHON_IADL.search(stage1_note):
+        _row("IADL status", "Dependent in ≥1 IADL")
+    elif _IADL_INDEPENDENT.search(stage1_note):
+        _row("IADL status", "Independent")
+    else:
+        _row("IADL status", "___  (Independent / Dependent in ≥1 IADL)")
+
+    if _difficulty_present(stage1_note, _SCHON_DIFF_QUARTER_MILE):
+        _row("Ambulation (¼ mile)", "Difficulty walking ¼ mile / several blocks")
+    elif _AMBULATES_OK.search(stage1_note):
+        _row("Ambulation (¼ mile)", "No difficulty")
+    else:
+        _row("Ambulation (¼ mile)", "___  (No difficulty / Difficulty walking ¼ mile)")
+
+    body = "\n".join(rows)
+    est = info.get("primary_survival_summary")
+    if est:
+        body += f"\n\n  Estimated survival: {est}"
+    return body
+
+
 def build_age_guardrail_block(stage1_note: str) -> str:
     """Build the deterministic guardrail block to inject into the
     Assessment and Plan agent prompts.
