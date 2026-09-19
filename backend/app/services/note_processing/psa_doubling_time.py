@@ -317,12 +317,49 @@ def render_psadt_table(results: List[PSADTResult]) -> str:
     return "\n".join(out)
 
 
+# A post-RP PSA at/above this is "detectable and rising" but still below the 0.2
+# biochemical-recurrence threshold — worth flagging, not yet worth a PSADT.
+_BCR_DETECTABLE_FLOOR = 0.1
+
+
+def subthreshold_psadt_note(psa_data: str, chart_text: str = "") -> str:
+    """One explanatory line for the post-RADICAL-PROSTATECTOMY patient whose PSA is
+    detectable and rising from a real nadir but has NOT yet reached the 0.2 ng/mL
+    biochemical-recurrence threshold — so a PSADT is intentionally not calculated.
+    Makes the omission explicit (vs looking like missing data). '' otherwise.
+
+    Uses the SAME gates as compute_psadt (post-RP, real nadir) so it can only fire
+    for exactly the patients a PSADT would apply to once they cross 0.2."""
+    if not _had_radical_prostatectomy(chart_text):
+        return ""
+    # If a qualifying (>=0.2) interval exists, the table already covers it.
+    if compute_psadt(psa_data, chart_text):
+        return ""
+    series = _parse_psa(psa_data)
+    tx_dates = _treatment_dates(chart_text)
+    best: Optional[PSADTResult] = None
+    for g in _rising_groups(series):
+        r = _psadt_for_group(g)
+        if (r is not None and _BCR_DETECTABLE_FLOOR <= r.peak_val < _BCR_PSA_THRESHOLD
+                and _is_real_nadir(r.nadir_ymd, r.nadir_val, series, tx_dates)):
+            if best is None or r.peak_val > best.peak_val:
+                best = r
+    if best is None:
+        return ""
+    return (f"PSA detectable and rising post-prostatectomy ({best.peak_val:g} ng/mL) "
+            f"but below the {_BCR_PSA_THRESHOLD:g} ng/mL biochemical-recurrence "
+            f"threshold; PSA doubling time not yet calculated.")
+
+
 def build_psadt_section(psa_data: str, chart_text: str = "") -> str:
     """Gated (VAUCDA_PSADT, default on) rendered PSADT table, or '' if none.
-    chart_text supplies treatment context for treatment-aware nadir detection."""
+    chart_text supplies treatment context for treatment-aware nadir detection.
+    When no >=0.2 interval qualifies, a rising sub-threshold post-RP PSA gets a
+    one-line explanation instead."""
     if os.environ.get("VAUCDA_PSADT", "1") != "1":
         return ""
     try:
-        return render_psadt_table(compute_psadt(psa_data, chart_text))
+        table = render_psadt_table(compute_psadt(psa_data, chart_text))
+        return table if table else subthreshold_psadt_note(psa_data, chart_text)
     except Exception:  # never break note assembly
         return ""
