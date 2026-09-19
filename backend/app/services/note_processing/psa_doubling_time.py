@@ -134,10 +134,26 @@ _PT_HAD_ANCHOR = re.compile(
 _NONRADICAL_OR_HYPO = re.compile(
     r"\bturp\b|\(turp\)|holep|holmium|enucleation|transurethral|simple\s+prostatectomy|"
     r"brother|father|sibling|\bson\b|paternal|maternal|family|uncle|relative|"
+    r"\bdad\b|\bmom\b|grandfather|grandpa|grandmother|grandpa|"      # colloquial family hx
     r"option|choos|interested|includ|discuss|candidate|proceed|consider|"
     r"\bvs\.?\b|versus|declin|recommend|offer|elect|"
     # a treatment-OPTIONS menu lists RP next to other definitive modalities
     r"brachytherap|perineal\s+prostatectomy\b|hormone\s+therapy",
+    re.I)
+
+# HYPOTHETICAL / PREDICTIVE constructions checked in a TIGHT window immediately
+# around the RP phrase — a bare radical-prostatectomy mention that is a
+# conditional ("would be possible"), a genomic-classifier prediction ("risk of
+# adverse pathology at radical prostatectomy", Decipher/Oncotype/GPS), or
+# counseling is NOT a performed surgery and must not license PSADT. Kept tight
+# (adjacent only) so it never suppresses a real, terse "s/p RRP 1996".
+_HYPOTHETICAL_RP = re.compile(
+    r"would\b|could\b|\bpossible\b|potential|adverse\s+pathology|risk\s+of\b|"
+    r"\bGPS\b|decipher|oncotype|prolaris|nomogram|not\s+a\s+candidate|"
+    r"questions?\s+about|counsel|planning\s+(?:for|to)|awaiting|considering|"
+    # nomogram / outcome-prediction tables: "progression-free probability AFTER
+    # radical prostatectomy / 5 YR 88%" is a projected statistic, not a surgery.
+    r"probability|progression[\s-]?free|free[\s-]?survival|\d\s*%",
     re.I)
 # Post-RP biochemical-recurrence PSA threshold.
 _BCR_PSA_THRESHOLD = 0.2
@@ -163,7 +179,8 @@ def _had_radical_prostatectomy(chart: str) -> bool:
     # in a hypothetical/options/menu context (e.g. "radical prostatectomy vs XRT").
     for m in _RP_RE.finditer(chart):
         win = chart[max(0, m.start() - 70):m.end() + 40]
-        if not _NONRADICAL_OR_HYPO.search(win):
+        tight = chart[max(0, m.start() - 45):m.end() + 30]
+        if not _NONRADICAL_OR_HYPO.search(win) and not _HYPOTHETICAL_RP.search(tight):
             return True
     # A bare "prostatectomy" counts ONLY when the patient clearly underwent it
     # (s/p / status-post / underwent anchor nearby) AND it isn't a BPH procedure,
@@ -174,7 +191,9 @@ def _had_radical_prostatectomy(chart: str) -> bool:
         return False
     for m in _RP_BARE.finditer(chart):
         win = chart[max(0, m.start() - 80):m.end() + 40]
-        if _PT_HAD_ANCHOR.search(win) and not _NONRADICAL_OR_HYPO.search(win):
+        tight = chart[max(0, m.start() - 45):m.end() + 30]
+        if (_PT_HAD_ANCHOR.search(win) and not _NONRADICAL_OR_HYPO.search(win)
+                and not _HYPOTHETICAL_RP.search(tight)):
             return True
     return False
 
