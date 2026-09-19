@@ -218,10 +218,13 @@ def classify_life_expectancy(stage1_note: str) -> dict:
 
     # Primary driver: NCCN/AUA SSA actuarial life expectancy adjusted by
     # comorbidity health quartile (replaces the coarse Charlson 10-yr survival).
-    from .life_expectancy import estimate_life_expectancy, parse_sex, format_life_expectancy
+    from .life_expectancy import (estimate_life_expectancy, parse_sex,
+                                   format_life_expectancy, compute_lee_index)
     sex = parse_sex(stage1_note)
     excellent = bool(_EXCELLENT_HEALTH.search(stage1_note or "")) and n_flags == 0
     le = estimate_life_expectancy(age, sex, n_flags, excellent_health=excellent)
+    # Lee 4-yr-mortality index — computed only when functional status is documented.
+    lee = compute_lee_index(stage1_note, age, sex)
 
     if age is None or le is None:
         bucket = "UNKNOWN"
@@ -243,6 +246,14 @@ def classify_life_expectancy(stage1_note: str) -> dict:
         _terminal = any(f in _TERMINAL_FLAG_LABELS for f in flags)
         if _terminal or n_flags >= 2 or (n_flags >= 1 and age >= 75):
             bucket = "VERY_LIMITED"
+        # Lee index is DOWNGRADE-ONLY: a high 4-yr mortality (score >=10 -> >=42%)
+        # reliably means limited life expectancy, so pull the bucket down at least
+        # one level. A low Lee score never upgrades (4-yr mortality can't confirm
+        # 10-yr survival) — the SSA estimate governs the upside.
+        if lee and lee["score"] >= 14:            # ~64% 4-yr mortality
+            bucket = "VERY_LIMITED"
+        elif lee and lee["score"] >= 10 and bucket == "STANDARD":  # ~42%
+            bucket = "LIMITED"
 
     # Honest summary: when a severe/terminal override forced VERY_LIMITED but the
     # actuarial number is >=5 yr, the table under-weights the end-stage condition
@@ -255,6 +266,13 @@ def classify_life_expectancy(stage1_note: str) -> dict:
                       f"the actuarial table under-weights end-stage disease.")
         disp_years = None
 
+    lee_summary = ""
+    if lee:
+        drivers = ", ".join(k for k in lee["contributors"] if k not in ("male",))
+        lee_summary = (f"Lee index {lee['score']} pts (~{lee['mortality_4yr_band']} "
+                       f"4-year mortality"
+                       + (f"; {drivers}" if drivers else "") + ").")
+
     return {
         "bucket": bucket,
         "age": age,
@@ -263,6 +281,8 @@ def classify_life_expectancy(stage1_note: str) -> dict:
         "life_expectancy": le,                       # SSA-based estimate dict (or None)
         "life_expectancy_years": disp_years,
         "life_expectancy_summary": le_summary,
+        "lee_index": lee,                            # Lee 4-yr index dict (or None)
+        "lee_index_summary": lee_summary,
         "known_prostate_cancer": _has_known_prostate_cancer(stage1_note),
     }
 
@@ -297,6 +317,9 @@ def build_age_guardrail_block(stage1_note: str) -> str:
         header.append(info["life_expectancy_summary"]
                       + " Use this life-expectancy figure (per NCCN/AUA "
                         "actuarial method), not a Charlson 10-year-survival %.")
+    if info.get("lee_index_summary"):
+        header.append(info["lee_index_summary"]
+                      + " (Lee index — corroborating validated estimate.)")
     if flags:
         header.append("Life-limiting comorbidity flags detected: "
                       + ", ".join(flags))

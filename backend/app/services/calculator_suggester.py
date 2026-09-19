@@ -146,13 +146,19 @@ class CalculatorSuggester:
             'optional': [],
             'description': 'Surgical complication severity grading'
         },
-        'ccicalculator': {
-            'category': 'surgical',
-            'name': 'Charlson Comorbidity Index',
-            'required': ['age', 'comorbidities'],
-            'optional': [],
-            'description': '10-year mortality prediction'
-        },
+        # Charlson Comorbidity Index RETIRED as a survival predictor — it is a
+        # blunt, off-label instrument for 10-year survival (1987, 1-yr inpatient
+        # mortality, coarse weights). Life expectancy is now estimated by the
+        # NCCN/AUA SSA-actuarial + health-quartile method (life_expectancy.py),
+        # refined by the Schonberg index when functional data is present. Left
+        # here (commented) rather than deleted so the retirement is explicit.
+        # 'ccicalculator': {
+        #     'category': 'surgical',
+        #     'name': 'Charlson Comorbidity Index',
+        #     'required': ['age', 'comorbidities'],
+        #     'optional': [],
+        #     'description': '10-year mortality prediction'
+        # },
         'lifeexpectancycalculator': {
             'category': 'surgical',
             'name': 'Life Expectancy Calculator',

@@ -105,6 +105,107 @@ def parse_sex(note: str) -> str:
     return "male"
 
 
+# ---------------------------------------------------------------------------
+# Lee index (Lee SJ et al., JAMA 2006;295:801-808) — validated 4-year mortality
+# for community-dwelling older adults. Exact published point weights below.
+# Used here as a DOWNGRADE-ONLY refinement: it requires self-reported functional
+# (ADL) status, so it only activates when the chart documents functional status;
+# a high score (high short-term mortality) reliably implies limited life
+# expectancy and lowers the bucket, but a low score never OVER-rides the SSA
+# estimate upward (4-year mortality says nothing definitive about 10-year
+# survival). The Schonberg 9-year index is not implemented: its point table is
+# not published in a citable/extractable form (ePrognosis is a closed calculator)
+# and it additionally needs self-rated health that charts don't capture.
+# ---------------------------------------------------------------------------
+_LEE_AGE_BANDS = ((85, 7), (80, 5), (75, 4), (70, 3), (65, 2), (60, 1))
+_LEE_DIABETES = re.compile(r"\bdiabet|\bT2DM\b|\bDM2\b|type\s*2\s*diabetes", re.I)
+_LEE_CANCER = re.compile(r"\bcancer\b|carcinoma|malignan|adenocarcinoma|lymphoma|leukemia", re.I)
+_LEE_LUNG = re.compile(r"\bCOPD\b|emphysema|chronic\s+bronchitis|pulmonary\s+fibrosis|"
+                       r"interstitial\s+lung|\blung\s+disease\b|\basthma\b", re.I)
+_LEE_CHF = re.compile(r"\bCHF\b|heart\s+failure|\bHFrEF\b|\bHFpEF\b|cardiomyopathy", re.I)
+_LEE_SMOKER = re.compile(r"current\s+smoker|currently\s+smok|active\s+(?:tobacco|smok)|"
+                         r"smokes\s+(?:daily|\d)|\btobacco\s+use\s*[:=]?\s*current", re.I)
+# Functional status is DOCUMENTED (either direction) — the gate for computing Lee.
+_LEE_FUNC_DOCUMENTED = re.compile(
+    r"\bADLs?\b|activities\s+of\s+daily\s+living|ambulat|\bgait\b|mobility|"
+    r"bath(?:e|ing)|dressing|toileting|transfers?\b|walker|wheelchair|\bcane\b|"
+    r"independent\s+(?:in|with)|assistance\s+with|difficulty\s+(?:walking|bathing|standing)|"
+    r"ECOG|performance\s+status|frailty|bed[-\s]?bound|\bfalls?\b|nursing\s+home", re.I)
+# Affirmative functional DIFFICULTY (scores points) — not merely 'independent'.
+# \b anchors keep 'dependent' from matching inside 'inDEPENDENT'; negation is
+# handled separately by _difficulty_present (so 'no difficulty walking' /
+# 'independent in ADLs' don't score).
+_LEE_DIFF_WALK = re.compile(
+    r"\bdifficulty\s+walking|\bunable\s+to\s+walk|\buses?\s+(?:a\s+)?(?:walker|wheelchair|cane)|"
+    r"\bwheelchair[-\s]?bound|\bbed[-\s]?bound|\bbedbound|\blimited\s+mobility|"
+    r"\bgait\s+(?:instability|impair)|\bnon[-\s]?ambulatory", re.I)
+_LEE_DIFF_BATH = re.compile(
+    r"\b(?:assistance|help|difficulty|dependent)\b\s+(?:with\s+|in\s+|for\s+)?"
+    r"(?:bathing|self[-\s]?care|ADLs?)|\brequires?\s+assistance\s+with\s+(?:daily|self)", re.I)
+_LEE_BMI = re.compile(r"\bBMI\s*[:=]?\s*(\d{1,2}(?:\.\d)?)", re.I)
+# Negation immediately before a difficulty phrase -> not a real difficulty.
+_LEE_NEG_BEFORE = re.compile(
+    r"(?:\bno\b|\bnot\b|\bwithout\b|\bdenies\b|\bindependent\b|\bnegative\s+for\b|"
+    r"\bable\s+to\b)[\w\s,]{0,20}$", re.I)
+
+
+def _difficulty_present(note: str, rx: "re.Pattern") -> bool:
+    """True if a functional-difficulty phrase appears and is NOT negated by a
+    preceding 'no/without/independent/denies' within a short window."""
+    for m in rx.finditer(note):
+        if not _LEE_NEG_BEFORE.search(note[max(0, m.start() - 25):m.start()]):
+            return True
+    return False
+
+
+def _lee_age_points(age: int) -> int:
+    for lo, pts in _LEE_AGE_BANDS:
+        if age >= lo:
+            return pts
+    return 0  # <60 (index not validated below 60)
+
+
+def compute_lee_index(note: str, age: Optional[int], sex: str = "male") -> Optional[Dict[str, Any]]:
+    """Lee 4-year-mortality index. Returns None when age is unknown or functional
+    status is not documented (the index needs ADL inputs — defer to SSA then)."""
+    if age is None or not note:
+        return None
+    if not _LEE_FUNC_DOCUMENTED.search(note):
+        return None
+    pts = _lee_age_points(age)
+    contributors = {}
+    if (sex or "").lower().startswith("m"):
+        pts += 2; contributors["male"] = 2
+    for label, rx, p in (("diabetes", _LEE_DIABETES, 1), ("cancer", _LEE_CANCER, 2),
+                         ("lung disease", _LEE_LUNG, 2), ("heart failure", _LEE_CHF, 2),
+                         ("current smoker", _LEE_SMOKER, 2)):
+        if rx.search(note):
+            pts += p; contributors[label] = p
+    m = _LEE_BMI.search(note)
+    if m:
+        try:
+            if float(m.group(1)) < 25:
+                pts += 1; contributors["BMI<25"] = 1
+        except ValueError:
+            pass
+    if _difficulty_present(note, _LEE_DIFF_WALK):
+        pts += 2; contributors["difficulty walking"] = 2
+    if _difficulty_present(note, _LEE_DIFF_BATH):
+        pts += 2; contributors["difficulty bathing"] = 2
+    # 'managing money' / 'pushing large objects' items are not reliably charted;
+    # omitted (0) — this biases the score LOW, consistent with downgrade-only use.
+    if pts <= 5:
+        band, m4 = "<4%", 4
+    elif pts <= 9:
+        band, m4 = "15%", 15
+    elif pts <= 13:
+        band, m4 = "42%", 42
+    else:
+        band, m4 = "64%", 64
+    return {"score": pts, "mortality_4yr_pct": m4, "mortality_4yr_band": band,
+            "contributors": contributors, "age": age}
+
+
 def format_life_expectancy(le: Optional[Dict[str, Any]]) -> str:
     """One-line clinician-facing summary, or '' if unknown."""
     if not le:
