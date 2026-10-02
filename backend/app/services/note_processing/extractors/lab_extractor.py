@@ -330,6 +330,23 @@ def _is_valid_lab_line(line: str) -> bool:
     if re.search(r'\bQ\d{1,2}H\b|\bQ(?:AM|PM|HS|D|OD)\b|\b(?:BID|TID|QID|QHS|QAM|PRN)\b',
                  line_upper):
         return False
+    # Medication-SIG / bowel-prep instruction fragments (wrapped continuation
+    # lines of a med order: "BEFORE PROCEDURE AT 2PM MIX WITH WATER AS DIRECTED ON
+    # LABEL", "MOUTH AS DIRECTED ON DAY BEFORE PROCEDURE AT 1PM,"). They carry
+    # no medication word, only a clock time — which is not a lab value.
+    sig_patterns = [
+        'AS DIRECTED', 'BEFORE PROCEDURE', 'BOWEL PREP', 'BY MOUTH', 'MOUTH ',
+        'MIX WITH', 'ON LABEL', 'PREP INSTRUCTION', 'REFRIGERATE', 'AS INSTRUCTED',
+        'CONTAINERFUL', 'AT BEDTIME', 'WITH FOOD', 'WITH MEALS', 'AS NEEDED',
+    ]
+    for pattern in sig_patterns:
+        if pattern in line_upper:
+            return False
+    # A line whose ONLY numbers are clock times ("AT 1PM, 2PM AND 11PM") is an
+    # instruction, not a result.
+    if re.search(r'\b\d{1,2}\s?(?:AM|PM)\b', line_upper) and \
+            not re.search(r'\d+\.?\d*(?!\s?(?:AM|PM)\b)(?![\d.])', re.sub(r'\b\d{1,2}\s?(?:AM|PM)\b', '', line_upper)):
+        return False
 
     # Multi-column lab-table rows ("PH 5.5 6.0 6.0 5 - 8" from a 3-date
     # URINALYSIS grid; "PROTEIN Negative Negative Negative") mangle into one
