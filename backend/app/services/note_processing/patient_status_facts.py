@@ -1005,7 +1005,8 @@ def extract_patient_status_facts(
         # pathology-headers reason as procedure findings) so copy-forward biopsy
         # events date to their own report, not a nearer non-prostate stamp.
         timeline = extract_clinical_timeline(raw_source_text or raw_for_timeline)
-        current_phase = classify_current_phase(timeline)
+        current_phase = classify_current_phase(
+            timeline, cancer_known=bool(cancer_evidence))
         # current_active_treatments now comes from the AUTHORITATIVE VistA
         # RXOP active-outpatient list (see detect_current_active_treatments).
         # That list is definitive for current meds, so we do NOT post-filter
@@ -1498,12 +1499,21 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
     if facts.asap_present:
         lines.append("")
         lines.append("ASAP_PRESENT: TRUE")
-        lines.append(
-            "  Significance: Atypical small acinar proliferation is a "
-            "SURVEILLANCE indicator, NOT a cancer diagnosis. It does NOT "
-            "authorize the language 'biochemical recurrence', 'salvage', "
-            "'post-treatment', or claims of completed treatment."
-        )
+        if facts.cancer_status in ("PRESENT", "TREATED"):
+            lines.append(
+                "  Significance: a biopsy showed atypical small acinar "
+                "proliferation, but prostate cancer is separately ESTABLISHED "
+                f"(status {facts.cancer_status}). The ASAP is NOT a standalone "
+                "surveillance indicator and carries no biopsy/surveillance "
+                "recommendation of its own."
+            )
+        else:
+            lines.append(
+                "  Significance: Atypical small acinar proliferation is a "
+                "SURVEILLANCE indicator, NOT a cancer diagnosis. It does NOT "
+                "authorize the language 'biochemical recurrence', 'salvage', "
+                "'post-treatment', or claims of completed treatment."
+            )
 
     if facts.inconsistencies:
         lines.append("")
@@ -1539,11 +1549,21 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
             "'Episodic PSA elevation', 'Elevated PSA - workup', "
             "'PSA surveillance with ASAP on prior biopsy'."
         )
-    if facts.asap_present and facts.cancer_status != "PRESENT":
+    if facts.asap_present and facts.cancer_status not in ("PRESENT", "TREATED"):
         lines.append(
             "  - ASAP warrants continued PSA trending and consideration of "
             "repeat or MRI-guided biopsy per AUA. It does NOT warrant "
             "cancer-directed therapy."
+        )
+    elif facts.asap_present:
+        lines.append(
+            "  - ASAP appears on a biopsy, but the patient has an ESTABLISHED "
+            "prostate-cancer diagnosis"
+            + (" that has been TREATED" if facts.cancer_status == "TREATED" else "")
+            + ". The ASAP is subsumed by that diagnosis: do NOT describe it as a "
+            "surveillance indicator, do NOT recommend repeat/MRI-guided biopsy "
+            "for it, and do NOT frame the visit as 'active surveillance' or "
+            "'ongoing evaluation' on its account."
         )
     if not facts.phoenix_applicable:
         lines.append(

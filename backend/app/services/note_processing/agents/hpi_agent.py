@@ -857,16 +857,40 @@ def _reconcile_psa_direction(hpi: str, psa_data: Optional[str]) -> str:
     patterns = [
         (re.compile(r'\brising\s+PSA(?:\s+levels)?\b', re.IGNORECASE),
          "previously elevated PSA, now declining"),
-        (re.compile(r'\belevated\s+PSA(?:\s+levels)?\b(?!\s+in\s+\d{4})',
+        # (?<!previously ) keeps this from re-matching inside the text the
+        # first pattern just produced ("previously previously elevated PSA,
+        # now declining, now declining").
+        (re.compile(r'(?<!previously )\belevated\s+PSA(?:\s+levels)?\b(?!\s+in\s+\d{4})(?!,\s+now\s+declining)',
                     re.IGNORECASE),
          "previously elevated PSA, now declining"),
         (re.compile(r'\bcurrently\s+undergoing\s+evaluation\s+for\s+new\s+disease\b',
                     re.IGNORECASE),
          "now on PSA surveillance following normalization"),
     ]
+    # Only CURRENT-trajectory framings are rewritten. A HISTORICAL 'elevated
+    # PSA' — the one that prompted the diagnostic biopsy ("initially noted to
+    # have an elevated PSA, with a biopsy on April 12, 2019 ...") — is a true
+    # statement of past history; rewriting it to 'previously elevated PSA, now
+    # declining' erases the diagnosis story and reads as if the post-treatment
+    # PSA decline were an unexplained trend rather than a treatment response.
+    _hist_cue = re.compile(
+        r"\b(?:19|20)\d{2}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d|"
+        r"\binitially\b|\bhistory\s+of\b|\bpresented\s+with\b|\bnoted\s+to\s+have\b|"
+        r"\bfound\s+to\s+have\b|\bprompt(?:ed|ing)\b|\bled\s+to\b|\bworkup\s+for\b|"
+        r"\bunderwent\b|\bbiops", re.IGNORECASE)
+
+    def _sentence_bounds(text: str, pos: int):
+        s = max(text.rfind(". ", 0, pos), text.rfind("\n", 0, pos))
+        e_candidates = [i for i in (text.find(". ", pos), text.find("\n", pos)) if i != -1]
+        e = min(e_candidates) if e_candidates else len(text)
+        return s + 1, e
+
     out = hpi
     for pat, repl in patterns:
-        out = pat.sub(repl, out)
+        def _sub(m, _repl=repl):
+            s, e = _sentence_bounds(out, m.start())
+            return m.group(0) if _hist_cue.search(out[s:e]) else _repl
+        out = pat.sub(_sub, out)
     return out
 
 

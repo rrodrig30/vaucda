@@ -232,12 +232,20 @@ def _ground_truth_block(gt: GroundTruth) -> str:
             lines.append(f"  Grade Groups in pathology: {sorted(gt.grade_groups)}")
         lines.append("")
     if gt.medications:
-        lines.append("MEDICATIONS in MEDICATIONS section (only meds in this list may "
-                     "appear in current_regimen):")
-        for m in sorted(gt.medications)[:20]:
-            lines.append(f"  - {m}")
-        if len(gt.medications) > 20:
-            lines.append(f"  ... and {len(gt.medications) - 20} more")
+        # Only UROLOGIC agents are offered for current_regimen. The full active
+        # list belongs to the MEDICATIONS section; naming a statin / anti-
+        # hypertensive here produced "He is currently on atorvastatin" in the HPI.
+        _uro = sorted(m for m in gt.medications
+                      if any(m.startswith(u) or u.startswith(m) for u in UROLOGIC_MEDS))
+        if _uro:
+            lines.append("UROLOGIC medications on the active list (ONLY these may appear "
+                         "in current_regimen; never name non-urologic drugs such as "
+                         "statins, antihypertensives, or anticoagulants):")
+            for m in _uro[:20]:
+                lines.append(f"  - {m}")
+        else:
+            lines.append("No UROLOGIC medications on the active list — current_regimen "
+                         "must be empty (do not list non-urologic drugs).")
         lines.append("")
     if gt.procedure_dates:
         lines.append("PROCEDURE EVENTS (date → types):")

@@ -1123,7 +1123,10 @@ def build_urology_note(
             print(f"      HPI v2: {'fallback' if result.used_fallback else 'accepted'} "
                   f"after {len(result.attempts)} attempt(s)"
                   + (f" — {result.fallback_reason}" if result.used_fallback else ""))
-            return result.hpi_text
+            # Same deterministic backstop the v1 chain applies: a sentence that
+            # names only non-urologic meds / labs / findings is not HPI content.
+            from .agents.hpi_agent import _strip_nonurologic_sentences as _strip_nonuro
+            return _strip_nonuro(result.hpi_text)
         except Exception as _e:
             logger.warning(f"HPI v2 path failed (using v1): {_e}")
             return v1_text

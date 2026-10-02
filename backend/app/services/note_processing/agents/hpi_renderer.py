@@ -311,8 +311,19 @@ def render_procedure_findings(findings: Optional[List[Dict]]) -> str:
     return " ".join(sentences)
 
 
+def _is_urologic_med(name: str) -> bool:
+    from .hpi_schema import UROLOGIC_MEDS
+    root = (name or "").strip().lower().split()[0] if (name or "").strip() else ""
+    return bool(root) and any(root.startswith(u) or u.startswith(root) for u in UROLOGIC_MEDS)
+
+
 def render_current_regimen(regimen: Optional[List[Dict]], sex: str) -> str:
-    """List of current urologic medications."""
+    """List of current urologic medications. Non-urologic agents the LLM
+    slipped in (statins, antihypertensives) are dropped — they belong to the
+    MEDICATIONS section, not the HPI."""
+    if not regimen:
+        return ""
+    regimen = [it for it in regimen if _is_urologic_med(it.get("medication", ""))]
     if not regimen:
         return ""
     p = _pron(sex)

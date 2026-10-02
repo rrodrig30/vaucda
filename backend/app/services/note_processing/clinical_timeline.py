@@ -362,6 +362,12 @@ _IMAGING_MODALITIES = (
 # ---------------------------------------------------------------------------
 # Helper: scan for a treatment word with completion verb / restart trigger
 # ---------------------------------------------------------------------------
+_TX_FALSE_CONTEXT_RE = re.compile(
+    r"[\s\-]*(?:cystitis|proctitis|chang|oncolog|induced|injury|dermatitis|enteritis|"
+    r"exposure|precaution|toxicit|side[\s\-]effect|effects?\b|necrosis|fibrosis|"
+    r"safety)", re.IGNORECASE)
+
+
 def _find_treatment_events(
     text: str, trigger_re: re.Pattern, event_type: str,
 ) -> List[TimelineEvent]:
@@ -375,6 +381,12 @@ def _find_treatment_events(
     for tx_pattern, tx_display in _TX_VOCAB:
         for m in re.finditer(tx_pattern, text, re.IGNORECASE):
             if _preceded_by_negation(text, m.start()):
+                continue
+            # "radiation cystitis" / "radiation changes" / "radiation oncology"
+            # name a complication, finding, or service — not a course of therapy
+            # ("underwent w/up for hematuria attributed to radiation cystitis"
+            # otherwise reads as 'started radiation' dated to the hematuria).
+            if _TX_FALSE_CONTEXT_RE.match(text, m.end()):
                 continue
             # Trigger may appear either BEFORE the modality
             # ("Restarted ADT") or AFTER it ("ADT was restarted"). Check
@@ -1473,15 +1485,25 @@ PHASES = (
 def classify_current_phase(
     timeline: List[TimelineEvent],
     today: Optional[date] = None,
+    cancer_known: bool = False,
 ) -> str:
-    """Deterministic state-machine over the timeline."""
+    """Deterministic state-machine over the timeline.
+
+    `cancer_known`: the caller's own cancer determination (PMH / pathology /
+    PSH evidence). Without it, a chart whose only in-timeline cancer evidence
+    is a biopsy PROCEDURE detail ("prostate biopsy : Gleason 3+3") plus a
+    COMPLETED radiation event was classified TREATMENT_NAIVE — contradicting
+    the facts block's own TREATED status and steering the HPI toward
+    'evaluation' framing for a patient in post-treatment surveillance.
+    """
     today = today or date.today()
     if not timeline:
         return "UNCERTAIN"
 
-    has_cancer = any(e.event_type == "DIAGNOSIS" for e in timeline) or any(
-        e.event_type == "PATHOLOGY"
-        and ("gleason" in e.detail.lower() or "adenocarcinoma" in e.detail.lower())
+    _cancer_words = ("gleason", "adenocarcinoma", "grade group")
+    has_cancer = cancer_known or any(e.event_type == "DIAGNOSIS" for e in timeline) or any(
+        e.event_type in ("PATHOLOGY", "PROCEDURE")
+        and any(w in (e.detail or "").lower() for w in _cancer_words)
         for e in timeline
     )
     if not has_cancer:
