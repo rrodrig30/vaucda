@@ -99,6 +99,10 @@ def _scan_sentences(text: str, pattern, max_n: int = 4) -> str:
         s = re.sub(r"\s+", " ", sent).strip()
         if not s or len(s) < 8 or not pattern.search(s):
             continue
+        # Surgery-booking / export boilerplate is not a presenting symptom.
+        if re.search(r"Pre-op\s+Diag|Post-op\s+Diag|Operative\s+Proc|Prin\s+Anest|"
+                     r"VISTA\s+EXPORT|Facility:", s, re.I):
+            continue
         key = s.lower()[:80]
         if key in seen:
             continue
@@ -232,27 +236,193 @@ def _filter_imaging_recent(imaging: str, ref_year: int, years: int = 2) -> str:
     return "\n".join(kept).strip()
 
 
+# ---- procedure history --------------------------------------------------------
+# TURBT (bladder) vs TURP / other OUTLET procedures (prostate) are different
+# operations; a "transurethral resection" match alone conflated them and sent a
+# scheduled TURP to the model as a PRIOR TURBT.
+_TURBT_RE = re.compile(
+    r"\bTURBT\b|transurethral\s+resection\s+of\s+(?:the\s+)?bladder(?:\s+tumou?r)?", re.I)
+_TURP_RE = re.compile(
+    r"\bTURP\b|transurethral\s+resection\s+of\s+(?:the\s+)?prostate|\bHoLEP\b|\bPVP\b|"
+    r"photoselective\s+vaporization|\bUroLift\b|\bRezum\b|simple\s+prostatectomy|"
+    r"aquablation|\bTUIP\b", re.I)
+# Language that means the procedure is proposed / booked / discussed — NOT done.
+_PLANNED_RE = re.compile(
+    r"\b(?:recommend\w*|plan(?:ned|s|ning)?\s+(?:for|to|on)|scheduled|requested|"
+    r"will\s+(?:undergo|proceed|schedule|need|be)|candidate\s+for|consider\w*|"
+    r"discuss\w*|interested\s+in|offer\w*|pending|upcoming|to\s+be\s+performed|"
+    r"book\w*|prior\s+to\s+(?:planned\s+)?|preop\w*|pre-op\w*)\b", re.I)
+# One VistA "SR - Surgery Rpt" entry: date / Status / Operative Proc(s).
+_SR_ENTRY_RE = re.compile(
+    r"^(\d{1,2}/\d{1,2}/\d{4})[ \t]+\S[^\n]*\n[ \t]*Status:[ \t]*\(?([A-Za-z][A-Za-z \-]*?)\)?"
+    r"[ \t]{2,}[\s\S]{0,500}?Operative\s+Proc\(s\):[ \t]*([^\n]+(?:\n[ \t]{12,}[^\n]+)*)",
+    re.M)
+_DATE_TOKEN_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b|" + _MONTHS_RE + r"\.?\s+(?:\d{1,2},?\s+)?\d{4}")
+
+
+def _surgery_report_entries(text: str):
+    """[(date, status_lower, procedure)] from the VistA surgery-report block."""
+    out = []
+    for m in _SR_ENTRY_RE.finditer(text or ""):
+        proc = re.sub(r"\s+", " ", m.group(3)).strip()
+        out.append((m.group(1), m.group(2).strip().lower(), proc))
+    return out
+
+
+def _is_planned_status(status: str) -> bool:
+    return bool(re.search(r"request|schedul|pending|planned|not\s+started|book", status or ""))
+
+
+def _is_completed_status(status: str) -> bool:
+    return "complet" in (status or "")
+
+
+def _planned_procedures(text: str):
+    """Booked / requested operations that have NOT been performed: [(date, proc, status)]."""
+    return [(d, proc, st) for d, st, proc in _surgery_report_entries(text)
+            if _is_planned_status(st)]
+
+
+def _completed_outlet_procedures(text: str):
+    """Prior COMPLETED prostate/outlet procedures (TURP, HoLEP, ...): [(date, detail)]."""
+    rows = {}
+    for d, st, proc in _surgery_report_entries(text):
+        if _is_completed_status(st) and _TURP_RE.search(proc):
+            rows[d] = (d, proc)
+    for sent in re.split(r"(?<=[.\n])\s+", text or ""):
+        s = re.sub(r"\s+", " ", sent).strip()
+        if not _TURP_RE.search(s) or _PLANNED_RE.search(s):
+            continue
+        if not re.search(r"\bs/p\b|status[\s-]post|history\s+of|underwent|\bprior\b|"
+                         r"\bprevious\b|\bhad\s+a\b|\bpost[\s-]?TURP", s, re.I):
+            continue
+        dm = _DATE_TOKEN_RE.search(s)
+        disp = dm.group(0) if dm else "(undated)"
+        rows.setdefault(disp, (disp, s[:160]))
+    return [rows[k] for k in sorted(rows)]
+
+
+def _bladder_pathology_summary(text: str) -> str:
+    """The most recent bladder specimen diagnosis — structured report lines
+    ('A. BLADDER, TRIGONE, BIOPSY: - ... - NEGATIVE FOR MALIGNANCY.') or the
+    narrative 'TURBT ... with pathology showing ...'. '' when none."""
+    # The specimen's diagnosis lines run to the next BLANK line; wrapped lines
+    # may continue unindented ("PRIOR\n          HEMORRHAGE."), so take every
+    # non-blank line and join at the '-' bullets.
+    m = re.search(
+        r"(?im)^[ \t]*[A-Z]\.[ \t]*(?:URINARY\s+)?BLADDER[^\n]*(?:BIOPSY|TURBT|RESECTION|TUMOU?R|"
+        r"LESION)[^\n]*:[ \t]*\n((?:[^\n]*\S[^\n]*\n?){1,12}?)(?:\n[ \t]*\n|\Z)", text or "")
+    if m:
+        body = re.sub(r"\s+", " ", m.group(1)).strip()
+        parts = [p.strip() for p in re.split(r"\s*(?:^|\s)-\s+", body) if p.strip()]
+        return "; ".join(parts)[:260]
+    m = re.search(r"TURBT[^.\n]{0,80}?patholog\w*\s+(?:showing|showed|revealed|demonstrat\w+|"
+                  r"consistent\s+with|:)\s*([^.\n]{5,160})", text or "", re.I)
+    return m.group(1).strip() if m else ""
+
+
+_MALIGNANT_TERM_RE = re.compile(
+    r"carcinoma|malignant\b|\bNMIBC\b|\bMIBC\b|carcinoma\s+in\s+situ|\bCIS\b|"
+    r"high[-\s]grade|low[-\s]grade|papillary\s+urothelial|urothelial\s+neoplasm|"
+    r"\bcancer\b", re.I)
+_NEGATED_MALIG_RE = re.compile(
+    r"(?:negative\s+for|no\s+evidence\s+of|no\s+|without|free\s+of)\s+(?:\w+\s+){0,3}"
+    r"(?:malignan\w*|carcinoma|cancer|dysplasia|neoplas\w*|atypia)", re.I)
+
+
+def _bladder_malignancy_documented(text: str, patient_facts) -> bool:
+    """True only when bladder pathology (or a facts-layer bladder diagnosis)
+    asserts malignancy. 'NEGATIVE FOR MALIGNANCY' / 'reactive changes' is NOT."""
+    for d in (getattr(patient_facts, "other_gu_diagnoses", None) or []):
+        if "bladder" in (getattr(d, "organ", "") or "").lower() and \
+                "malignant" in (getattr(d, "category", "") or "").lower():
+            return True
+    blob = _NEGATED_MALIG_RE.sub(" ", _bladder_pathology_summary(text))
+    return bool(_MALIGNANT_TERM_RE.search(blob))
+
+
 def _turbt_history(patient_facts, text: str):
-    """Return prior TURBTs as (date_display, finding), oldest -> most recent
-    last. Prefers the deterministic clinical timeline; falls back to a text
-    scan of sentences mentioning TURBT."""
+    """Prior COMPLETED TURBTs as (date_display, finding), oldest -> most recent
+    last, with the bladder pathology result attached to the most recent one.
+    A recommended / planned TURBT and any TURP (prostate) are excluded."""
     rows = {}
     events = getattr(patient_facts, "clinical_timeline", None) or []
     for e in events:
         blob = f"{getattr(e, 'modality', '')} {getattr(e, 'detail', '')} {getattr(e, 'source_quote', '')}"
-        if re.search(r"\bTURBT\b|transurethral\s+resection", blob, re.IGNORECASE):
-            key = getattr(e, "date_key", "") or getattr(e, "date_display", "")
-            rows[key] = (getattr(e, "date_display", "") or "(undated)",
-                         (getattr(e, "detail", "") or getattr(e, "modality", "")).strip())
+        if not _TURBT_RE.search(blob) or _PLANNED_RE.search(blob):
+            continue
+        key = getattr(e, "date_key", "") or getattr(e, "date_display", "")
+        rows[key] = (getattr(e, "date_display", "") or "(undated)",
+                     (getattr(e, "detail", "") or getattr(e, "modality", "")).strip())
+    for d, st, proc in _surgery_report_entries(text):
+        if _is_completed_status(st) and _TURBT_RE.search(proc):
+            rows.setdefault(d, (d, proc))
     if not rows:
-        for sent in re.split(r"(?<=[.\n])\s+", text):
-            if not re.search(r"\bTURBT\b|transurethral\s+resection", sent, re.IGNORECASE):
+        for sent in re.split(r"(?<=[.\n])\s+", text or ""):
+            s = re.sub(r"\s+", " ", sent).strip()
+            if not _TURBT_RE.search(s) or _PLANNED_RE.search(s):
                 continue
-            dm = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", sent) or \
-                re.search(rf"{_MONTHS_RE}\.?\s+\d{{4}}", sent)
+            dm = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", s) or \
+                re.search(rf"{_MONTHS_RE}\.?\s+\d{{4}}", s)
             disp = dm.group(0) if dm else "(undated)"
-            rows[disp] = (disp, re.sub(r"\s+", " ", sent).strip()[:160])
-    return [rows[k] for k in sorted(rows.keys())]
+            rows.setdefault(disp, (disp, s[:160]))
+    out = [rows[k] for k in sorted(rows.keys())]
+    summary = _bladder_pathology_summary(text)
+    if out and summary:
+        d, finding = out[-1]
+        out[-1] = (d, f"{finding} — pathology: {summary}")
+    return out
+
+
+# ---- output guards --------------------------------------------------------------
+# The model is told the rules, but a claim it still makes without support is
+# removed deterministically: bladder malignancy without malignant pathology, and a
+# "prior TURP" / post-TURP anatomy without a completed TURP on record.
+_BLADDER_CA_CLAIM_RE = re.compile(
+    r"(?:bladder|urothelial|transitional[\s-]cell)\s+(?:cell\s+)?(?:cancer|carcinoma|"
+    r"malignancy|neoplasm)|\bNMIBC\b|\bMIBC\b|carcinoma\s+in\s+situ|\bCIS\b|"
+    r"papillary\s+urothelial|non-?invasive\s+(?:papillary\s+)?urothelial|"
+    r"intravesical\s+(?:BCG|chemotherapy|gemcitabine|mitomycin)|\bBCG\b", re.I)
+_CA_NEGATED_RE = re.compile(
+    r"(?:no\s+(?:evidence|history|sign)s?\s+of|negative\s+for|without\s+(?:evidence\s+of\s+)?|"
+    r"rule\s+out|r/o|to\s+exclude)\s+(?:\w+\s+){0,3}(?:cancer|carcinoma|malignan|urothelial|"
+    r"NMIBC|CIS)", re.I)
+_PRIOR_TURP_CLAIM_RE = re.compile(
+    r"(?:prior|previous|history\s+of|\bs/p\b|status[\s-]post|post[\s-]?)[^.\n]{0,25}?"
+    r"(?:\bTURP\b|transurethral\s+resection\s+of\s+(?:the\s+)?prostate)|post-?TURP|"
+    r"\bTURP\s+(?:defect|fossa|cavity|bed)|prostatic\s+fossa|resected\s+prostat", re.I)
+
+
+def _drop_sentences(txt: str, claim_rx, allow_rx=None) -> str:
+    if not txt:
+        return txt
+    kept = []
+    for sent in re.split(r"(?<=[.!?])\s+", txt.strip()):
+        if claim_rx.search(sent) and not (allow_rx and allow_rx.search(sent)):
+            continue
+        kept.append(sent)
+    return " ".join(kept).strip()
+
+
+def _fallback_indication(planned, turbts, gu, malignant: bool) -> str:
+    if planned:
+        d, proc, _ = planned[0]
+        short = "TURP" if _TURP_RE.search(proc) else proc.split("(")[0].strip()
+        return (f"Pre-procedural cystoscopic evaluation of the lower urinary tract prior to "
+                f"planned {short} ({d}).")
+    if turbts:
+        d, finding = turbts[-1]
+        path = finding.split("— pathology:")[-1].strip() if "— pathology:" in finding else ""
+        if path and not malignant and re.search(r"negative\s+for\s+malignan|benign|reactive", path, re.I):
+            path = "benign, negative for malignancy"
+        tail = (" (pathology: " + path + ")") if path else ""
+        if malignant:
+            return f"Surveillance cystoscopy following TURBT on {d}{tail}."
+        return (f"Surveillance cystoscopy following TURBT on {d} for a bladder lesion of "
+                f"uncertain significance{tail}.")
+    if gu:
+        return f"Cystoscopic evaluation for {gu[0].name}."
+    return "Cystoscopic evaluation of the lower urinary tract."
 
 
 def _surveillance_table() -> str:
@@ -321,9 +491,18 @@ def build_cystoscopy_note(
     except Exception:
         pathology = ""
 
-    # Prior TURBTs (dates + findings), oldest first / most recent last.
+    # Prior COMPLETED TURBTs (dates + findings + pathology), oldest first / most
+    # recent last; planned bookings and prostate/outlet procedures kept separate.
     turbts = _turbt_history(patient_facts, text)
     turbt_ctx = "\n".join(f"- {d}: {finding}" for d, finding in turbts) if turbts else "(none documented)"
+    planned = _planned_procedures(clinical_text) or _planned_procedures(text)
+    planned_ctx = "\n".join(f"- {proc} — booked for {d} (status: {st}; NOT yet performed)"
+                            for d, proc, st in planned) if planned else "(none)"
+    outlet_done = _completed_outlet_procedures(clinical_text) or _completed_outlet_procedures(text)
+    outlet_ctx = "\n".join(f"- {d}: {detail}" for d, detail in outlet_done) if outlet_done else "(none documented)"
+    bladder_path = _bladder_pathology_summary(clinical_text) or _bladder_pathology_summary(text)
+    bladder_malignant = _bladder_malignancy_documented(clinical_text, patient_facts) or \
+        _bladder_malignancy_documented(text, patient_facts)
 
     # Known GU diagnoses give the LLM the indication anchor (bladder tumor,
     # hematuria workup, renal mass, etc.).
@@ -346,7 +525,10 @@ def build_cystoscopy_note(
     ctx = (
         f"PATIENT SEX: {sex or 'unknown'}\n"
         f"KNOWN UROLOGIC DIAGNOSES: {dx_summary}\n"
-        f"PRIOR TURBTs (oldest first, most recent last):\n{turbt_ctx}\n\n"
+        f"PRIOR COMPLETED TURBTs (oldest first, most recent last):\n{turbt_ctx}\n"
+        f"BLADDER PATHOLOGY (most recent specimen): {bladder_path or '(none on file)'}\n\n"
+        f"PRIOR COMPLETED PROSTATE / OUTLET PROCEDURES (TURP etc.):\n{outlet_ctx}\n\n"
+        f"PLANNED / SCHEDULED PROCEDURES — booked but NOT performed:\n{planned_ctx}\n\n"
         f"PRESENTING SYMPTOMS / REASON:\n{symptoms or '(none stated)'}\n\n"
         f"TOBACCO / RISK FACTORS:\n{tobacco or '(none stated)'}\n\n"
         f"ANTICOAGULATION / ANTIPLATELET (and any hold):\n{anticoag or '(none stated)'}\n\n"
@@ -370,6 +552,15 @@ def build_cystoscopy_note(
         "the absence of contraindications, and the anticoagulation status "
         "including when it was held (e.g. 'on apixaban, held 3 days ago'). "
         "State only what the data supports.\n"
+        "RULES: (1) A procedure under PLANNED / SCHEDULED has NOT happened — never "
+        "call it prior history or describe post-operative anatomy; today's "
+        "cystoscopy is typically the pre-operative evaluation for it, so say so "
+        "with its booked date. (2) Describe a TURP / outlet procedure as prior ONLY "
+        "if it is listed under PRIOR COMPLETED PROSTATE / OUTLET PROCEDURES. (3) Use "
+        "cancer / carcinoma / malignancy wording for the bladder ONLY when BLADDER "
+        "PATHOLOGY documents a malignant diagnosis; a benign / reactive / "
+        "negative-for-malignancy result must be stated as benign, and an "
+        "unbiopsied lesion is 'a lesion of uncertain significance'.\n"
         "INDICATION: a one-line indication for the cystoscopy.\n"
         "FINDINGS: the anticipated cystoscopic findings of the urethra and "
         "bladder based on the indication, imaging, and PRIOR TURBT findings "
@@ -389,9 +580,17 @@ def build_cystoscopy_note(
         llm_raw = ""
 
     sections = _parse_llm_sections(llm_raw)
+    # Deterministic guards on the model's prose (see _BLADDER_CA_CLAIM_RE /
+    # _PRIOR_TURP_CLAIM_RE): drop any sentence asserting bladder malignancy when
+    # the pathology does not, and any prior-TURP / post-TURP-anatomy sentence when
+    # no completed TURP is on record (a booked TURP is not history).
+    for k in ("HPI", "INDICATION", "FINDINGS", "ASSESSMENT", "PLAN"):
+        if not bladder_malignant:
+            sections[k] = _drop_sentences(sections[k], _BLADDER_CA_CLAIM_RE, _CA_NEGATED_RE)
+        if not outlet_done:
+            sections[k] = _drop_sentences(sections[k], _PRIOR_TURP_CLAIM_RE)
     cysto_hpi = sections["HPI"]
-    indication = sections["INDICATION"] or (
-        gu[0].name if gu else "Cystoscopic evaluation of the lower urinary tract")
+    indication = sections["INDICATION"] or _fallback_indication(planned, turbts, gu, bladder_malignant)
 
     # Apply the same active-voice enforcement clinic notes get: no negative
     # recommendations ("no biopsy required"), no ungrounded if-then, no vague
