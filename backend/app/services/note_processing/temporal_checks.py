@@ -117,6 +117,47 @@ def psa_section(note: str) -> str:
     return m.group(1) if m else ""
 
 
+# A sentence that presents the PSA as a PRESENT state ("has remained low and
+# stable", "is", "currently", "continues") while quoting an OLDER documented
+# value — "His PSA has remained low and stable, recorded at 0.55 ng/mL on
+# 03/30/2023" when the latest PSA is 0.12 (Sep 2026).
+_PSA_PRESENT_STATE = re.compile(
+    r"\bPSA\b[^.\n]{0,60}?\b(?:remain\w*|is|are|currently|now|today|continues?|"
+    r"stable|low|undetectable|controlled|recorded\s+at|measured\s+at)\b", re.IGNORECASE)
+_NG_ML_VALUE = re.compile(r"(\d+\.\d+)\s*ng\s*/\s*m[lL]")
+
+
+def _fmt_dk(dk: str) -> str:
+    try:
+        y, m, d = dk.split("-")
+        mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+               "Nov", "Dec"][int(m) - 1]
+        return f"{mon} {int(d):02d}, {y}"
+    except (ValueError, IndexError):
+        return dk
+
+
+def stale_current_psa(text: str, psa_data: str) -> Optional[Tuple[float, float, str]]:
+    """(stale_value, latest_value, latest_date_display) when a present-state PSA
+    sentence quotes a documented but NON-latest PSA and never names the latest;
+    else None."""
+    pairs = psa_pairs(psa_data)
+    if len(pairs) < 2:
+        return None
+    latest_dk, latest = max(pairs, key=lambda p: p[0])
+    documented = [v for _, v in pairs]
+    for sent in sentences(norm(text)):
+        if not _PSA_PRESENT_STATE.search(sent):
+            continue
+        vals = [float(v) for v in _NG_ML_VALUE.findall(sent)]
+        if not vals or any(abs(v - latest) <= 0.011 for v in vals):
+            continue
+        stale = [v for v in vals if any(abs(v - d) <= 0.011 for d in documented)]
+        if stale:
+            return stale[0], latest, _fmt_dk(latest_dk)
+    return None
+
+
 def latest_wins_violations(text: str, facts: Any, psa_data: str) -> List[str]:
     viol: List[str] = []
     pairs = psa_pairs(psa_data)
@@ -128,6 +169,12 @@ def latest_wins_violations(text: str, facts: Any, psa_data: str) -> List[str]:
         if m and abs(float(m.group(1)) - latest) > 0.011:
             viol.append(f"the text calls {m.group(1)} the most-recent PSA, but the "
                         f"LATEST documented PSA is {latest:g} — the newest result wins")
+        stale = stale_current_psa(text, psa_data)
+        if stale:
+            viol.append(f"the text presents PSA {stale[0]:g} ng/mL as the patient's current "
+                        f"status, but that is an OLDER result — the LATEST documented PSA is "
+                        f"{stale[1]:g} ng/mL ({stale[2]}); state the latest value and date as "
+                        f"the current status (older values may be cited only as history)")
     staging = [e for e in (getattr(facts, "clinical_timeline", None) or [])
                if getattr(e, "event_type", "") == "STAGING_DECISION" and getattr(e, "date_key", "")]
     if staging:
@@ -368,6 +415,13 @@ def finalize_temporal(
         residual = _viol(text)
         if residual:
             logger.info(f"[TEMPORAL:{section}] residual: {residual}")
+        # Deterministic backstop: if the repair still presents a stale PSA as the
+        # current status, state the latest documented value explicitly so the
+        # reader is never left with the old number as the only "current" one.
+        stale = stale_current_psa(text, psa_data or "")
+        if stale:
+            text = text.rstrip() + (f" The most recent PSA is {stale[1]:g} ng/mL "
+                                    f"({stale[2]}).")
     except Exception as e:  # noqa: BLE001
         logger.warning(f"finalize_temporal({section}) error: {e}")
     return text
