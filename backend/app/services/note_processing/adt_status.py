@@ -294,10 +294,20 @@ _SCHED_DATE_RE = re.compile(
     r"(\d{1,2})[/\-](?:(\d{1,2})[/\-])?(\d{2,4})", re.I)
 
 _DATE = r"(\d{1,2})[/\-](?:(\d{1,2})[/\-])?(\d{2,4})"
+# Month-name date — "January 8, 2026", "Jan 04, 2023", "Jan 2023". Same three
+# positional groups as _DATE (month, optional day, year) so one parser serves
+# both; the month alternation is explicit so "Decreased 2023" can't read as Dec.
+_MON_NAME = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+             r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+             r"dec(?:ember)?")
+_DATE_MN = r"\b(" + _MON_NAME + r")\.?\s+(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(\d{4})\b"
 # Reject a date that is really a lab / appointment / PSA / entry date, not an
 # injection date, when it sits between the anchor and the number.
 _DATE_NEG = re.compile(r"lab|psa|drawn|complet|appoint|follow|entry|dictat|"
                        r"scan|imaging|biopsy|visit", re.I)
+
+_MON3 = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
 
 
 def _norm_year(y: int) -> int:
@@ -305,9 +315,16 @@ def _norm_year(y: int) -> int:
 
 
 def _parse_date(mm: str, dd: Optional[str], yy: str) -> Optional[Tuple[int, int, int, str]]:
-    """-> (year, month, day, display) or None. Month/year-only -> day=15, display MM/YYYY."""
+    """-> (year, month, day, display) or None. Month/year-only -> day=15, display MM/YYYY.
+    `mm` may be a month NAME (Jan / January) as well as a number."""
     try:
-        m = int(mm); y = _norm_year(int(yy))
+        if mm and mm[:1].isalpha():
+            m = _MON3.get(mm[:3].lower())
+            if not m:
+                return None
+        else:
+            m = int(mm)
+        y = _norm_year(int(yy))
     except (TypeError, ValueError):
         return None
     if not (1 <= m <= 12 and 1900 <= y <= 2100):
@@ -376,6 +393,20 @@ _STATUS_DISPLAY = {
 }
 
 
+# Words that tie a status phrase to ADT. "in holding" (pre-op holding area),
+# "lifelong anticoagulation", "stopped radiation early due to side effects"
+# must not read as ADT holding / continuous ADT / ADT discontinued.
+_ADT_CTX_RE = re.compile(
+    r"\badt\b|androgen|eligard|lupron|leuprolide|zoladex|goserelin|degarelix|"
+    r"firmagon|trelstar|triptorelin|hormon|injection|depot|castrat", re.I)
+
+
+def _adt_ctx_hit(rx: "re.Pattern", text: str) -> bool:
+    """True when `rx` matches somewhere whose surrounding clause names ADT."""
+    return any(_ADT_CTX_RE.search(_clause(text, m.start(), m.end()))
+               for m in rx.finditer(text))
+
+
 def _pick_injectable(text: str) -> Optional[Tuple[str, str, str]]:
     """First injectable ADT agent present -> (display, class, family)."""
     low = text.lower()
@@ -429,54 +460,229 @@ def _collect_injection_dates(text: str) -> List[Tuple[int, int, int, str]]:
     directly adjacent to the date), most-recent last. Rejects lab / PSA /
     appointment dates that merely sit near the word 'injection'."""
     out = []
-    # (regex, kind). kind: 'start' (documented first/started), 'last' (documented
-    # last injection), 'generic' (agent+injection+date, side unknown).
-    patterns = (
+    # (regex-template, kind). kind: 'start' (documented first/started), 'last'
+    # (documented last injection), 'generic' (agent+injection+date, side unknown).
+    # Each template is instantiated for BOTH the numeric (_DATE) and month-name
+    # (_DATE_MN) date forms ("received Eligard 5/19/2021" / "administered on
+    # January 8, 2026" / "started ADT ... Jan 2023").
+    templates = (
         # "<agent> injection [was/in/on] <date>" — side unknown
-        (re.compile(r"(?:" + _AGENT_WORD + r")\s+injection\s+"
-                    r"(?:was\s+|in\s+|on\s+|dated\s+)?" + _DATE, re.I), "generic"),
+        (r"(?:" + _AGENT_WORD + r")\s+injection\s+"
+         r"(?:was\s+|in\s+|on\s+|dated\s+)?{D}", "generic"),
         # "first [agent] injection <date>" -> start ; "last [agent] injection
         # <date>" -> last. (a "next injection" is a FUTURE dose — skip it.)
-        (re.compile(r"first\s+(?:\w+\s+){0,3}injection\s+(?:was\s+|in\s+|on\s+)?" + _DATE, re.I), "start"),
-        (re.compile(r"last\s+(?:\w+\s+){0,3}injection\s+(?:was\s+|in\s+|on\s+)?" + _DATE, re.I), "last"),
-        # "started/initiated ADT/<agent> ... <date>"
-        (re.compile(r"(?:start(?:ed)?|initiat\w+|began)\s+(?:on\s+)?"
-                    r"(?:adt|" + _AGENT_WORD + r")[^.\n]{0,18}?" + _DATE, re.I), "start"),
+        (r"first\s+(?:\w+\s+){0,3}injection\s+(?:was\s+|in\s+|on\s+)?{D}", "start"),
+        (r"last\s+(?:\w+\s+){0,3}injection\s+(?:was\s+|in\s+|on\s+)?{D}", "last"),
+        # "started/initiated ADT/<agent> ... <date>" — window wide enough for a
+        # parenthetical regimen: "started ADT (bicalutamide x 30d and Eligard) Jan 2023"
+        (r"(?:start(?:ed)?|initiat\w+|began)\s+(?:on\s+)?"
+         r"(?:adt|" + _AGENT_WORD + r")[^.\n]{0,36}?{D}", "start"),
         # "<date>: started on ADT/<agent>"
-        (re.compile(_DATE + r"[:\s\-]{1,3}(?:start\w*|initiat\w+)[^.\n]{0,18}?"
-                    r"(?:adt|" + _AGENT_WORD + r")", re.I), "start"),
+        (r"{D}[:\s\-]{1,3}(?:start\w*|initiat\w+)[^.\n]{0,18}?"
+         r"(?:adt|" + _AGENT_WORD + r")", "start"),
         # "last dose/injection of Eligard ... <date>" / "most recent Eligard <date>"
-        (re.compile(r"(?:last|most\s+recent|prior|previous)\s+(?:dose\s+of\s+)?"
-                    r"(?:" + _AGENT_WORD + r")[^.\n]{0,18}?" + _DATE, re.I), "last"),
+        # / "most recent Eligard injection was administered on January 8, 2026"
+        (r"(?:last|most\s+recent|prior|previous)\s+(?:dose\s+of\s+)?"
+         r"(?:" + _AGENT_WORD + r")[^.\n]{0,36}?{D}", "last"),
+        # "received/given <agent> [45mg] [injection] [on] <date>" — a dated dose
+        (r"(?:received|given|gave|administered)\s+(?:his\s+|her\s+|the\s+|an?\s+)?"
+         r"(?:first\s+|last\s+|next\s+)?(?:" + _AGENT_WORD + r")"
+         r"[^.\n]{0,30}?(?:\bon\s+|\bin\s+)?{D}", "generic"),
+        # "<agent> [45 mg] [injection] administered [in/on] <date>"
+        (r"(?:" + _AGENT_WORD + r")[^.\n]{0,25}?administered\s+(?:on\s+|in\s+)?{D}",
+         "generic"),
     )
-    for rx, kind in patterns:
-        for m in rx.finditer(text):
-            if _DATE_NEG.search(m.group(0)):
-                continue
-            g = m.groups()
-            d = _parse_date(g[-3], g[-2], g[-1])
-            if d:
-                out.append((d[0], d[1], d[2], d[3], kind))
+    for tmpl, kind in templates:
+        for dpat in (_DATE, _DATE_MN):
+            rx = re.compile(tmpl.replace("{D}", dpat), re.I)
+            for m in rx.finditer(text):
+                if _DATE_NEG.search(m.group(0)):
+                    continue
+                g = m.groups()
+                d = _parse_date(g[-3], g[-2], g[-1])
+                if d:
+                    out.append((d[0], d[1], d[2], d[3], kind))
     return out
 
 
-_MON3 = {m: i + 1 for i, m in enumerate(
-    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+# ---- note-scoped administration records -------------------------------------
+# The authoritative injection record in a VistA/CPRS chart is the nursing note
+# ("Administered Eligard 45MG SQ to Left lower abdomen.") — the sentence itself
+# carries NO date; the date is the enclosing note's header. Every historical
+# note in a dump is introduced by "MM/DD/YYYY HH:MM  Local Title: <TITLE>" (VistA)
+# or "DATE OF NOTE: MON DD, YYYY" (CPRS / normalized), so a sequential scan that
+# tracks the current note date can stamp each administration line.
+_NOTE_HDR_RE = re.compile(
+    r"^\s*(\d{1,2})/(\d{1,2})/(\d{2,4})\s+\d{1,2}:\d{2}\s+Local\s+Title:|"
+    r"DATE\s+OF\s+NOTE:\s*(?:(\d{1,2})/(\d{1,2})/(\d{2,4})|"
+    r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4}))", re.I | re.M)
+# An administration statement with NO explicit date of its own. "given" /
+# "received" are accepted only in the "<verb> <agent> ... today" shape — the bare
+# "Eligard given his age" preposition would otherwise read as a dose.
+_ADMIN_LINE_RE = re.compile(
+    r"^\s*administered\s+(?:" + _AGENT_WORD + r")\b|"
+    r"(?:" + _AGENT_WORD + r")[^.\n]{0,30}?\badministered\s+(?:in\s+clinic\s+)?today\b|"
+    r"\b(?:" + _AGENT_WORD + r")\s+(?:injection\s+)?administered\b"
+    r"(?![^.\n]{0,12}?\b(?:on|in)\s+\d)|"
+    r"\b(?:" + _AGENT_WORD + r")\s+(?:injection\s+)?(?:given|received)\s+today\b|"
+    r"(?:received|given|gave|administered)\s+(?:his\s+|her\s+|the\s+|an?\s+)?"
+    r"(?:first\s+|next\s+)?(?:" + _AGENT_WORD + r")[^.\n]{0,25}?\btoday\b|"
+    r"\bpt\s+received\s+(?:" + _AGENT_WORD + r")\s+today\b", re.I | re.M)
+# Sentences that only TALK about administering (future / negated / conditional).
+_ADMIN_LINE_NEG_RE = re.compile(
+    r"\bnot\b|\bno\b|declin|defer|\bhold|refus|cancel|postpon|\bif\b|"
+    r"\bwill\s+(?:not|need|be\s+due)|due\s+for|scheduled\s+for|next\s+due|"
+    r"last\s+(?:\w+\s+){0,2}(?:injection|dose)\s+(?:was|in|on)\b|"
+    r"\bhistory\s+of\b|previously\s+received|\?", re.I)
+# Any explicit date in the sentence — the dated-narrative collector owns those.
+_ANY_DATE_RE = re.compile(_DATE + r"|" + _DATE_MN, re.I)
+
+
+def _header_ymd(m: "re.Match") -> Optional[Tuple[int, int, int]]:
+    g = m.groups()
+    if g[0]:
+        d = _parse_date(g[0], g[1], g[2])
+    elif g[3]:
+        d = _parse_date(g[3], g[4], g[5])
+    else:
+        d = _parse_date(g[6], g[7], g[8])
+    return (d[0], d[1], d[2]) if d else None
+
+
+def _collect_note_scoped_administrations(text: str) -> List[Tuple[int, int, int, str, str]]:
+    """Administration lines stamped with their enclosing note's date, kind='admin'.
+    Returns [] when the text has no recognizable note headers."""
+    out = []
+    cur = None
+    for line in text.splitlines():
+        hm = _NOTE_HDR_RE.search(line)
+        if hm:
+            ymd = _header_ymd(hm)
+            if ymd:
+                cur = ymd
+            continue
+        if cur is None:
+            continue
+        am = _ADMIN_LINE_RE.search(line)
+        if not am:
+            continue
+        # Judge the SENTENCE holding the phrase (not the whole line): a trailing
+        # "no complaints" must not veto the dose, but a "not"/"defer"/explicit
+        # date inside the same sentence does.
+        s0 = line.rfind(".", 0, am.start()) + 1
+        s1 = line.find(".", am.end())
+        sent = line[s0:(s1 if s1 != -1 else len(line))]
+        if _ADMIN_LINE_NEG_RE.search(sent) or _ANY_DATE_RE.search(sent):
+            continue
+        out.append((cur[0], cur[1], cur[2], f"{cur[1]:02d}/{cur[2]:02d}/{cur[0]}", "admin"))
+    return out
+
+
+def _has_note_headers(text: str) -> bool:
+    return bool(_NOTE_HDR_RE.search(text))
+
+
+def _visit_scoped_text(text: str, vdt: Tuple[int, int, int]) -> str:
+    """The text of only those notes dated on the visit date `vdt` (header-scoped).
+    Used so "Eligard administered today" in a two-year-old note cannot read as
+    given at THIS visit. Returns "" when nothing is dated on the visit."""
+    keep, cur = [], None
+    for line in text.splitlines():
+        hm = _NOTE_HDR_RE.search(line)
+        if hm:
+            cur = _header_ymd(hm) or cur
+            continue
+        if cur == vdt:
+            keep.append(line)
+    return "\n".join(keep)
+
+
+def _notes_text_since(text: str, ymd: Tuple[int, int, int]) -> str:
+    """Text of the notes dated on/after `ymd` (header-scoped). Lets a status
+    phrase be judged against what was written SINCE the last administration —
+    a 'declined repeat injection' two weeks before the patient came back for the
+    dose is history, not the current state."""
+    keep, cur = [], None
+    for line in text.splitlines():
+        hm = _NOTE_HDR_RE.search(line)
+        if hm:
+            cur = _header_ymd(hm) or cur
+            continue
+        if cur is not None and cur >= ymd:
+            keep.append(line)
+    return "\n".join(keep)
+
+
+def _dedupe_dates(dates: list) -> list:
+    """Collapse the same dose recorded several ways: exact duplicates; a month-only
+    mention ("4/2025") when a full date in that month exists ("04/09/2025"); and
+    two records within 10 days of each other (a nurse note + its next-day addendum)
+    — the earliest record of the cluster is the administration date. Depot
+    intervals are >= 1 month, so a 10-day cluster can never be two real doses."""
+    if not dates:
+        return []
+    full_months = {(d[0], d[1]) for d in dates if "/" in d[3] and d[3].count("/") == 2}
+    pts = []
+    for d in dates:
+        if d[3].count("/") == 1 and (d[0], d[1]) in full_months:
+            continue  # month-only shadowed by a full date in the same month
+        pts.append(d)
+    pts.sort(key=lambda d: (d[0], d[1], d[2]))
+    out = []
+    for d in pts:
+        if out and _cmp(d[:3], out[-1][:3]) <= 10:
+            # same dose; keep the earlier record but upgrade its kind/display if
+            # the later one is a documented START/LAST (more informative label)
+            prev = out[-1]
+            if len(d) > 4 and len(prev) > 4 and d[4] in ("start", "last") and prev[4] not in ("start", "last"):
+                out[-1] = (prev[0], prev[1], prev[2], prev[3], d[4])
+            continue
+        out.append(d)
+    return out
+
+
+# VistA prep-extract banner: "CLINIC : ALM GU PRO ADVANCED 2M   DATE: 6/24/2026" —
+# the appointment date the extract was pulled for. It is the visit date even
+# when the newest note in the dump is weeks older.
+_EXTRACT_DATE_RE = re.compile(
+    r"^\s*CLINIC\s*:[^\n]*?\bDATE:\s*(\d{1,2})/(\d{1,2})/(\d{4})", re.I | re.M)
+
+
+def _extract_header_visit_date(text: str) -> Optional[Tuple[int, int, int]]:
+    m = _EXTRACT_DATE_RE.search(text[:3000])
+    if not m:
+        return None
+    d = _parse_date(m.group(1), m.group(2), m.group(3))
+    return (d[0], d[1], d[2]) if d else None
 
 
 def _latest_note_date(text: str) -> Optional[Tuple[int, int, int]]:
-    """Most-recent 'DATE OF NOTE: MON DD, YYYY' — the visit date when a normalized
-    'VISIT DATE:' header is absent (raw VistA dumps)."""
+    """Most-recent note-header date ('MM/DD/YYYY HH:MM  Local Title:' or
+    'DATE OF NOTE: MON DD, YYYY') — the visit date when a 'VISIT DATE:' header
+    is absent (raw VistA dumps)."""
     best = None
-    for m in re.finditer(r"DATE\s+OF\s+NOTE:\s*([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})",
-                         text, re.I):
-        mo = _MON3.get(m.group(1)[:3].lower())
-        if not mo:
-            continue
-        ymd = (int(m.group(3)), mo, int(m.group(2)))
-        if best is None or ymd > best:
+    for m in _NOTE_HDR_RE.finditer(text):
+        ymd = _header_ymd(m)
+        if ymd and (best is None or ymd > best):
             best = ymd
     return best
+
+
+def adt_text_from_notes(notes) -> str:
+    """Join split note dicts ({'date','title','content'}) into text the ADT
+    extractor can date: each body is prefixed with a 'DATE OF NOTE:' header so a
+    nursing 'Administered Eligard ...' line keeps its note date even though the
+    splitter stripped the original 'Local Title' header line."""
+    parts = []
+    for n in notes or []:
+        if not isinstance(n, dict):
+            continue
+        body = n.get("content", "") or ""
+        if not body:
+            continue
+        date = (n.get("date") or "").strip()
+        parts.append((f"DATE OF NOTE: {date}\n" if date else "") + body)
+    return "\n\n".join(parts)
 
 
 def _split_courses(dates, interval_months):
@@ -538,41 +744,76 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     if st.interval_months:
         st.interval_display = f"q{st.interval_months} month{'s' if st.interval_months != 1 else ''}"
 
-    dates = _collect_injection_dates(raw_text)
+    # Visit date: the explicit header when the caller has one, else the most
+    # recent note header in the chart (the prep extract is pulled on visit day).
+    vdt = (_parse_visit_ymd(visit_date) or _extract_header_visit_date(raw_text)
+           or _latest_note_date(raw_text))
+    has_headers = _has_note_headers(raw_text)
+
+    # Injection dates = dated narrative mentions + note-scoped administration
+    # records (the nursing "Administered Eligard 45MG SQ ..." line stamped with
+    # its note's date). Deduped so one dose recorded three ways counts once.
+    admin_dates = _collect_note_scoped_administrations(raw_text)
+    dates = _dedupe_dates(_collect_injection_dates(raw_text) + admin_dates)
     # A documented START/first-injection date exists (vs only last/generic dates).
     st.start_is_documented = any(len(d) > 4 and d[4] == "start" for d in dates)
     if dates:
-        dates.sort(key=lambda d: (d[0], d[1], d[2]))
         st.start_display = dates[0][3]
         last = dates[-1]
         st.last_injection_display = last[3]
         st.last_injection_ymd = (last[0], last[1], last[2])
+    if admin_dates:
+        _adm = _dedupe_dates(admin_dates)
+        st.evidence.append(
+            f"{len(_adm)} administration record(s) in nursing/clinic notes; "
+            f"most recent {_adm[-1][3]}")
+
+    # Interval fallback from the documented dosing CADENCE: when no order line
+    # states the depot schedule ("Lupron" with no dose line), the spacing of the
+    # administration records is the schedule. Median gap -> nearest standard
+    # depot interval (1 / 3 / 4 / 6 months), needs >= 2 records.
+    if st.interval_months is None and len(_dedupe_dates(admin_dates)) >= 2:
+        _adm = _dedupe_dates(admin_dates)
+        gaps = sorted(_cmp(b[:3], a[:3]) for a, b in zip(_adm, _adm[1:]))
+        med = gaps[len(gaps) // 2]
+        if 20 <= med <= 220:
+            st.interval_months = min((1, 3, 4, 6), key=lambda n: abs(n * 30 - med))
+            st.interval_display = f"q{st.interval_months} month{'s' if st.interval_months != 1 else ''}"
+            st.evidence.append(f"dosing interval inferred from administration cadence "
+                               f"(~{round(med / 30)} months between records)")
 
     # ---- signals ----
     # Metastatic drives CONTINUOUS and propagates into HPI/Assessment/Plan, so it
     # must be DOCUMENTED (imaging or explicit M1/mHSPC/mCRPC), not a bare mention.
     metastatic = _metastatic_documented(raw_text)
     intermittent = bool(_INTERMITTENT_RE.search(raw_text))
-    holding = bool(_HOLDING_RE.search(raw_text))
-    deferred_today = bool(_DEFER_TODAY_RE.search(raw_text))
-    given_today = bool(_INJECTION_TODAY_RE.search(raw_text)) and not deferred_today
+    # Holding / discontinued are judged on notes written SINCE the last recorded
+    # administration (when the chart is header-dated): a dose given after the
+    # 'holding' statement means the hold ended.
+    _since = raw_text
+    if has_headers and admin_dates:
+        _last_adm = max(admin_dates, key=lambda d: d[:3])[:3]
+        _since = _notes_text_since(raw_text, _last_adm) or raw_text
+    holding = _adt_ctx_hit(_HOLDING_RE, _since)
+    # "Given/deferred TODAY" is judged on the notes dated at THIS visit only — a
+    # chart holds years of prior visit notes that each said "Eligard administered
+    # today" / "presents for his next Eligard injection today" on THEIR day. When
+    # the text has no note headers (plain prose), fall back to the whole text.
+    today_text = _visit_scoped_text(raw_text, vdt) if (vdt and has_headers) else raw_text
+    deferred_today = bool(_DEFER_TODAY_RE.search(today_text))
+    admin_on_visit = bool(vdt) and any(d[:3] == vdt for d in admin_dates)
+    given_today = (admin_on_visit or bool(_INJECTION_TODAY_RE.search(today_text))) \
+        and not deferred_today
 
-    # An injection ADMINISTERED/GIVEN today is a dose on the visit date. It rarely
-    # carries an explicit date in the note ("Administered Eligard today"), so
-    # without this it's invisible to the date collector — and a patient with one
-    # earlier narrative dose then a dose today would show that earlier date as
-    # BOTH the first and the last dose. Add the visit date so today's dose extends
-    # the course (deduped downstream, so a lone first-dose-today stays a single dose).
-    if given_today:
-        # Use ONLY an explicit visit date (the render path passes one). Do NOT
-        # fall back to a scanned note date — that can grab an unrelated OLD note
-        # header and stamp it as today's dose (e.g. a 2011 date on a 2026 chart).
-        _vymd = _parse_visit_ymd(visit_date)
-        if _vymd:
-            dates.append((_vymd[0], _vymd[1], _vymd[2],
-                          f"{_vymd[1]:02d}/{_vymd[2]:02d}/{_vymd[0]}", "last"))
+    # An injection ADMINISTERED/GIVEN today is a dose on the visit date. The
+    # provider's "Eligard administered today" carries no explicit date, so add the
+    # visit date so today's dose extends the course (deduped — a lone first-dose-
+    # today stays a single dose; a nursing record of the same dose is one date).
+    if given_today and vdt:
+        dates = _dedupe_dates(dates + [(vdt[0], vdt[1], vdt[2],
+                                        f"{vdt[1]:02d}/{vdt[2]:02d}/{vdt[0]}", "last")])
     finite_done = bool(_FINITE_COMPLETED_RE.search(raw_text))
-    disc_tox = bool(_DISCONTINUED_TOX_RE.search(raw_text))
+    disc_tox = _adt_ctx_hit(_DISCONTINUED_TOX_RE, _since)
     new_course = bool(_NEW_COURSE_RE.search(raw_text))
     finite_planned = _FINITE_PLANNED_RE.search(raw_text)
     m_dc = _DOSE_COUNT_RE.search(raw_text)
@@ -584,7 +825,9 @@ def build_adt_status(raw_text: str, visit_date: str = "",
             x, y = nums[0], nums[1]
             dc_done, dc_progress = x >= y, x < y
             dc_txt = f"injection {x} of {y}"
-    off_now = holding or deferred_today
+    # A dose actually administered at THIS visit outranks any (older or copied-
+    # forward) "holding" language — the patient is not holding.
+    off_now = (holding or deferred_today) and not admin_on_visit
     pending = st.order_status == "PENDING"
     # a bare med-list 'ACTIVE' does NOT count as receiving when the note says off
     active_order = pending or given_today or (st.order_status == "ACTIVE" and not off_now)
@@ -599,7 +842,6 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     # Injection recency vs the visit — a patient truly on CONTINUOUS ADT has had
     # many injections AND a recent one (~one dosing interval ago). Depot interval
     # defaults to 6 months when the order didn't specify it.
-    vdt = _parse_visit_ymd(visit_date) or _latest_note_date(raw_text)
     gap_days = (-_cmp(st.last_injection_ymd, vdt)
                 if (st.last_injection_ymd and vdt) else None)
     _interval_days = (st.interval_months or 6) * 30
@@ -695,7 +937,7 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     elif metastatic and active_order:
         st.status = "CONTINUOUS"
         st.evidence.append("documented metastatic disease (imaging/stage) on active ADT")
-    elif bool(_CONTINUE_INDEF_RE.search(raw_text)):
+    elif _adt_ctx_hit(_CONTINUE_INDEF_RE, raw_text):
         st.status = "CONTINUOUS"
         st.evidence.append("indefinite/continuous ADT documented")
     elif long_term_continuous:
@@ -751,6 +993,17 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.injection = "NOT_DUE"
         st.determination = ("No injection due — off-cycle (intermittent ADT); "
                             "resume per PSA threshold." + _psa_tail(psa_data))
+    elif (st.order_status == "PENDING" and st.last_injection_ymd and st.interval_months
+          and vdt and _cmp(vdt, _add_months(st.last_injection_ymd, st.interval_months)) < -14):
+        # A standing clinic order can sit PENDING for months after the last dose
+        # was consumed. The dosing math governs: last dose + interval is still
+        # more than 2 weeks away, so a dose today would be early.
+        nd = _add_months(st.last_injection_ymd, st.interval_months)
+        st.next_due_display = f"{nd[1]:02d}/{nd[2]:02d}/{nd[0]}"
+        st.injection = "NOT_DUE"
+        st.determination = (f"No injection due — next due {st.next_due_display} "
+                            f"(last {st.last_injection_display}, {st.interval_display}); "
+                            f"a pharmacy order is PENDING but the dose is not yet due.")
     elif st.order_status == "PENDING":
         st.injection = "ORDERED_PENDING"
         st.determination = (f"INJECTION ORDERED — {_regimen(st)} "

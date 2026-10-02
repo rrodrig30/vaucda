@@ -1229,11 +1229,11 @@ def build_stage2_note(
             # format) and NOT the rendered prose (which misfires the extractor).
             # This preserves the full dosing directive (DUE/ordered/lapsed) for
             # the Plan even though the visible ADT section is minimal.
-            from .adt_status import build_adt_status, adt_plan_directive
-            _adt_raw = "\n".join(
-                (n.get("content", "") or "")
-                for n in ((gu_notes or []) + (non_gu_notes or []))
-            )
+            from .adt_status import build_adt_status, adt_plan_directive, adt_text_from_notes
+            # Each body is re-dated with its note's date so the nursing
+            # "Administered Eligard ..." record keeps the date the splitter
+            # stripped (the "Local Title" header line).
+            _adt_raw = adt_text_from_notes((gu_notes or []) + (non_gu_notes or []))
             _adt_directive = adt_plan_directive(build_adt_status(_adt_raw)) if _adt_raw else None
             if _adt_directive:
                 _plan_facts = ((authoritative_facts or "")
