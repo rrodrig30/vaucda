@@ -163,7 +163,33 @@ def _parse_age(stage1_note: str) -> Optional[int]:
 
 
 _ECOG_RE = re.compile(
-    r"ECOG\s*(?:PS|performance\s+status)?\s*(?:of\s+|[:=]\s*)?([0-4])\b", re.IGNORECASE)
+    r"ECOG\s*(?:PS|performance\s+status|status)?\s*(?:of\s+|[:=]\s*)?([0-4])\b",
+    re.IGNORECASE)
+
+# ---- checkbox intake normalization ------------------------------------------
+# The Functional Status intake renders as checkbox rows:
+#   ECOG status:       [] 0  [] 1  [x] 2  [] 3  [] 4
+# Every extractor that reads the note must see only the CHECKED option
+# ("ECOG status: 2") — an unchecked "[] Difficulty walking 1/4 mile" or
+# "[] Poor" would otherwise score as a documented answer. A row with nothing
+# checked is dropped entirely so a blank template is invisible.
+_INTAKE_ROW_RE = re.compile(
+    r"^[ \t]*(ECOG\s+status|Self-rated\s+health|IADL\s+status|Ambulation\s*\(1/4\s*mile\))"
+    r"[ \t]*:(?=.*\[\s*[xX✓✔ ]?\s*\])(.*)$", re.IGNORECASE | re.MULTILINE)
+_OPTION_RE = re.compile(r"\[\s*([xX✓✔])?\s*\]\s*([^\[\n]*?)\s*(?=\[|$)")
+
+
+def normalize_checkbox_intake(text: str) -> str:
+    """Rewrite checkbox intake rows to 'Label: <checked option>' and drop rows
+    with no box checked. Text without such rows is returned unchanged."""
+    if not text or "[" not in text:
+        return text
+
+    def _sub(m):
+        label, body = m.group(1), m.group(2)
+        picked = [opt.strip() for mark, opt in _OPTION_RE.findall(body) if mark and opt.strip()]
+        return f"{label}: {picked[0]}" if picked else ""
+    return _INTAKE_ROW_RE.sub(_sub, text)
 
 
 def _parse_ecog(stage1_note: str) -> Optional[int]:
@@ -171,7 +197,7 @@ def _parse_ecog(stage1_note: str) -> Optional[int]:
     documents it for cancer patients), or None if not documented."""
     if not stage1_note:
         return None
-    m = _ECOG_RE.search(stage1_note)
+    m = _ECOG_RE.search(normalize_checkbox_intake(stage1_note))
     return int(m.group(1)) if m else None
 
 
@@ -225,6 +251,8 @@ def classify_life_expectancy(stage1_note: str) -> dict:
       STANDARD:     <70 (any), or 70-74 without comorbidities.
                     ⇒ standard AUA early-detection options apply.
     """
+    # Checked intake options only — a blank checkbox template must not score.
+    stage1_note = normalize_checkbox_intake(stage1_note or "")
     age = _parse_age(stage1_note)
     flags = _detect_life_limiting(stage1_note)
     n_flags = len(flags)
@@ -351,24 +379,45 @@ _ANY_CANCER_RE = re.compile(
     r"\bcancer\b|carcinoma|malignan|adenocarcinoma|lymphoma|leukemia|sarcoma|"
     r"\bGleason\b|Grade\s+Group", re.IGNORECASE)
 _IADL_INDEPENDENT = re.compile(
-    r"independent\s+(?:in|with)\s+(?:all\s+)?(?:IADL|instrumental)", re.IGNORECASE)
+    r"independent\s+(?:in|with)\s+(?:all\s+)?(?:IADL|instrumental)|"
+    r"IADL\s+status\s*:\s*Independent\b", re.IGNORECASE)
 _AMBULATES_OK = re.compile(
     r"no\s+difficulty\s+walking|ambulat\w*\s+(?:independently|without\s+"
-    r"(?:difficulty|assist)|well)|walks?\s+without\s+(?:difficulty|assist)", re.IGNORECASE)
+    r"(?:difficulty|assist)|well)|walks?\s+without\s+(?:difficulty|assist)|"
+    r"Ambulation\s*\(1/4\s*mile\)\s*:\s*No\s+difficulty\b", re.IGNORECASE)
+
+# Checkbox intake rows (provider-supplied layout). Each row's options are
+# rendered as "[] option"; the option the chart documents is pre-checked "[x]".
+_INTAKE_ROWS = (
+    ("ECOG status:          ", ["0", "1", "2", "3", "4"], 2),
+    ("Self-rated health:  ", ["Excellent", "Very good", "Good", "Fair", "Poor"], 2),
+    ("IADL status:        ", ["Independent", "Dependent in >=1 IADL"], 3),
+    ("Ambulation (1/4 mile):     ", ["No difficulty", "Difficulty walking 1/4 mile"], 3),
+)
+
+
+def _checkbox_row(label: str, options: list, gap: int, checked: Optional[str]) -> str:
+    boxes = []
+    for opt in options:
+        mark = "[x]" if (checked is not None and opt.lower() == checked.lower()) else "[]"
+        boxes.append(f"{mark} {opt}")
+    return "  " + label + (" " * gap).join(boxes)
 
 
 def build_functional_status_section(stage1_note: str) -> str:
     """Structured intake that (a) captures the Schonberg self-report inputs
     (perceived health, IADL status, ambulation) and (b) prompts ECOG performance
     status for cancer patients — so both the life-expectancy estimate and ECOG
-    are documented. Extracted values are shown when present; otherwise a labeled
-    fill-in template prompts the provider. Rendered only when relevant (cancer,
-    age >=65, or functional status already documented)."""
+    are documented. Rendered as checkbox rows; the option the chart already
+    documents is pre-checked, otherwise every box is blank for the provider.
+    Rendered only when relevant (cancer, age >=65, or functional status already
+    documented)."""
     if not stage1_note:
         return ""
     from .life_expectancy import (_SCHON_PERCEIVED, _SCHON_IADL,
                                   _SCHON_DIFF_QUARTER_MILE, _LEE_FUNC_DOCUMENTED,
                                   _difficulty_present)
+    stage1_note = normalize_checkbox_intake(stage1_note)
     info = classify_life_expectancy(stage1_note)
     age = info.get("age")
     is_cancer = bool(_ANY_CANCER_RE.search(stage1_note)) or info.get("known_prostate_cancer")
@@ -377,37 +426,35 @@ def build_functional_status_section(stage1_note: str) -> str:
     if not relevant:
         return ""
 
+    ecog_row, health_row, iadl_row, amb_row = _INTAKE_ROWS
     rows = []
-
-    def _row(label, value):
-        rows.append(f"  {(label + ':').ljust(28)}{value}")
 
     if is_cancer:
         _e = _parse_ecog(stage1_note)
-        _row("ECOG performance status",
-             str(_e) if _e is not None else
-             "___  (0 fully active | 1 restricted strenuous | 2 ambulatory, "
-             "up >50% | 3 limited, in bed >50% | 4 bedbound)")
+        rows.append(_checkbox_row(*ecog_row, str(_e) if _e is not None else None))
 
     pm = _SCHON_PERCEIVED.search(stage1_note)
+    health = None
     if pm:
-        _row("Self-rated health", (next((g for g in pm.groups() if g), "") or "").strip().title())
-    else:
-        _row("Self-rated health", "___  (Excellent / Very good / Good / Fair / Poor)")
+        val = (next((g for g in pm.groups() if g), "") or "").strip().lower()
+        health = next((o for o in health_row[1] if o.lower() == val), None)
+    rows.append(_checkbox_row(*health_row, health))
 
     if _SCHON_IADL.search(stage1_note):
-        _row("IADL status", "Dependent in >=1 IADL")
+        iadl = "Dependent in >=1 IADL"
     elif _IADL_INDEPENDENT.search(stage1_note):
-        _row("IADL status", "Independent")
+        iadl = "Independent"
     else:
-        _row("IADL status", "___  (Independent / Dependent in >=1 IADL)")
+        iadl = None
+    rows.append(_checkbox_row(*iadl_row, iadl))
 
     if _difficulty_present(stage1_note, _SCHON_DIFF_QUARTER_MILE):
-        _row("Ambulation (1/4 mile)", "Difficulty walking 1/4 mile / several blocks")
+        amb = "Difficulty walking 1/4 mile"
     elif _AMBULATES_OK.search(stage1_note):
-        _row("Ambulation (1/4 mile)", "No difficulty")
+        amb = "No difficulty"
     else:
-        _row("Ambulation (1/4 mile)", "___  (No difficulty / Difficulty walking 1/4 mile)")
+        amb = None
+    rows.append(_checkbox_row(*amb_row, amb))
 
     body = "\n".join(rows)
     est = info.get("primary_survival_summary")

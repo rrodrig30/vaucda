@@ -231,7 +231,7 @@ _SCHON_PERCEIVED = re.compile(
     r"reports?\s+(excellent|very\s+good|good|fair|poor)\s+health|"
     r"(fair|poor)\s+(?:overall\s+)?health", re.I)
 _SCHON_IADL = re.compile(
-    r"dependent\s+(?:in|for)\s+(?:at\s+least\s+)?(?:one|a|1|any|some|\d+)?\s*IADLs?|"
+    r"dependent\s+(?:in|for)\s+(?:at\s+least\s+)?(?:>=|≥)?\s*(?:one|a|1|any|some|\d+)?\s*IADLs?|"
     r"IADL\s+depend|"
     r"difficulty\s+(?:managing|with)\s+(?:money|finances|medications?|shopping|"
     r"transportation|cooking|housework|telephone|meals)|"
