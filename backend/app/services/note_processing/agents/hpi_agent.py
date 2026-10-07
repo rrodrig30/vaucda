@@ -1951,6 +1951,9 @@ Provide ONLY the clinical narrative HPI. NO meta-commentary, NO explanations lik
     # 'rising PSA' framing applied to a clearly-declining trajectory.
     cleaned_hpi = _strip_stale_recent_qualifier(cleaned_hpi)
     cleaned_hpi = _reconcile_psa_direction(cleaned_hpi, psa_data)
+    # "No subsequent PSA values are documented" above a 12-value PSA curve.
+    from ..tx_timeline_llm import drop_unsupported_psa_absence_claims
+    cleaned_hpi = drop_unsupported_psa_absence_claims(cleaned_hpi, psa_data)
     # PSA-hallucination scrubber — replaces fabricated PSA-context ng/mL
     # values (e.g., "PSA risen to 38.6 ng/mL" pulled from a TUMOR
     # SCREENS reference-range row) with the deterministic current PSA

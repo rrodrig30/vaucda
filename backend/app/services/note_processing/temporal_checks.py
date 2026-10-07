@@ -386,6 +386,7 @@ def finalize_temporal(
     section: str = "note section",
     ref_note: str = "",
     max_repair: int = 1,
+    raw_text: str = "",
 ) -> str:
     """Deterministic scrub of vague recency + an optional repair loop for
     volatile-must-be-dated / latest-wins / staleness. Safe-degrade: returns the
@@ -398,9 +399,19 @@ def finalize_temporal(
         return text
     ref_ym = reference_ym(ref_note)
 
+    def _tx_viol(t: str) -> List[str]:
+        # VAUCDA_TX_LLM layer 3: a recommendation for a treatment the chart
+        # documents as completed ("s/p salvage XRT").
+        try:
+            from .tx_timeline_llm import enabled as _tx_on, completed_treatment_recommendation_violations
+            return completed_treatment_recommendation_violations(t, raw_text) if (_tx_on() and raw_text) else []
+        except Exception:  # noqa: BLE001
+            return []
+
     def _viol(t: str) -> List[str]:
         return (temporal_violations(t) + latest_wins_violations(t, facts, psa_data or "")
-                + staleness_violations(t, ref_ym) + tier_override_violations(t, facts))
+                + staleness_violations(t, ref_ym) + tier_override_violations(t, facts)
+                + _tx_viol(t))
 
     try:
         repairs = 0
@@ -422,6 +433,9 @@ def finalize_temporal(
         if stale:
             text = text.rstrip() + (f" The most recent PSA is {stale[1]:g} ng/mL "
                                     f"({stale[2]}).")
+        if _tx_viol(text):
+            from .tx_timeline_llm import drop_completed_treatment_recommendations
+            text = drop_completed_treatment_recommendations(text, raw_text)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"finalize_temporal({section}) error: {e}")
     return text

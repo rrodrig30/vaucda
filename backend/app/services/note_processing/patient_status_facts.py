@@ -831,6 +831,14 @@ class PatientStatusFacts:
     biopsy, TURBT, DEXA, etc.). Surfaced separately because these were
     frequently missed by synthesis agents despite being decision-driving."""
 
+    unresolved_treatment_mentions: List[str] = field(default_factory=list)
+    """VAUCDA_TX_LLM: modalities the chart says were DONE (strong completion
+    phrase, quoted) that no timeline event resolved. Rendered as UNRESOLVED in
+    the facts block instead of a prohibition — absence is never a prohibition."""
+
+    planned_treatments: List[str] = field(default_factory=list)
+    """VAUCDA_TX_LLM: booked / recommended treatments (not performed)."""
+
     patient_sex: str = ""
     """'female' | 'male' | '' from demographics. Guards against
     anatomically-impossible narratives (prostate cancer in a female patient)."""
@@ -1523,8 +1531,35 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
         lines.append("  -> Resolve in favor of the deterministic verdicts above.")
 
     lines.append("")
+    _unresolved = getattr(facts, "unresolved_treatment_mentions", None) or []
+    _planned = getattr(facts, "planned_treatments", None) or []
+    if _unresolved:
+        lines.append("")
+        lines.append("UNRESOLVED TREATMENT MENTIONS (the chart asserts these were DONE; no dated "
+                     "event was resolved — treat them as the patient's history, NOT as absent):")
+        for u in _unresolved[:5]:
+            lines.append(f"  - {u}")
+    if _planned:
+        lines.append("")
+        lines.append("PLANNED / BOOKED TREATMENTS (NOT performed — never describe as history):")
+        for p in _planned[:5]:
+            lines.append(f"  - {p}")
+    lines.append("")
     lines.append("ABSOLUTE RULES based on the above:")
-    if facts.treatment_naive:
+    if _unresolved:
+        lines.append(
+            "  - The chart documents treatment(s) listed under UNRESOLVED TREATMENT MENTIONS. "
+            "DO NOT describe the patient as treatment-naive, DO NOT recommend, re-offer, or "
+            "'clarify the status of' a treatment the chart says was completed — state it as "
+            "completed history with its date."
+        )
+    _done_cats = [c for c, s in (facts.treatment_active_status or {}).items() if s == "COMPLETED"]
+    if _done_cats:
+        lines.append(
+            "  - COMPLETED treatments (" + ", ".join(_done_cats) + ") are HISTORY: never "
+            "recommend, consider, refer for, or question whether they have been initiated."
+        )
+    if facts.treatment_naive and not _unresolved:
         lines.append(
             "  - The patient is TREATMENT-NAIVE for prostate cancer. "
             "DO NOT use any of: 'focal therapy', 'focal ablation', "

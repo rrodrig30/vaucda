@@ -220,6 +220,13 @@ def build_authoritative_patient_facts(
     # ED treatments) so the HPI doesn't repeat or conflate them.
     from .patient_status_facts import clean_treatment_facts
     facts = clean_treatment_facts(facts)
+    # VAUCDA_TX_LLM: LLM-forward, quote-verified treatment timeline (regex can
+    # add, never veto) + unresolved-mention guard. No-op when the flag is off.
+    try:
+        from .tx_timeline_llm import enrich_facts_with_llm_timeline
+        facts = enrich_facts_with_llm_timeline(facts, clinical_text, llm_task_config)
+    except Exception as _te:  # noqa: BLE001
+        logger.warning(f"LLM treatment timeline skipped: {_te}")
     return facts
 
 
@@ -512,6 +519,12 @@ def build_urology_note(
             raw_clinical_text=clinical_document,
             raw_source_text=_raw_clinical_text,
         )
+        try:
+            from .tx_timeline_llm import enrich_facts_with_llm_timeline
+            _hpi_patient_facts = enrich_facts_with_llm_timeline(
+                _hpi_patient_facts, _raw_clinical_text or clinical_document, task_config)
+        except Exception as _te:  # noqa: BLE001
+            logger.warning(f"LLM treatment timeline skipped: {_te}")
     _hpi_authoritative_facts = format_facts_for_prompt(_hpi_patient_facts)
     print(f"      Patient facts (for HPI): cancer={_hpi_patient_facts.cancer_status}, "
           f"naive={_hpi_patient_facts.treatment_naive}, "
@@ -1126,7 +1139,8 @@ def build_urology_note(
             # Same deterministic backstop the v1 chain applies: a sentence that
             # names only non-urologic meds / labs / findings is not HPI content.
             from .agents.hpi_agent import _strip_nonurologic_sentences as _strip_nonuro
-            return _strip_nonuro(result.hpi_text)
+            from .tx_timeline_llm import drop_unsupported_psa_absence_claims as _drop_psa_absence
+            return _drop_psa_absence(_strip_nonuro(result.hpi_text), _doc_psa or "")
         except Exception as _e:
             logger.warning(f"HPI v2 path failed (using v1): {_e}")
             return v1_text

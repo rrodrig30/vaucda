@@ -276,6 +276,11 @@ _NOT_CANDIDATE_RE = re.compile(
     r"androgen)|(?:eligard|lupron|leuprolide|adt|androgen\s+deprivation)"
     r"[^.\n]{0,20}?(?:contraindicated|not\s+(?:a\s+candidate|recommended|indicated))",
     re.I)
+# ADT named only as declined / withheld — never received.
+_DECLINED_ADT_RE = re.compile(
+    r"(?:declin\w*|refus\w*|defer\w*|opted\s+(?:against|not))\s+(?:\w+\s+){0,4}?(?:adt|androgen|eligard|lupron|"
+    r"leuprolide|hormon\w*\s+therapy)|(?:adt|eligard|lupron|leuprolide)[^.\n]{0,25}?(?:was\s+|were\s+)?"
+    r"(?:declined|refused|deferred)|\bwithout\s+(?:concurrent\s+)?(?:adt|androgen\s+deprivation)", re.I)
 # ADT being INITIATED — a first injection scheduled/planned but not yet given.
 _PLANNED_START_RE = re.compile(
     r"(?:scheduled\s+to\s+(?:receive|start|begin)|plan(?:s|ned)?\s+to\s+(?:start|"
@@ -917,9 +922,12 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     short_conflict = False
 
     # Suppress the section entirely when the injectable agent is named ONLY as a
-    # non-candidate / contraindication and there is no order, injection, or
-    # planned start (e.g. "not a candidate for Eligard").
-    if not_candidate and not ever_used and not planned_start:
+    # non-candidate / contraindication / DECLINED therapy and there is no order,
+    # injection, or planned start ("not a candidate for Eligard", "declined ADT",
+    # "salvage XRT without ADT"). An ADT section for a patient who never received
+    # ADT reads as a therapy to confirm, and the Plan then invents one.
+    declined_only = bool(_DECLINED_ADT_RE.search(raw_text)) and not st.dose and not st.order_status
+    if (not_candidate or declined_only) and not ever_used and not planned_start:
         st.present = False
         return st
 
@@ -999,6 +1007,12 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.status = "ACTIVE"
         st.evidence.append("on ADT — continuous vs. finite course not established; "
                            "confirm intended duration")
+    elif last_recent:
+        # A dose within the dosing interval (+90 d) IS being on ADT, even with no
+        # order line in the extract (CPRS charts list Eligard as a non-VA med).
+        st.status = "ACTIVE"
+        st.evidence.append(f"on ADT — last dose {st.last_injection_display} is within the "
+                           f"dosing interval; continuous vs. finite course not established")
     else:
         st.status = "UNCERTAIN"
 

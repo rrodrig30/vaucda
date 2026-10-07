@@ -1172,7 +1172,8 @@ def build_stage2_note(
             from .temporal_checks import finalize_temporal, psa_section
             assessment = finalize_temporal(
                 assessment, patient_facts, psa_section(stage1_note),
-                _asmt_repair_call, "Assessment", ref_note=stage1_note)
+                _asmt_repair_call, "Assessment", ref_note=stage1_note,
+                raw_text=_raw_for_facts or "")
             # Liver-directed-therapy guard: strip TACE/Y90/(chemo|radio)-
             # embolization from GU-cancer sentences that carry no hepatic
             # referent (the hepatic plan belongs to a concurrent HCC, not the
@@ -1299,7 +1300,8 @@ def build_stage2_note(
                                    task_config=task_config, max_tokens=1200)
 
             plan = finalize_temporal(plan, patient_facts, psa_section(stage1_note),
-                                     _plan_temporal_call, "Plan", ref_note=stage1_note)
+                                     _plan_temporal_call, "Plan", ref_note=stage1_note,
+                                     raw_text=_raw_for_facts or "")
             plan = _break_dash_bullets(plan)
             plan = _scrub_unproductive_plan(plan)
             plan = _strip_negative_recs(plan, is_plan=True)

@@ -1560,7 +1560,19 @@ def classify_current_phase(
         return "SALVAGE_OR_RESTART"
 
     if has_recurrence_decision:
-        # Recurrence noted but no restart yet
+        # Recurrence noted — but a LOCAL salvage treatment (radiation /
+        # prostatectomy / focal) COMPLETED after the recurrence puts the patient
+        # back in post-treatment surveillance (GORDEN: BCR 2024 -> salvage XRT
+        # completed 3/2025 -> surveillance), not in an open recurrence.
+        rec_dates = [e.date_key for e in staging if "recurrence" in e.modality.lower() and e.date_key]
+        latest_rec = max(rec_dates) if rec_dates else ""
+        salvage_done = [e for e in timeline
+                        if e.event_type == "TREATMENT_COMPLETED" and e.date_key
+                        and re.search(r"radiation|radiotherapy|xrt|ebrt|imrt|sbrt|brachy|prostatectomy|"
+                                      r"hifu|cryo|focal", f"{e.modality} {e.detail}", re.I)
+                        and e.date_key > latest_rec]
+        if salvage_done and not has_metastatic:
+            return "POST_TREATMENT_SURVEILLANCE"
         return "BIOCHEMICAL_RECURRENCE"
 
     # All confirmed treatments completed?
