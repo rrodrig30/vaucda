@@ -96,6 +96,13 @@ RULES:
   documented reason for the tumor-clinic follow-up. List it first.
 - Capture the actual organ. "Squamous cell carcinoma of penis" is organ
   "penile"; "urothelial carcinoma" is "bladder"; a renal mass is "renal".
+- SYMPTOMS ARE NOT DIAGNOSES. Hematuria, LUTS, nocturia, frequency, urgency,
+  incontinence, dysuria, pain, retention, and erectile dysfunction are symptoms.
+  Do NOT list a symptom as a problem unless it is the documented reason for
+  THIS visit AND its workup is still incomplete. A presenting symptom whose
+  workup was negative or that led to a cancer diagnosis (e.g. the hematuria
+  that prompted the PSA/biopsy) is part of that cancer's history — omit it.
+  Never label a symptom 'indeterminate etiology' or 'under surveillance'.
 - Include definitive cancer surgery in key_treatments (e.g. glansectomy,
   penectomy, inguinal lymph node dissection, nephrectomy, cystectomy, TURBT,
   prostatectomy, radiation, chemotherapy) with dates when documented.
@@ -175,6 +182,14 @@ _STOPWORDS = {
     "carcinoma", "cancer", "tumour", "tumor", "disease", "history",
     "status", "post", "patient", "malignant", "benign", "lesion",
 }
+
+
+_SYMPTOM_ONLY_RE = re.compile(
+    r"hematuria|\bLUTS\b|lower\s+urinary\s+tract\s+symptom|nocturia|frequency|urgency|incontinence|"
+    r"dysuria|\bpain\b|retention|erectile|\bED\b|voiding|dribbl|hesitancy|weak\s+stream", re.I)
+_LESION_WORD_RE = re.compile(
+    r"lesion|mass|tumou?r|carcinoma|cancer|neoplasm|stricture|stone|calcul|cyst|hydronephrosis|"
+    r"diverticul|fistula|varicocele|hydrocele", re.I)
 
 
 def _to_category(malignancy: str) -> str:
@@ -307,6 +322,29 @@ def enrich_facts_with_holistic_diagnoses(
             if (rd.name and not _GENERIC_NAME.search(rd.name)
                     and (not d.name or _GENERIC_NAME.search(d.name))):
                 d.name = rd.name
+
+    # Deterministic symptom guard (ALEJANDRO: 'gross hematuria of indeterminate
+    # etiology' became problem #1 above a metastatic prostate cancer). A
+    # symptom-only entry (no lesion / mass / tumour / carcinoma / stricture /
+    # stone / cyst word) is dropped when the patient has an established cancer
+    # (prostate cancer_status PRESENT/TREATED or a holistic cancer) — it is that
+    # cancer's history, not a separate problem to anchor the note on.
+    _has_cancer = (getattr(facts, "cancer_status", "") in ("PRESENT", "TREATED")
+                   or any(d.category == "cancer" for d in non_prostate))
+    if _has_cancer:
+        kept = []
+        for d in non_prostate:
+            if d.category != "cancer" and _SYMPTOM_ONLY_RE.search(d.name or "") \
+                    and not _LESION_WORD_RE.search(f"{d.name} {d.status}"):
+                logger.info(f"Holistic dx dropped (symptom, cancer present): {d.name!r}")
+                continue
+            kept.append(d)
+        non_prostate = kept
+        if not non_prostate:
+            facts.other_gu_diagnoses = [
+                d for d in (getattr(facts, "other_gu_diagnoses", None) or []) if d.category == "cancer"]
+            return facts
+        holistic_organs = {d.organ for d in non_prostate}
 
     merged: List[GUDiagnosis] = list(non_prostate)
     for d in (getattr(facts, "other_gu_diagnoses", None) or []):

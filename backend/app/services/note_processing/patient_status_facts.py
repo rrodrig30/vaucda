@@ -1354,7 +1354,11 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
     # (renal mass, bladder tumor). List them FIRST so the CC and HPI anchor to
     # the correct organ instead of defaulting to a prostate/PSA narrative.
     if facts.other_gu_diagnoses:
+        _pca_primary = (facts.cancer_status in ("PRESENT", "TREATED")
+                        and not any(d.category == "cancer" for d in facts.other_gu_diagnoses))
         lines.append(
+            "OTHER_UROLOGIC_DIAGNOSES (non-prostate — SECONDARY: the prostate cancer below "
+            "is the PRIMARY problem):" if _pca_primary else
             "OTHER_UROLOGIC_DIAGNOSES (non-prostate — often the PRIMARY problem):"
         )
         for d in facts.other_gu_diagnoses:
@@ -1365,7 +1369,10 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
                 bits.append(d.status)
             lines.append("  - " + " ".join(bits))
         lines.append(
-            "  -> Center the CC and HPI on these when present. An 'indeterminate' "
+            ("  -> These are SECONDARY problems; the prostate cancer is PROBLEM #1 and the "
+             "CC/HPI/Assessment lead with it. " if _pca_primary else
+             "  -> Center the CC and HPI on these when present. ")
+            + "An 'indeterminate' "
             "mass is NEITHER cancer NOR benign — frame it as a mass/lesion of "
             "uncertain significance (NEVER call an unbiopsied mass 'benign'). The "
             "prostate status below is a SEPARATE, organ-specific finding: "
