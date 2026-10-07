@@ -16,7 +16,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.security import get_optional_user, get_current_admin_user
 from app.config import settings
-from app.database.sqlite_models import User
+from app.database.sqlite_models import User, UserPreferences
+from app.database.sqlite_session import get_db
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.rag import (
     RAGSearchRequest,
     SearchResult,
@@ -725,3 +728,266 @@ async def get_knowledge_base_stats(
             "sources": ["User uploaded documents"],
             "status": "Knowledge base stats unavailable"
         }
+
+
+# ---------------------------------------------------------------------------
+# GraphRAG layer rebuild
+#
+# Document upload only populates the vector store (Document + Chunk + embeddings).
+# The GraphRAG layer (Entity extraction -> Leiden communities -> hierarchical
+# summaries -> community embeddings) is a SEPARATE build. After ingesting new
+# material, the operator triggers this rebuild so the new chunks join the graph.
+# Entity extraction is incremental (it skips chunks that already have entities),
+# so a rebuild only processes newly-added chunks, then re-detects communities and
+# summarizes. Models come from settings.graphrag_model_config() (.env-backed).
+# ---------------------------------------------------------------------------
+
+# In-process build state (single build at a time). Reset on server restart.
+_GRAPHRAG_BUILD: Dict[str, Any] = {
+    "status": "idle",          # idle | running | success | error
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": None,
+    "result": None,            # run_full_pipeline stage summary
+    "error": None,
+    "models": None,
+    "baseline": None,          # coverage snapshot at build start (for progress %)
+    "progress": None,          # live phase progress set by the pipeline callback
+}
+_GRAPHRAG_BUILD_LOCK = asyncio.Lock()
+_GRAPHRAG_TASK: Optional[asyncio.Task] = None  # keep a ref so it isn't GC'd
+
+
+async def _graphrag_coverage(neo4j_client) -> Dict[str, Any]:
+    """Live GraphRAG coverage: how many chunks are in the graph layer, plus
+    entity/community/summary counts. Cheap enough to poll while a build runs."""
+    if neo4j_client is None:
+        return {}
+    try:
+        async with neo4j_client.driver.session() as session:
+            r = await (await session.run(
+                """
+                MATCH (c:Chunk)
+                WITH count(c) AS total,
+                     count(CASE WHEN EXISTS((c)-[:HAS_ENTITY]->(:Entity)) THEN 1 END) AS in_graph
+                RETURN total, in_graph
+                """
+            )).single()
+            total = r["total"] if r else 0
+            in_graph = r["in_graph"] if r else 0
+            ent = await (await session.run("MATCH (n:Entity) RETURN count(n) AS c")).single()
+            com = await (await session.run("MATCH (n:Community) RETURN count(n) AS c")).single()
+            summ = await (await session.run("MATCH (n:HierarchicalSummary) RETURN count(n) AS c")).single()
+        pct = round(100.0 * in_graph / total, 1) if total else 0.0
+        return {
+            "total_chunks": total,
+            "chunks_in_graph": in_graph,
+            "chunks_pending": max(0, total - in_graph),
+            "coverage_pct": pct,
+            "entities": ent["c"] if ent else 0,
+            "communities": com["c"] if com else 0,
+            "summaries": summ["c"] if summ else 0,
+        }
+    except Exception as e:
+        logger.warning(f"GraphRAG coverage query failed: {e}")
+        return {"error": str(e)}
+
+
+async def _run_graphrag_build(neo4j_client, llm_model_override: Optional[str] = None) -> None:
+    """Background task: run the full (incremental) GraphRAG pipeline."""
+    import time
+    from datetime import datetime, timezone
+    from rag.graphrag_pipeline import GraphRAGPipeline
+
+    gr = settings.graphrag_model_config(llm_model_override)
+    # Snapshot coverage BEFORE the build so the UI can show a real progress bar
+    # ("X of Y new chunks processed") rather than a global coverage % that barely
+    # moves. Progress = baseline.chunks_pending - current.chunks_pending.
+    baseline = await _graphrag_coverage(neo4j_client)
+    _GRAPHRAG_BUILD.update({
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "elapsed_seconds": None,
+        "result": None,
+        "error": None,
+        "models": gr,
+        "baseline": baseline,
+        "progress": None,
+    })
+    t0 = time.time()
+    logger.info(f"GraphRAG rebuild starting with models={gr}, baseline={baseline}")
+
+    # Live progress from the pipeline. Entity extraction writes to Neo4j in a
+    # single batch at the end of phase 1, so DB coverage can't show phase-1
+    # progress — this callback is the only per-chunk signal.
+    _PHASE_LABEL = {
+        "entity_extraction": "Extracting entities",
+        "community_detection": "Detecting communities",
+        "summarization": "Regenerating summaries",
+        "embeddings": "Computing community embeddings",
+    }
+
+    def _on_progress(phase: str, done: int, total: int) -> None:
+        if phase == "entity_extraction" and total:
+            _GRAPHRAG_BUILD["progress"] = {
+                "phase": phase,
+                "label": _PHASE_LABEL.get(phase, phase),
+                "target_chunks": total,
+                "processed_chunks": done,
+                "percent": round(100.0 * done / total, 1),
+            }
+        else:
+            # Phases 2-4 are global operations with no per-item count.
+            _GRAPHRAG_BUILD["progress"] = {
+                "phase": phase,
+                "label": _PHASE_LABEL.get(phase, phase),
+                "target_chunks": 0,
+                "processed_chunks": 0,
+                "percent": 100.0,
+            }
+
+    try:
+        pipeline = GraphRAGPipeline(
+            neo4j_client=neo4j_client,
+            ollama_base_url=gr["ollama_base_url"],
+            llm_model=gr["llm_model"],
+            embedding_model=gr["embedding_model"],
+            max_concurrent=12,
+            # Per-call LLM timeout for the build (entity extraction / summaries).
+            llm_timeout=settings.OLLAMA_TIMEOUT,
+        )
+        results = await pipeline.run_full_pipeline(
+            extract_entities=True,       # incremental: skips chunks already in graph
+            detect_communities=True,
+            generate_summaries=True,
+            compute_embeddings=True,
+            progress_callback=_on_progress,
+        )
+        # Silent-failure guard: if chunks were pending but extraction produced
+        # zero entities, the GraphRAG model almost certainly failed on every call
+        # (typically an Ollama Cloud usage-limit / HTTP 429, or an unreachable
+        # model) and the per-chunk safety net swallowed it. Report an error
+        # instead of a misleading "success" with unchanged coverage.
+        ee = (results.get("stages") or {}).get("entity_extraction") or {}
+        if ee.get("total_chunks", 0) > 0 and ee.get("extracted_entities", 0) == 0:
+            _GRAPHRAG_BUILD.update({
+                "status": "error",
+                "error": (
+                    f"Entity extraction produced 0 entities from {ee.get('total_chunks')} "
+                    f"pending chunks — the GraphRAG model '{gr['llm_model']}' failed on every "
+                    f"call (commonly an Ollama Cloud usage limit / HTTP 429, or an unreachable "
+                    f"model). Add credits, or select a local GraphRAG model in Settings, then "
+                    f"rebuild."
+                ),
+                "result": results.get("stages", results),
+            })
+            logger.error("GraphRAG rebuild produced 0 entities — flagging as error (likely LLM 429/quota)")
+        else:
+            _GRAPHRAG_BUILD.update({
+                "status": "success",
+                "result": results.get("stages", results),
+            })
+            logger.info("GraphRAG rebuild completed successfully")
+    except Exception as e:
+        logger.error(f"GraphRAG rebuild failed: {e}", exc_info=True)
+        _GRAPHRAG_BUILD.update({"status": "error", "error": str(e)})
+    finally:
+        from datetime import datetime, timezone
+        _GRAPHRAG_BUILD["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _GRAPHRAG_BUILD["elapsed_seconds"] = round(time.time() - t0, 1)
+
+
+@router.post("/rebuild-graphrag")
+async def rebuild_graphrag(
+    current_user: User = Depends(get_current_admin_user),
+    rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    db: AsyncSession = Depends(get_db),
+):
+    """Trigger a (re)build of the GraphRAG layer for the knowledge base.
+
+    **Admin only.** Runs in the background — poll ``GET /rag/graphrag-status``
+    for progress. Entity extraction is incremental, so this processes only chunks
+    added since the last build, then re-detects communities and regenerates
+    summaries. Models are resolved from settings (GRAPHRAG_LLM_MODEL).
+    """
+    global _GRAPHRAG_TASK
+    neo4j_client = getattr(rag_pipeline, "neo4j_client", None)
+    if neo4j_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GraphRAG rebuild requires Neo4j. It is not connected.",
+        )
+
+    # Resolve the user-selected GraphRAG model (Settings page) if any; else the
+    # env GRAPHRAG_LLM_MODEL default.
+    model_override = None
+    try:
+        prefs = (await db.execute(
+            select(UserPreferences).where(UserPreferences.user_id == current_user.user_id)
+        )).scalar_one_or_none()
+        if prefs is not None:
+            model_override = getattr(prefs, "graphrag_llm_model", None)
+    except Exception as e:
+        logger.warning(f"Could not load graphrag_llm_model preference: {e}")
+
+    async with _GRAPHRAG_BUILD_LOCK:
+        if _GRAPHRAG_BUILD["status"] == "running":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A GraphRAG rebuild is already running.",
+            )
+        # Mark running synchronously so a rapid second POST is rejected.
+        _GRAPHRAG_BUILD["status"] = "running"
+        _GRAPHRAG_TASK = asyncio.create_task(
+            _run_graphrag_build(neo4j_client, llm_model_override=model_override)
+        )
+
+    before = await _graphrag_coverage(neo4j_client)
+    return {
+        "status": "started",
+        "message": "GraphRAG rebuild started in the background. Poll /rag/graphrag-status.",
+        "models": settings.graphrag_model_config(model_override),
+        "coverage_before": before,
+    }
+
+
+@router.get("/graphrag-status")
+async def graphrag_status(
+    current_user: Optional[User] = Depends(get_optional_user),
+    rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+):
+    """Current GraphRAG build state + live coverage of the graph layer."""
+    neo4j_client = getattr(rag_pipeline, "neo4j_client", None)
+    coverage = await _graphrag_coverage(neo4j_client)
+    state = {k: v for k, v in _GRAPHRAG_BUILD.items()}
+    state["coverage"] = coverage
+
+    # Live elapsed while running (finished builds keep their final elapsed).
+    if state.get("status") == "running" and state.get("started_at"):
+        try:
+            from datetime import datetime, timezone
+            started = datetime.fromisoformat(state["started_at"])
+            state["elapsed_seconds"] = round(
+                (datetime.now(timezone.utc) - started).total_seconds(), 1
+            )
+        except Exception:
+            pass
+
+    # Progress: prefer the live pipeline callback (the only signal during
+    # entity extraction, which batches its Neo4j write at end-of-phase). Fall
+    # back to a coverage-derived figure only if the callback hasn't set one yet.
+    if state.get("status") == "running" and not state.get("progress"):
+        base = state.get("baseline") or {}
+        base_pending = base.get("chunks_pending")
+        cur_pending = coverage.get("chunks_pending")
+        if isinstance(base_pending, int) and isinstance(cur_pending, int) and base_pending > 0:
+            processed = max(0, base_pending - cur_pending)
+            state["progress"] = {
+                "phase": "entity_extraction",
+                "label": "Extracting entities",
+                "target_chunks": base_pending,
+                "processed_chunks": processed,
+                "percent": round(100.0 * processed / base_pending, 1),
+            }
+    return state

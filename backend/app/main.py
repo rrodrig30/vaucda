@@ -35,6 +35,14 @@ from database.neo4j_client import Neo4jClient, Neo4jConfig
 import redis
 
 
+# HIPAA: install the PHI-safe logging boundary BEFORE basicConfig so the
+# logging StreamHandler binds the redaction-wrapped stderr. This scrubs
+# structured identifiers (SSN/MRN/phone/DOB/email) from everything written to
+# the console — which start.sh persists to logs/backend.log — as a backstop to
+# the source discipline of never emitting patient content to logs.
+from app.core.phi_redaction import install_phi_safe_logging
+install_phi_safe_logging()
+
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL),
@@ -49,6 +57,14 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
+
+    # Apply any UI-managed LLM provider API keys to the live settings object so
+    # the note-generation pipeline picks them up (stored keys override env).
+    try:
+        from app.core.api_key_store import apply_to_settings as _apply_llm_keys
+        _apply_llm_keys()
+    except Exception as e:
+        logger.error(f"Failed to apply stored LLM API keys: {e}")
 
     # Initialize SQLite database
     try:

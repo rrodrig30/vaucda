@@ -503,8 +503,21 @@ def _parse_bladder_specimens(diagnosis_block: str, date_str: str, results_list: 
     """
     specimen_results = []
 
-    # Pattern for individual specimen results - handles multiple bladder formats
-    specimen_pattern = r'([A-L])\.\s*((?:URINARY\s+)?BLADDER[,\s]+[^:]+?(?:TRANSURETHRAL\s+RESECTION|BIOPSY)?)[;\s:]*\n?\s*((?:[-•]\s*[^\n]+(?:\n\s+[^\n]+)*\n?\s*)+?)(?=\n\s*[A-L]\.\s|$)'
+    # Pattern for individual specimen results - handles multiple bladder formats.
+    # NOTE: the findings group is a simple lazy `.*?` bounded by the next-specimen
+    # lookahead. The previous nested-quantifier form
+    #   ((?:[-•]\s*[^\n]+(?:\n\s+[^\n]+)*\n?\s*)+?)
+    # caused CATASTROPHIC BACKTRACKING on large bladder-pathology blocks (TRICKEL:
+    # 157K chart froze a CPU core with the GIL held, so the async note-timeout
+    # could never fire and the whole server hung). The location group is length-
+    # bounded and newline-free to keep matching linear.
+    specimen_pattern = (
+        r'([A-L])\.\s*'
+        r'((?:URINARY\s+)?BLADDER[,\s][^:\n]{0,150})'   # location header (bounded)
+        r'\s*:\s*'                                        # colon terminator
+        r'(.*?)'                                          # findings (lazy, DOTALL)
+        r'(?=\n\s*[A-L]\.\s|\Z)'                          # up to next specimen / end
+    )
 
     for spec_match in re.finditer(specimen_pattern, diagnosis_block, re.IGNORECASE | re.DOTALL):
         spec_letter = spec_match.group(1)
@@ -1219,6 +1232,17 @@ def extract_pathology(clinical_document: str) -> str:
     if addendum_pathology:
         pathology_reports.append(addendum_pathology)
 
+    # Germline / somatic genomic test reports (genetics notes, outside labs) —
+    # a negative BRCA/ATM/HOXB13 panel is a result the Assessment/Plan rely on
+    # (PARP-inhibitor eligibility, cascade testing) and belongs here.
+    try:
+        from .genomics_extractor import extract_genomic_testing
+        for g in extract_genomic_testing(clinical_document):
+            if g not in pathology_reports:
+                pathology_reports.append(g)
+    except Exception:  # noqa: BLE001
+        pass
+
     # Catch-all urologic pathology — runs LAST so it can dedup against
     # all earlier paths (specialized extractors AND the section-split
     # loop below). See the misc_dedup block at the end of this function.
@@ -1489,7 +1513,33 @@ def extract_pathology(clinical_document: str) -> str:
     if not pathology_reports:
         return ""
 
-    return '\n\n'.join(pathology_reports)
+    return _truncate_pathology_bleed('\n\n'.join(pathology_reports))
+
+
+# Non-pathology section headers that must TERMINATE a pathology report — a
+# DIAGNOSIS capture whose terminator sits far away otherwise absorbs an
+# intervening medication-reconciliation list, problem list, or ROS (THORNTON:
+# 'Active Outpatient Medications' bled into the pathology section).
+_PATH_BLEED_STOP = re.compile(
+    r"(?im)(?:^|[;\n])\s*(?:"
+    r"Medication\s+Reconc\w*|Current\s+Medications|"
+    r"Active\s+(?:Inpatient|Outpatient)(?:,?\s*(?:Inpatient|Outpatient|and|Clinic))*"
+    r"\s+Medications|Pending\s+Outpatient\s+Medications|"
+    r"Computerized\s+Problem\s+List|Active\s+problems|"
+    r"REVIEW\s+OF\s+SYSTEMS|GU\s+review\s+of\s+systems|"
+    r"PHYSICAL\s+EXAM|VITAL\s+SIGNS|CHIEF\s+COMPLAINT"
+    r")\b.*",
+    re.DOTALL,
+)
+
+
+def _truncate_pathology_bleed(text: str) -> str:
+    """Cut anything from a non-pathology section header onward — the pathology
+    extractor's DIAGNOSIS captures occasionally run past their report into an
+    adjacent med-reconciliation / problem-list / ROS block."""
+    if not text:
+        return text
+    return _PATH_BLEED_STOP.sub("", text).rstrip()
 
 
 def extract_pathology_from_note(note_content: str) -> str:

@@ -266,7 +266,7 @@ export const notesApi = {
    */
   batchUploadProcessStream: (
     files: File[],
-    options: { visitDate?: string },
+    options: { visitDate?: string; noteType?: string },
     callbacks: {
       onFileStart?: (data: { filename: string; output_filename: string; note_type: string; current_index: number; total_files: number }) => void
       onFileComplete?: (data: { filename: string; output_filename: string; note_type: string; current_index: number; total_files: number; attempts: number; generation_time_seconds: number; note_content: string }) => void
@@ -287,6 +287,9 @@ export const notesApi = {
     }
     if (options.visitDate) {
       formData.append('visit_date', options.visitDate)
+    }
+    if (options.noteType) {
+      formData.append('note_type_override', options.noteType)
     }
 
     fetch(url, {

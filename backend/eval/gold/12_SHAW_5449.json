@@ -1,0 +1,17 @@
+{
+  "patient_id": "12_SHAW_5449",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/Monday_7_6_2026/input/12_SHAW_5449.txt",
+  "primary_diagnosis": {
+    "organ": "prostate",
+    "malignancy": "cancer"
+  },
+  "cancer_organs": [
+    "prostate"
+  ],
+  "notes": "GG2 prostate adenocarcinoma on active surveillance"
+}

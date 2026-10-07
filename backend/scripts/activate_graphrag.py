@@ -122,12 +122,20 @@ async def run_full_graphrag_pipeline(
     """Run the complete Microsoft GraphRAG pipeline."""
     from rag.graphrag_pipeline import GraphRAGPipeline
 
-    # Initialize pipeline
+    # Initialize pipeline. Model config comes from settings (.env-backed),
+    # NOT a hardcoded literal: the build must use the same configured GraphRAG
+    # model (GRAPHRAG_LLM_MODEL) as the runtime retrieval path, not the weak
+    # OLLAMA_DEFAULT_MODEL (llama3.1:8b) this previously hardcoded.
+    gr = settings.graphrag_model_config()
+    logger.info(
+        f"GraphRAG build models: llm={gr['llm_model']}, "
+        f"embedding={gr['embedding_model']}, base_url={gr['ollama_base_url']}"
+    )
     pipeline = GraphRAGPipeline(
         neo4j_client=client,
-        ollama_base_url=settings.OLLAMA_BASE_URL or "http://localhost:11434",
-        llm_model=settings.OLLAMA_DEFAULT_MODEL or "llama3.1:8b",
-        embedding_model=settings.OLLAMA_EMBEDDING_MODEL or "nomic-embed-text",
+        ollama_base_url=gr["ollama_base_url"],
+        llm_model=gr["llm_model"],
+        embedding_model=gr["embedding_model"],
         max_concurrent=12,
         llm_timeout=300
     )

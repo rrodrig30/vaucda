@@ -4,6 +4,7 @@ Complete RAG workflow from query to augmented context
 """
 
 import logging
+import uuid
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,7 +70,7 @@ class RAGPipeline:
         retriever: RAGRetriever,
         neo4j_client: Optional[Neo4jClient] = None,
         embedding_generator: Optional[EmbeddingGenerator] = None,
-        max_context_length: int = 4000,
+        max_context_length: int = 9000,
         include_metadata: bool = True
     ):
         """
@@ -262,24 +263,16 @@ class RAGPipeline:
         try:
             import os
 
-            # Resolve config from app settings (which loads .env).
-            # GRAPHRAG_LLM_MODEL is the dedicated knob for map-reduce
-            # speed; defaults to a fast cloud model. The previous
-            # default (llama3.1:8b) caused 30s+ per LLM call which made
-            # the 10-call map-reduce multi-minute per query.
+            # Resolve config from app settings (which load .env) via the single
+            # source of truth. GRAPHRAG_LLM_MODEL is the dedicated knob for
+            # map-reduce speed/quality; the build path uses the SAME resolver so
+            # retrieval and build never diverge (rules.txt: config via .env only).
             try:
                 from app.config import settings as _app_settings
-                ollama_url = (
-                    _app_settings.OLLAMA_BASE_URL
-                    or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-                )
-                llm_model = getattr(
-                    _app_settings, "GRAPHRAG_LLM_MODEL", None
-                ) or os.getenv("GRAPHRAG_LLM_MODEL", "gpt-oss:120b-cloud")
-                embedding_model = (
-                    _app_settings.OLLAMA_EMBEDDING_MODEL
-                    or os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-                )
+                gr = _app_settings.graphrag_model_config()
+                ollama_url = gr["ollama_base_url"]
+                llm_model = gr["llm_model"]
+                embedding_model = gr["embedding_model"]
             except Exception:
                 # Fallback to env if settings import is somehow broken
                 ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -425,8 +418,14 @@ class RAGPipeline:
             }
 
             logger.info(
-                "GraphRAG retrieved %d documents (global=%s local=%s)",
-                len(documents), global_meta.get("status"), local_meta.get("status")
+                "GraphRAG retrieved %d documents | GLOBAL(map-reduce): status=%s "
+                "communities_queried=%s mapped_answers=%s | LOCAL(graph): status=%s "
+                "entities=%s relationships=%s chunks=%s",
+                len(documents),
+                global_meta.get("status"), global_meta.get("communities_queried", 0),
+                global_meta.get("intermediate_answers", 0),
+                local_meta.get("status"), local_meta.get("entity_count", 0),
+                local_meta.get("relationship_count", 0), local_meta.get("chunk_count", 0),
             )
             return documents, top_meta
 
@@ -455,8 +454,20 @@ class RAGPipeline:
             # Build document section
             doc_parts = []
 
-            # Header with source
+            # Header with source. For GraphRAG community-level results, surface the
+            # map-reduce provenance (communities queried / mapped answers / entities
+            # + relationships traversed) so the community-level contribution is
+            # VISIBLE and clearly distinguished from plain vector chunks.
             header = f"[Source {idx}: {doc.source} - {doc.title}]"
+            _m = doc.metadata or {}
+            if doc.category == "graphrag_global" and _m.get("communities_queried"):
+                header += (f"\n[GraphRAG GLOBAL map-reduce: "
+                           f"{_m['communities_queried']} communities queried, "
+                           f"{_m.get('intermediate_answers', '?')} relevant community "
+                           f"answers synthesized]")
+            elif doc.category == "graphrag_local" and _m.get("entity_count") is not None:
+                header += (f"\n[GraphRAG LOCAL graph: {_m.get('entity_count', 0)} entities, "
+                           f"{_m.get('relationship_count', 0)} relationships traversed]")
             doc_parts.append(header)
 
             # Add metadata if enabled
@@ -750,6 +761,10 @@ class RAGPipeline:
                 chunks_data = []
                 for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                     chunks_data.append({
+                        # Stable id so entity extraction can link entities back to
+                        # this chunk by provenance (Chunk-[:HAS_ENTITY]->Entity)
+                        # instead of fragile content-substring matching.
+                        'id': str(uuid.uuid4()),
                         'content': chunk.content,
                         'chunk_index': chunk.chunk_index,
                         'total_chunks': chunk.total_chunks,
@@ -762,6 +777,7 @@ class RAGPipeline:
                 MATCH (d:Document) WHERE id(d) = $doc_id
                 UNWIND $chunks AS chunk_data
                 CREATE (c:Chunk {
+                    id: chunk_data.id,
                     content: chunk_data.content,
                     chunk_index: chunk_data.chunk_index,
                     total_chunks: chunk_data.total_chunks,

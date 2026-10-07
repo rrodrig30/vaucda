@@ -80,6 +80,13 @@ _MODALITY_FROM_TEXT = {
     r"\bTURBT\b|\btransurethral\s+resection.{0,20}bladder\b": "TURBT",
     r"\bnephrectomy\b": "nephrectomy",
     r"\bcystectomy\b": "cystectomy",
+    r"\bdocetaxel\b|\bcabazitaxel\b|\bchemotherapy\b": "chemotherapy",
+    # Novel androgen-receptor signaling inhibitors are part of systemic
+    # hormonal therapy for prostate cancer — bucket them under ADT so a
+    # patient on abiraterone/enzalutamide is not seen as treatment-naive.
+    r"\babiraterone\b|\benzalutamide\b|\bapalutamide\b|\bdarolutamide\b"
+    r"|\bzytiga\b|\bxtandi\b|\berleada\b|\bnubeqa\b": "ADT",
+    r"\bnivolumab\b|\bipilimumab\b|\bpembrolizumab\b|\bimmunotherapy\b": "immunotherapy",
     r"\bureteroscopy\b|\bURS\b": "ureteroscopy",
     r"\borchiectomy\b": "orchiectomy",
     r"\bvaricocelectomy\b": "varicocelectomy",
@@ -138,6 +145,46 @@ def _extract_psa_entries(psa_text: str) -> List[PSAEntry]:
         seen.add(key)
         out.append(e)
     return out
+
+
+def _recent_psa_cluster(entries: List[PSAEntry], gap_months: int = 24,
+                        min_recent: int = 3) -> List[PSAEntry]:
+    """Trim a mixed-era PSA series to its most-recent contiguous cluster.
+
+    A record may carry two PSA eras separated by a multi-year gap — e.g. an
+    old sub-1.0 baseline (2000-2022) plus a current 4-5 ng/mL curve
+    (2024-2026), as in ASHFORD. Only the recent era is relevant to today's
+    HPI trajectory; leaving the old era in lets the LLM cite a stale value as
+    'current' (a 0.9 that matches an old 0.86/0.94 within tolerance). Cut at
+    the first gap larger than ``gap_months`` once at least ``min_recent``
+    recent entries are kept.
+
+    Conservative by design: entries are newest-first, it never trims below
+    min_recent, and ordinary surveillance cadence (≤~12-month gaps) is
+    untouched. The full PSA curve still renders in the note's PSA section —
+    this only scopes what the HPI trajectory may reference.
+    """
+    if len(entries) <= min_recent:
+        return entries
+    from datetime import datetime as _d
+
+    def _pd(s: str):
+        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+            try:
+                return _d.strptime(s, fmt)
+            except (ValueError, TypeError):
+                continue
+        return None
+
+    kept = [entries[0]]
+    for prev, cur in zip(entries, entries[1:]):
+        dp, dc = _pd(prev.date), _pd(cur.date)
+        if dp and dc:
+            months = (dp.year - dc.year) * 12 + (dp.month - dc.month)
+            if months > gap_months and len(kept) >= min_recent:
+                break
+        kept.append(cur)
+    return kept
 
 
 def _extract_gleason_grade_groups(pathology_text: str) -> tuple:
@@ -224,28 +271,109 @@ def build_ground_truth(
     imaging_text: str = "",
     procedure_findings: Optional[List] = None,
     treatment_naive: bool = True,
+    clinical_timeline: Optional[List] = None,
+    current_active_treatments: Optional[List[str]] = None,
+    confirmed_urologic_treatments: Optional[List[str]] = None,
+    cancer_status: str = "",
+    narrative_text: str = "",
+    other_gu_diagnoses: Optional[List] = None,
+    prior_hpi: str = "",
+    prior_plan: str = "",
 ) -> GroundTruth:
-    """Build a GroundTruth from existing-extractor outputs."""
+    """Build a GroundTruth from existing-extractor outputs.
+
+    The structured PSH/MEDS/PATH extractors return EMPTY on narrative
+    oncology-consult inputs, so we additionally ingest the treatment
+    course already assembled by patient_status_facts / clinical_timeline
+    (``clinical_timeline``, ``current_active_treatments``,
+    ``confirmed_urologic_treatments``, ``cancer_status``). Without this a
+    heavily-treated patient is mislabeled treatment-naive and the HPI
+    collapses to a "new patient" stub.
+    """
     gleasons, ggs = _extract_gleason_grade_groups(pathology_text)
     confirmed = _extract_confirmed_modalities(psh_text, pathology_text, pmh_text)
-    # treatment_naive can be wrong when the patient-status-facts agent
-    # misclassifies a post-treatment patient (Woods: s/p IMRT 2015 per
-    # PSH but pf.treatment_naive=True). When confirmed_treatment_modalities
-    # contains any cancer-directed treatment, force treatment_naive=False
-    # so the prompt doesn't tell the LLM the opposite of the GT.
+
+    # Build a readable treatment/diagnosis timeline from clinical_timeline.
+    # NOTE: _treatment_blob_parts collects ONLY actual treatment events —
+    # diagnosis/pathology/procedure events must NOT count as treatment
+    # evidence (else a treatment-naive AS patient with a biopsy is wrongly
+    # marked treated and the HPI invents a treatment course).
+    treatment_timeline: List[str] = []
+    _treatment_blob_parts: List[str] = []
+    _treatment_event_count = 0
+    _TIMELINE_EVENT_TYPES = {
+        "DIAGNOSIS", "TREATMENT_STARTED", "TREATMENT_COMPLETED",
+        "TREATMENT_RESTARTED", "TREATMENT_DECLINED", "PATHOLOGY",
+        "PROCEDURE", "STAGING_DECISION",
+    }
+    _TREATMENT_EVENT_TYPES = {
+        "TREATMENT_STARTED", "TREATMENT_COMPLETED",
+        "TREATMENT_RESTARTED", "TREATMENT_DECLINED",
+    }
+    for ev in (clinical_timeline or []):
+        etype = getattr(ev, "event_type", "") or ""
+        if etype not in _TIMELINE_EVENT_TYPES:
+            continue
+        disp = getattr(ev, "date_display", "") or ""
+        modality = getattr(ev, "modality", "") or ""
+        detail = getattr(ev, "detail", "") or ""
+        label = etype.replace("_", " ").lower()
+        parts = [p for p in (modality, detail) if p]
+        line = f"{disp}: {label}" + (f" — {' — '.join(parts)}" if parts else "")
+        treatment_timeline.append(line.strip())
+        if etype in _TREATMENT_EVENT_TYPES:
+            _treatment_event_count += 1
+            _treatment_blob_parts.append(f"{modality} {detail}")
+
+    # Map the treatment course onto the canonical modality vocabulary so
+    # both the prompt and the fact validator recognize them. Scan ONLY
+    # authoritative treatment evidence — the actual treatment-event
+    # modalities, patient_status_facts' confirmed/active treatment lists.
+    # We deliberately do NOT scan the raw source narrative: incidental,
+    # negated, or hypothetical mentions ("discussed prostatectomy vs
+    # radiation", "candidate for ADT") would otherwise be promoted to
+    # CONFIRMED treatments — the EVERETT failure (treatment-naive AS
+    # patient given phantom prostatectomy/radiation/ADT/chemo).
+    _modality_scan_blob = " ".join(
+        _treatment_blob_parts
+        + list(confirmed_urologic_treatments or [])
+        + list(current_active_treatments or [])
+    )
+    for pattern, modality in _MODALITY_FROM_TEXT.items():
+        if re.search(pattern, _modality_scan_blob, re.IGNORECASE):
+            confirmed.add(modality)
+
+    # treatment_naive resolution. The structured extractors can miss a
+    # post-treatment patient (Woods: s/p IMRT 2015 per PSH but
+    # pf.treatment_naive=True). Force naive=False whenever ANY oncologic
+    # treatment evidence exists OR the authoritative cancer_status says
+    # the patient has been treated. NOTE: a bare diagnosis/biopsy is NOT
+    # treatment — only actual treatment events count.
     ONCOLOGIC = {"prostatectomy", "radiation", "brachytherapy",
-                 "focal-therapy", "ADT", "chemotherapy", "nephrectomy",
-                 "cystectomy"}
-    if confirmed & ONCOLOGIC:
+                 "focal-therapy", "ADT", "chemotherapy", "immunotherapy",
+                 "nephrectomy", "cystectomy"}
+    _treated_status = (cancer_status or "").upper() in {
+        "TREATED", "METASTATIC", "RECURRENT", "NED", "REMISSION",
+    }
+    if (confirmed & ONCOLOGIC) or _treatment_event_count or current_active_treatments \
+            or _treated_status:
         treatment_naive = False
+
     return GroundTruth(
         name=patient_name,
         age=int(patient_age) if patient_age else 0,
         sex=patient_sex.lower() if patient_sex else "",
         visit_date=visit_date,
-        psa_entries=_extract_psa_entries(psa_data),
+        psa_entries=_recent_psa_cluster(_extract_psa_entries(psa_data)),
         confirmed_treatment_modalities=confirmed,
         treatment_naive=treatment_naive,
+        treatment_timeline=treatment_timeline,
+        current_active_treatments=list(current_active_treatments or []),
+        cancer_status=cancer_status or "",
+        narrative_text=narrative_text or "",
+        other_gu_diagnoses=list(other_gu_diagnoses or []),
+        prior_hpi=prior_hpi or "",
+        prior_plan=prior_plan or "",
         pathology_text=pathology_text or "",
         gleason_scores=gleasons,
         grade_groups=ggs,

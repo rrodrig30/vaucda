@@ -1,0 +1,18 @@
+{
+ "gold_version": "1.0",
+ "schema_version": 2,
+ "frozen_date": "2026-06-27",
+ "reviewer_note": "Urologist reviewed ~20% of segments, found no problems; categories (cancer/benign/indeterminate), cancer-aware grading, imaging split, and treatment-diagnosis links approved. 2026-06-27.",
+ "n_segments": 99,
+ "diagnoses_by_category": {
+  "cancer": 81,
+  "benign": 147,
+  "indeterminate": 15
+ },
+ "n_treatment_events": 169,
+ "n_imaging": 141,
+ "n_procedures": 158,
+ "n_metastases": 17,
+ "non_urologic_segments": 2,
+ "content_sha256": "7d8f0580c2204c345977945c3370c6a4885b5d3705a617a1da95b8e274327ff0"
+}

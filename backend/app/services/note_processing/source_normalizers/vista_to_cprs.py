@@ -62,6 +62,17 @@ _KNOWN_CODES = (
     "SLT", "CH", "MIC", "AR", "SPN", "CT",
 )
 
+# Sentinel line prepended to the RXOP-derived medication block. The VistA
+# RXOP "OUTPT RX-ACTIVE ONLY" list is the AUTHORITATIVE current-medication
+# list as of collection; embedded note med-reconciliation blocks share the
+# "Active Outpatient Medications" header but are stale. Downstream current-med
+# extraction keys on this sentinel to read only the authoritative list.
+RXOP_AUTHORITATIVE_SENTINEL = (
+    "=== CURRENT OUTPATIENT MEDICATIONS — VistA RXOP active prescriptions as "
+    "of collection (AUTHORITATIVE; supersedes any med list embedded in older "
+    "notes) ==="
+)
+
 # Real-world VistA headers are surrounded by dash padding so they look
 # like ASCII separator bars:
 #
@@ -452,12 +463,24 @@ def _render_medications_from_rxop(rxop_body: str) -> str:
     if cur_name:
         _flush()
 
+    # Sentinel marking THIS block as the authoritative current-meds list
+    # (VistA RXOP active outpatient Rx as of collection). Embedded
+    # med-reconciliation blocks inside old notes carry the same
+    # "Active Outpatient Medications" header but are STALE snapshots; the
+    # current-meds extractor keys on this sentinel to read only the
+    # authoritative list. See RXOP_AUTHORITATIVE_SENTINEL.
     if not blocks:
-        return ("Active Outpatient Medications (including Supplies):\n"
-                + rxop_body.strip() + "\n")
+        # "No data available" / unparseable: authoritative source says the
+        # patient has no active outpatient prescriptions.
+        return (
+            RXOP_AUTHORITATIVE_SENTINEL + "\n"
+            + "Active Outpatient Medications (including Supplies):\n"
+            + rxop_body.strip() + "\n"
+        )
 
     return (
-        "Active Outpatient Medications (including Supplies):\n"
+        RXOP_AUTHORITATIVE_SENTINEL + "\n"
+        + "Active Outpatient Medications (including Supplies):\n"
         + "\n".join(blocks)
         + "\n"
         + "=" * 79

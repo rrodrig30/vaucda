@@ -29,7 +29,7 @@ def extract_social(note_content: str) -> str:
 
     # Pattern 1: Explicit "Social History:" section with proper boundaries
     # IMPORTANT: Stop at Family History, Past Medical History, etc. to prevent contamination
-    pattern = r'(?:Social History|SOCIAL|Social Hx|Social and personal history):\s*(.*?)(?=\n\s*(?:Family History|FAMILY:|Sexual History|SEXUAL:|ROS:|PE:|PHYSICAL|EXAM:|ASSESSMENT:|PLAN:|Review of Systems|Physical Exam|MEDICATIONS:|ALLERGIES:|======|Facility:|Note Narrative|Provider Narrative|Past Medical History|PAST MEDICAL|PMH:|Active [Pp]roblems|Computerized Problem List))'
+    pattern = r'(?:Social History|SOCIAL|Social Hx|Social and personal history):\s*(.*?)(?=\n\s*(?:Family History|FAMILY:|Sexual History|SEXUAL:|ROS:|PE:|PHYSICAL|EXAM:|ASSESSMENT:|PLAN:|\d+[\s-]*(?:point|pt)\.?\s+Review of Systems|Review of Systems|Physical Exam|MEDICATIONS:|ALLERGIES:|======|Facility:|Note Narrative|Provider Narrative|Past Medical History|PAST MEDICAL|PMH:|Active [Pp]roblems|Computerized Problem List))'
 
     match = re.search(pattern, note_content, re.IGNORECASE | re.DOTALL | re.MULTILINE)
     if match:

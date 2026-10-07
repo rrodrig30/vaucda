@@ -257,6 +257,25 @@ export const ragApi = {
   },
 
   /**
+   * Trigger a (re)build of the GraphRAG layer (admin only).
+   * Incremental: only processes chunks added since the last build, then
+   * re-detects communities and regenerates summaries. Runs in the background;
+   * poll getGraphRAGStatus() for progress.
+   */
+  rebuildGraphRAG: async (): Promise<any> => {
+    const response = await apiClient.post('/rag/rebuild-graphrag')
+    return response.data
+  },
+
+  /**
+   * Current GraphRAG build state + live coverage of the graph layer.
+   */
+  getGraphRAGStatus: async (): Promise<any> => {
+    const response = await apiClient.get('/rag/graphrag-status')
+    return response.data
+  },
+
+  /**
    * Ingest a new document into the knowledge base (admin only)
    */
   ingestDocument: async (request: DocumentIngestionRequest): Promise<DocumentIngestionResponse> => {

@@ -139,6 +139,22 @@ class LLMProviderError(Exception):
     pass
 
 
+def _infer_provider_from_model(model: Optional[str]) -> str:
+    """Best-effort provider for a bare model name, so a cloud-provider model that
+    reaches the legacy path (no task_config in scope — e.g. a worker thread where
+    the thread-local config didn't propagate) is NOT POSTed to Ollama (which 404s
+    on 'claude-opus-5'). Ollama models carry a ':tag' (llama3.1:8b,
+    gpt-oss:120b-cloud, deepseek-v4-pro:cloud) and stay local regardless of family."""
+    m = (model or "").strip().lower()
+    if not m or ":" in m:
+        return "ollama"
+    if m.startswith("claude") or m.startswith("anthropic"):
+        return "anthropic"
+    if m.startswith(("gpt-", "gpt4", "chatgpt", "o1", "o3", "o4")):
+        return "openai"
+    return "ollama"
+
+
 def synthesize_with_llm(
     prompt: str,
     model: Optional[str] = None,
@@ -178,9 +194,27 @@ def synthesize_with_llm(
     if current_config is not None:
         return _synthesize_with_config(prompt, current_config, system_prompt)
 
-    # Legacy behavior: use Ollama directly
+    # Legacy behavior: no task_config in scope.
     if model is None:
         model = settings.OLLAMA_DEFAULT_MODEL
+
+    # A caller may pass the user's configured Anthropic/OpenAI model here without a
+    # task_config (e.g. from a worker thread where the thread-local config didn't
+    # propagate). Route by the model name so a Claude/GPT model isn't mis-sent to
+    # Ollama (404). Ollama-tagged models (':') stay on the local path below.
+    _inferred = _infer_provider_from_model(model)
+    if _inferred != "ollama":
+        from app.services.llm_config_manager import LLMTaskConfig
+        _cfg = LLMTaskConfig(
+            provider=_inferred,
+            model=model,
+            temperature=temperature,
+            max_tokens=(max_tokens if max_tokens is not None else
+                        settings.ANTHROPIC_MAX_TOKENS if _inferred == "anthropic"
+                        else settings.OPENAI_MAX_TOKENS),
+        )
+        logger.info(f"Legacy path routing '{model}' to {_inferred} (no task_config in scope)")
+        return _synthesize_with_config(prompt, _cfg, system_prompt)
 
     if max_tokens is None:
         max_tokens = settings.OLLAMA_MAX_TOKENS
@@ -231,7 +265,7 @@ def synthesize_with_llm(
             raise LLMProviderError(f"Failed to connect to Ollama at {url}: timeout")
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
-            if status in (429, 500) and attempt < max_retries:
+            if status in (410, 429, 500) and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
                     f"LLM {status} (attempt {attempt}/{max_retries}), "
@@ -341,7 +375,10 @@ def _call_ollama_sync(
             raise LLMProviderError(f"Ollama timeout for model {config.model}")
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
-            if status in (429, 500, 502, 503, 504) and attempt < max_retries:
+            # 410 Gone = transient Ollama Cloud model-instance rotation (recovers
+            # in seconds); retry it like other transient upstream errors so a
+            # brief cloud blip doesn't fail the whole note/batch.
+            if status in (410, 429, 500, 502, 503, 504) and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
                     f"Ollama {status} (attempt {attempt}/{max_retries}), "
@@ -350,7 +387,7 @@ def _call_ollama_sync(
                 time.sleep(delay)
                 continue
             logger.error(f"Ollama HTTP error: {e}")
-            if status in (502, 503, 504):
+            if status in (410, 502, 503, 504):
                 raise LLMProviderError(
                     f"LLM upstream unavailable ({status}) for model "
                     f"{config.model}. The provider is overloaded or down. "
@@ -418,7 +455,10 @@ async def _call_ollama_async(
             raise LLMProviderError(f"Ollama timeout for model {config.model}")
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            if status in (429, 500, 502, 503, 504) and attempt < max_retries:
+            # 410 Gone = transient Ollama Cloud model-instance rotation (recovers
+            # in seconds); retry it like other transient upstream errors so a
+            # brief cloud blip doesn't fail the whole note/batch.
+            if status in (410, 429, 500, 502, 503, 504) and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
                     f"Ollama async {status} (attempt {attempt}/{max_retries}), "
@@ -427,7 +467,7 @@ async def _call_ollama_async(
                 await asyncio.sleep(delay)
                 continue
             logger.error(f"Ollama async HTTP error: {e}")
-            if status in (502, 503, 504):
+            if status in (410, 502, 503, 504):
                 raise LLMProviderError(
                     f"LLM upstream unavailable ({status}) for model "
                     f"{config.model}. The provider is overloaded or down. "
@@ -440,6 +480,29 @@ async def _call_ollama_async(
 
     logger.error(f"Ollama async failed after {max_retries} retries (429 Too Many Requests)")
     raise LLMProviderError(f"Ollama overloaded after {max_retries} retries")
+
+
+# Newer Claude models (and OpenAI reasoning models like o1/o3) have DEPRECATED
+# the `temperature` parameter and reject any request that includes it with a 400
+# ("`temperature` is deprecated for this model."). We can't know per-model up
+# front, so learn on first rejection and omit `temperature` proactively for that
+# model thereafter — avoiding a wasted 400 on each of the ~20 per-note agents.
+_TEMP_UNSUPPORTED_MODELS: set = set()
+
+
+def _strip_unsupported_temperature(payload: dict) -> None:
+    if payload.get("model") in _TEMP_UNSUPPORTED_MODELS:
+        payload.pop("temperature", None)
+
+
+def _is_temperature_rejection(status_code: int, body: str) -> bool:
+    return status_code == 400 and "temperature" in (body or "").lower()
+
+
+def _note_temperature_unsupported(model: str) -> None:
+    if model and model not in _TEMP_UNSUPPORTED_MODELS:
+        _TEMP_UNSUPPORTED_MODELS.add(model)
+        logger.info("Model %s rejects 'temperature'; omitting it going forward", model)
 
 
 def _call_anthropic_sync(
@@ -470,12 +533,20 @@ def _call_anthropic_sync(
         payload["system"] = system_prompt
 
     try:
+        _strip_unsupported_temperature(payload)
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers,
             json=payload,
             timeout=settings.ANTHROPIC_TIMEOUT
         )
+        if _is_temperature_rejection(response.status_code, response.text):
+            _note_temperature_unsupported(config.model)
+            payload.pop("temperature", None)
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers, json=payload, timeout=settings.ANTHROPIC_TIMEOUT,
+            )
         response.raise_for_status()
 
         result = response.json()
@@ -486,6 +557,10 @@ def _call_anthropic_sync(
     except requests.exceptions.Timeout:
         logger.error(f"Anthropic timeout after {settings.ANTHROPIC_TIMEOUT}s")
         raise LLMProviderError(f"Anthropic timeout for model {config.model}")
+    except requests.exceptions.HTTPError as e:
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        logger.error(f"Anthropic call failed: {e} | {body[:300]}")
+        raise LLMProviderError(f"Anthropic call failed: {e}: {body[:200]}")
     except Exception as e:
         logger.error(f"Anthropic call failed: {e}")
         raise LLMProviderError(f"Anthropic call failed: {e}")
@@ -518,12 +593,20 @@ def _call_openai_sync(
     }
 
     try:
+        _strip_unsupported_temperature(payload)
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=settings.OPENAI_TIMEOUT
         )
+        if _is_temperature_rejection(response.status_code, response.text):
+            _note_temperature_unsupported(config.model)
+            payload.pop("temperature", None)
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers, json=payload, timeout=settings.OPENAI_TIMEOUT,
+            )
         response.raise_for_status()
 
         result = response.json()
@@ -535,6 +618,10 @@ def _call_openai_sync(
     except requests.exceptions.Timeout:
         logger.error(f"OpenAI timeout after {settings.OPENAI_TIMEOUT}s")
         raise LLMProviderError(f"OpenAI timeout for model {config.model}")
+    except requests.exceptions.HTTPError as e:
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        logger.error(f"OpenAI call failed: {e} | {body[:300]}")
+        raise LLMProviderError(f"OpenAI call failed: {e}: {body[:200]}")
     except Exception as e:
         logger.error(f"OpenAI call failed: {e}")
         raise LLMProviderError(f"OpenAI call failed: {e}")
@@ -634,12 +721,20 @@ async def _call_anthropic_async(
         payload["system"] = system_prompt
 
     try:
+        _strip_unsupported_temperature(payload)
         async with httpx.AsyncClient(timeout=settings.ANTHROPIC_TIMEOUT) as client:
             response = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=headers,
                 json=payload
             )
+            if _is_temperature_rejection(response.status_code, response.text):
+                _note_temperature_unsupported(config.model)
+                payload.pop("temperature", None)
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers, json=payload,
+                )
             response.raise_for_status()
 
             result = response.json()
@@ -682,12 +777,20 @@ async def _call_openai_async(
     }
 
     try:
+        _strip_unsupported_temperature(payload)
         async with httpx.AsyncClient(timeout=settings.OPENAI_TIMEOUT) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
                 json=payload
             )
+            if _is_temperature_rejection(response.status_code, response.text):
+                _note_temperature_unsupported(config.model)
+                payload.pop("temperature", None)
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers, json=payload,
+                )
             response.raise_for_status()
 
             result = response.json()

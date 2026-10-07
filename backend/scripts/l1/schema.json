@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "L1NarrativeExtraction",
+  "schema_version": 2,
+  "description": "Structured clinical facts extracted from ONE narrative note segment. Every record carries a source_span (char offsets into the segment). Emit null/empty when a field is not present in THIS segment. v2: diagnoses are a list (cancer AND benign urologic dx); grading is cancer-aware (Gleason/GG, Fuhrman, WHO+stage); imaging is separate from procedures (interventions only); treatments link to their diagnosis; the segment is flagged urologic vs non-urologic.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["segment_id", "primary_context", "diagnoses", "treatment_events", "procedures", "imaging", "metastases"],
+  "properties": {
+    "segment_id": { "type": "string" },
+    "primary_context": {
+      "type": "string",
+      "enum": ["urologic", "non_urologic"],
+      "description": "non_urologic = a tumor-board/consult note whose primary cancer is NOT urologic (lung/colon/etc.). Still extract cross-specialty facts (chemo, radiation, hospitalization, palliative) but do NOT mint a urologic cancer diagnosis from such a note."
+    },
+    "diagnoses": {
+      "type": "array",
+      "description": "Every urologic diagnosis in this segment — cancers AND benign conditions (ED, BPH, urolithiasis, renal mass/cyst, hydronephrosis, ...). One entry per distinct diagnosis.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "name", "source_span"],
+        "properties": {
+          "id": { "type": "string", "description": "short stable ref within this segment, e.g. 'dx1' — treatments reference it via for_diagnosis" },
+          "category": { "type": "string", "enum": ["cancer", "benign", "indeterminate"], "description": "cancer = biopsy/pathology-confirmed malignancy. benign = a condition known benign (ED, BPH, stones, simple cyst). indeterminate = a mass/lesion of UNKNOWN pathology (e.g. an unbiopsied renal mass). NEVER label an unbiopsied/unconfirmed mass 'benign' — that has VA benefits implications." },
+          "name": { "type": "string", "description": "e.g. 'prostate adenocarcinoma', 'clear cell RCC', 'urothelial carcinoma' (cancer); 'erectile dysfunction', 'nephrolithiasis', 'simple renal cyst' (benign); 'renal mass of uncertain significance' / 'renal mass of unknown pathology' (indeterminate, NOT 'benign')" },
+          "site": { "type": ["string", "null"], "description": "'prostate', 'left kidney', 'bladder', ..." },
+          "diagnosis_date": { "type": ["string", "null"], "description": "ISO; biopsy-confirmed date for cancers, NOT earliest elevated-PSA date" },
+          "stage_tnm": { "type": ["string", "null"] },
+          "grade": { "$ref": "#/$defs/grade" },
+          "risk": { "type": ["string", "null"] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    },
+    "treatment_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["modality", "status", "source_span"],
+        "properties": {
+          "for_diagnosis": { "type": ["string", "null"], "description": "the diagnoses[].id this treatment targets (e.g. active-surveillance -> the RCC, prostatectomy -> the prostate cancer)" },
+          "modality": { "type": "string", "enum": ["prostatectomy", "radiation", "brachytherapy", "focal", "ADT", "ARSI", "chemotherapy", "radioligand", "immunotherapy", "active-surveillance", "nephrectomy", "partial-nephrectomy", "cystectomy", "TURBT", "intravesical", "other"] },
+          "agent": { "type": ["string", "null"], "description": "specific drug/technique when named (leuprolide, abiraterone, Lu-177 PSMA, IMRT, BCG, ...) — never collapse into modality" },
+          "start_date": { "type": ["string", "null"] },
+          "end_date": { "type": ["string", "null"], "description": "populate when a course range is documented so a START date is never rendered as completion" },
+          "status": { "type": "string", "enum": ["started", "ongoing", "completed", "discontinued", "declined", "planned"] },
+          "intent": { "type": ["string", "null"], "enum": ["definitive", "adjuvant", "neoadjuvant", "salvage", "palliative", "maintenance", null] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    },
+    "procedures": {
+      "type": "array",
+      "description": "INTERVENTIONS ONLY (biopsy, cystoscopy, TURBT, prostatectomy, ablation, stent, ureteroscopy, nephrectomy ...). NOT imaging (-> imaging[]), NOT labs/cultures/urine studies, NOT exam findings (DRE).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "source_span"],
+        "properties": {
+          "type": { "type": "string" },
+          "date": { "type": ["string", "null"], "description": "the PROCEDURE/collection date, NOT the results-notification/sign-out date" },
+          "finding": { "type": ["string", "null"] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    },
+    "imaging": {
+      "type": "array",
+      "description": "Imaging studies (CT, MRI, US, PET, PSMA-PET, bone scan, x-ray, NM) — separate from procedures.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["modality", "source_span"],
+        "properties": {
+          "modality": { "type": "string", "description": "CT abdomen/pelvis, prostate MRI, PSMA-PET, bone scan, renal US, ..." },
+          "date": { "type": ["string", "null"] },
+          "impression": { "type": ["string", "null"] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    },
+    "metastases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["site", "source_span"],
+        "properties": {
+          "site": { "type": "string" },
+          "date": { "type": ["string", "null"] },
+          "source_span": { "$ref": "#/$defs/span" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "span": {
+      "type": ["array", "null"],
+      "items": { "type": "integer", "minimum": 0 },
+      "minItems": 2, "maxItems": 2
+    },
+    "grade": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "Cancer-context-aware grade. Set `system` by cancer type and populate only the matching fields.",
+      "properties": {
+        "system": { "type": ["string", "null"], "enum": ["gleason-isup", "fuhrman", "who", "other", null] },
+        "gleason": { "type": ["string", "null"], "description": "prostate, e.g. '4+4'" },
+        "grade_group": { "type": ["integer", "null"], "minimum": 1, "maximum": 5, "description": "prostate ISUP grade group (MAX core)" },
+        "nuclear_grade": { "type": ["integer", "null"], "minimum": 1, "maximum": 4, "description": "RCC Fuhrman nuclear grade" },
+        "who_grade": { "type": ["string", "null"], "enum": ["low-grade", "high-grade", null], "description": "urothelial/bladder WHO grade" },
+        "bladder_stage": { "type": ["string", "null"], "description": "Ta / T1 / CIS / T2 / MIBC / ..." },
+        "value": { "type": ["string", "null"], "description": "free-text catch-all for other systems" }
+      }
+    }
+  }
+}

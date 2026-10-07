@@ -1,0 +1,17 @@
+{
+  "patient_id": "07_FOSTER_2388",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/Monday_7_6_2026/input/07_FOSTER_2388.txt",
+  "primary_diagnosis": {
+    "organ": "prostate",
+    "malignancy": "cancer"
+  },
+  "cancer_organs": [
+    "prostate"
+  ],
+  "notes": "prostate cancer s/p RRP 2000 + XRT 2021 + ADT; biochemical recurrence; adrenal/renal incidental"
+}

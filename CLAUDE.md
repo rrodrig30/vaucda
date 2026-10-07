@@ -205,7 +205,7 @@ The system uses a standardized urology clinic note template (see `urology_prompt
 - Use clinical data only from uploaded documents
 - No truncations - provide complete information
 - Full summarizations of all imaging and pathology
-- PSA Curve format: `[r] MMM DD, YYYY HH:MM    PSA_VALUE` (append H if >4)
+- PSA Curve format: `MMM DD, YYYY HH:MM    PSA_VALUE` (append H if >4; no `[r]` prefix)
 - Chain of thought reasoning for clinical decision-making
 
 ## Security & Compliance

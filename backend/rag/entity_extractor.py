@@ -115,6 +115,10 @@ class GraphExtractionResult:
     relationship_count: int
     chunk_count: int
     total_time_seconds: float
+    # Per-chunk provenance preserved BEFORE the by-name merge collapses it:
+    # (chunk_id, entity_name) pairs used to create Chunk-[:HAS_ENTITY]->Entity
+    # links by provenance rather than fragile content-substring matching.
+    mentions: List[Tuple[str, str]] = field(default_factory=list)
 
 
 class EntityExtractor:
@@ -168,8 +172,8 @@ Return ONLY the merged description text, nothing else."""
 
     def __init__(
         self,
-        ollama_base_url: str = "http://localhost:11434",
-        model: str = "llama3.1:8b",
+        ollama_base_url: Optional[str] = None,
+        model: Optional[str] = None,
         entity_types: Optional[List[str]] = None,
         relationship_types: Optional[List[str]] = None,
         max_concurrent: int = 5,
@@ -179,13 +183,24 @@ Return ONLY the merged description text, nothing else."""
         Initialize the entity extractor.
 
         Args:
-            ollama_base_url: Ollama API base URL
-            model: LLM model to use
+            ollama_base_url: Ollama API base URL. None -> resolve from settings.
+            model: LLM model to use. None -> resolve from settings
+                (GRAPHRAG_LLM_MODEL); never a hardcoded weak-model literal
+                (rules.txt: config via .env only).
             entity_types: List of entity types to extract
             relationship_types: List of relationship types to extract
             max_concurrent: Max concurrent extraction requests
             timeout: Request timeout in seconds
         """
+        if ollama_base_url is None or model is None:
+            try:
+                from app.config import settings as _app_settings
+                gr = _app_settings.graphrag_model_config()
+            except Exception:
+                gr = {"ollama_base_url": "http://localhost:11434",
+                      "llm_model": "gpt-oss:120b-cloud"}
+            ollama_base_url = ollama_base_url or gr["ollama_base_url"]
+            model = model or gr["llm_model"]
         self.ollama_url = ollama_base_url
         self.model = model
         self.entity_types = entity_types or CLINICAL_ENTITY_TYPES
@@ -207,9 +222,17 @@ Return ONLY the merged description text, nothing else."""
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            # Constrain the model to emit syntactically valid JSON. Without this,
+            # gpt-oss/cloud models emit JSON with trailing commas / unescaped
+            # characters that json.loads rejects — which was silently dropping
+            # ~46% of chunks ("Failed to parse JSON response") and leaving them
+            # with zero entities.
+            "format": "json",
             "options": {
                 "temperature": 0.1,  # Low temperature for consistent extraction
-                "num_predict": 2048,
+                # Headroom so entity-rich clinical chunks aren't truncated
+                # mid-JSON (which format:json can't always close).
+                "num_predict": 4096,
                 "num_ctx": 8192,
             }
         }
@@ -231,20 +254,97 @@ Return ONLY the merged description text, nothing else."""
             return ""
 
     def _parse_extraction_response(self, response: str) -> Tuple[List[Dict], List[Dict]]:
-        """Parse LLM response into entities and relationships."""
-        # Try to extract JSON from response
-        try:
-            # Find JSON block in response
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                data = json.loads(json_match.group())
-                entities = data.get("entities", [])
-                relationships = data.get("relationships", [])
-                return entities, relationships
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON response: {e}")
+        """Parse LLM response into entities and relationships.
 
+        Robust to the ways models wrap/format JSON: markdown code fences, prose
+        around the object, and (the big one) trailing commas / minor syntax
+        slips that strict json.loads rejects. Tries progressively looser
+        strategies before giving up so a single stray comma doesn't discard an
+        entire chunk's entities.
+        """
+        if not response or not response.strip():
+            return [], []
+
+        def _extract(data) -> Tuple[List[Dict], List[Dict]]:
+            return data.get("entities", []) or [], data.get("relationships", []) or []
+
+        # Strip markdown code fences (```json ... ```), common with chat models.
+        cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", response.strip(),
+                         flags=re.IGNORECASE)
+
+        # 1) Direct parse — works when the model emits clean JSON (format:json).
+        try:
+            return _extract(json.loads(cleaned))
+        except json.JSONDecodeError:
+            pass
+
+        # 2) Greedy brace slice (first '{' .. last '}') then parse.
+        json_match = re.search(r'\{[\s\S]*\}', cleaned)
+        candidate = json_match.group() if json_match else cleaned
+        try:
+            return _extract(json.loads(candidate))
+        except json.JSONDecodeError:
+            pass
+
+        # 3) Repair the most common offenders and retry: trailing commas before
+        #    a closing } or ], and stray control characters.
+        repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", repaired)
+        try:
+            return _extract(json.loads(repaired))
+        except json.JSONDecodeError:
+            pass
+
+        # 4) Salvage: the model routinely emits an unescaped quote/newline inside
+        #    a `description`, which breaks strict JSON deep in a large response
+        #    ("Expecting ',' delimiter"). Rather than discard the whole chunk,
+        #    pull each flat object's key fields with per-object regex and ignore
+        #    the fragile description. name+type (and rel source/target) are all
+        #    the graph actually needs.
+        ents, rels = self._salvage_objects(cleaned)
+        if ents or rels:
+            return ents, rels
+
+        logger.warning("Failed to parse JSON response (unrecoverable after salvage)")
         return [], []
+
+    @staticmethod
+    def _salvage_objects(text: str) -> Tuple[List[Dict], List[Dict]]:
+        """Regex-salvage entities/relationships from malformed JSON.
+
+        Truncation-robust: scans EVERY flat object (entity/relationship objects
+        have no nested braces) across the whole response and classifies each by
+        its fields, rather than trying to isolate the entities[]/relationships[]
+        arrays — so a response cut off mid-array (num_predict limit) still yields
+        all of its complete objects. A broken string in one object can't poison
+        the others.
+        """
+        _str = r'"((?:[^"\\]|\\.)*)"'  # a JSON string body (handles escapes)
+
+        def _field(obj: str, key: str):
+            m = re.search(rf'"{key}"\s*:\s*{_str}', obj)
+            return m.group(1) if m else None
+
+        ents: List[Dict] = []
+        rels: List[Dict] = []
+        seen_ent, seen_rel = set(), set()
+        for obj in re.findall(r'\{[^{}]*\}', text):
+            src, tgt = _field(obj, "source"), _field(obj, "target")
+            if src and tgt:  # relationship object
+                key = (src, tgt, _field(obj, "type") or "")
+                if key not in seen_rel:
+                    seen_rel.add(key)
+                    rels.append({"source": src, "target": tgt,
+                                 "type": _field(obj, "type") or "related_to",
+                                 "description": _field(obj, "description") or ""})
+                continue
+            name = _field(obj, "name")
+            if name:  # entity object
+                if name not in seen_ent:
+                    seen_ent.add(name)
+                    ents.append({"name": name, "type": _field(obj, "type") or "Concept",
+                                 "description": _field(obj, "description") or ""})
+        return ents, rels
 
     async def extract_from_chunk(
         self,
@@ -553,17 +653,31 @@ Return ONLY the merged description text, nothing else."""
             if progress_callback:
                 progress_callback(completed, total)
 
+        # Capture (chunk_id, entity_name) provenance BEFORE the by-name merge
+        # collapses many chunks' mentions of the same entity into one node.
+        # This is what lets store_entities_in_neo4j link each chunk to exactly
+        # the entities extracted from it.
+        mentions = list({
+            (e.source_chunk_id, e.name)
+            for e in all_entities
+            if e.source_chunk_id and e.name
+        })
+
         # Merge duplicates (sync concat pass + async LLM-merge for the heavy hitters)
         merged_entities = self._merge_entities(all_entities)
         await self._llm_merge_descriptions_async(merged_entities)
         valid_entity_names = set(merged_entities.keys())
         merged_relationships = self._merge_relationships(all_relationships, valid_entity_names)
 
+        # Keep only mentions whose entity survived the merge (by name).
+        mentions = [(cid, name) for (cid, name) in mentions if name in valid_entity_names]
+
         elapsed = time.time() - start_time
 
         logger.info(
             f"Extracted {len(merged_entities)} entities and {len(merged_relationships)} "
-            f"relationships from {len(chunks)} chunks in {elapsed:.1f}s"
+            f"relationships from {len(chunks)} chunks in {elapsed:.1f}s "
+            f"({len(mentions)} chunk-entity mentions)"
         )
 
         return GraphExtractionResult(
@@ -572,7 +686,8 @@ Return ONLY the merged description text, nothing else."""
             entity_count=len(merged_entities),
             relationship_count=len(merged_relationships),
             chunk_count=len(chunks),
-            total_time_seconds=elapsed
+            total_time_seconds=elapsed,
+            mentions=mentions,
         )
 
 
@@ -723,6 +838,35 @@ async def store_entities_in_neo4j(
             )
 
     logger.info(f"Stored {stored} entities and {rels_total} relationships")
+
+    # Link chunks to their entities BY PROVENANCE (source_chunk_id captured at
+    # extraction), not by content-substring matching. Requires chunks to carry a
+    # stable `id` (set at ingestion / backfilled). An index on Chunk.id keeps the
+    # per-mention MATCH O(log n) instead of a full label scan.
+    mentions = getattr(extraction_result, "mentions", None) or []
+    if mentions:
+        try:
+            await neo4j_client.execute_query(
+                "CREATE INDEX chunk_id_index IF NOT EXISTS FOR (c:Chunk) ON (c.id)"
+            )
+        except Exception as idx_error:
+            logger.warning(f"Could not create Chunk.id index: {idx_error}")
+
+        link_query = """
+        UNWIND $pairs AS p
+        MATCH (c:Chunk {id: p.chunk_id})
+        MATCH (e:Entity {name: p.name})
+        MERGE (c)-[:HAS_ENTITY]->(e)
+        """
+        link_batch = 1000
+        pairs = [{"chunk_id": cid, "name": name} for (cid, name) in mentions]
+        linked = 0
+        for i in range(0, len(pairs), link_batch):
+            await neo4j_client.execute_query(link_query, {"pairs": pairs[i:i + link_batch]})
+            linked += len(pairs[i:i + link_batch])
+            if linked % 10000 == 0 or linked == len(pairs):
+                logger.info(f"Linked chunk-entity mentions: {linked} / {len(pairs)}")
+        logger.info(f"Created HAS_ENTITY links for {len(pairs)} mentions")
 
     return stored
 

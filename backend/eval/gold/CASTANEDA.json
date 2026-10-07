@@ -1,0 +1,22 @@
+{
+  "patient_id": "CASTANEDA",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "logs/input.txt",
+  "primary_diagnosis": {
+    "organ": "penile",
+    "malignancy": "cancer"
+  },
+  "cancer_organs": [
+    "penile"
+  ],
+  "forbidden_diagnoses": [
+    "benign bladder pathology",
+    "prostate cancer",
+    "bladder cancer"
+  ],
+  "notes": "pT2N0 SCCa of penis s/p glansectomy + bilateral ILND, NED, surveillance"
+}

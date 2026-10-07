@@ -69,6 +69,8 @@ export const Settings: React.FC = () => {
     stage2_use_rag: true,
     stage2_use_graphrag: true,
     stage2_rag_top_k: 5,
+    // GraphRAG knowledge-graph build/retrieval model (blank = server default)
+    graphrag_llm_model: '',
   })
 
   // Per-task "model max" hints from /llm/model-context-size, displayed under each input
@@ -116,6 +118,16 @@ export const Settings: React.FC = () => {
     password: '',
   })
   const [showOpenEvidencePassword, setShowOpenEvidencePassword] = useState(false)
+
+  // LLM provider API keys (system-wide). The server never returns the key
+  // itself — only a "configured" flag + masked last-4 hint.
+  const [apiKeys, setApiKeys] = useState({ anthropic: '', openai: '' })
+  const [apiKeyStatus, setApiKeyStatus] = useState({
+    anthropic: { configured: false, hint: null as string | null },
+    openai: { configured: false, hint: null as string | null },
+  })
+  const [showApiKeys, setShowApiKeys] = useState({ anthropic: false, openai: false })
+  const [savingApiKey, setSavingApiKey] = useState<'anthropic' | 'openai' | null>(null)
 
   // System prompt editor state
   const [systemPrompt, setSystemPrompt] = useState('')
@@ -221,6 +233,18 @@ export const Settings: React.FC = () => {
         highlight_abnormal_values: settingsData.display_preferences?.highlight_abnormal_values ?? true,
       })
 
+      // LLM provider API key status (booleans + masked hints only)
+      setApiKeyStatus({
+        anthropic: {
+          configured: settingsData.anthropic_configured ?? false,
+          hint: settingsData.anthropic_key_hint ?? null,
+        },
+        openai: {
+          configured: settingsData.openai_configured ?? false,
+          hint: settingsData.openai_key_hint ?? null,
+        },
+      })
+
       // Load task-specific LLM settings
       // Note: Model names are loaded from backend API, never hardcoded
       // Empty model string means "use first available model from selected provider"
@@ -245,6 +269,7 @@ export const Settings: React.FC = () => {
           stage2_use_rag: settingsData.stage2_llm?.use_rag ?? true,
           stage2_use_graphrag: settingsData.stage2_llm?.use_graphrag ?? true,
           stage2_rag_top_k: settingsData.stage2_llm?.rag_top_k ?? 5,
+          graphrag_llm_model: settingsData.graphrag_llm_model ?? '',
         }))
 
         // Populate the "Model max" hints once for whatever model the user
@@ -472,6 +497,7 @@ export const Settings: React.FC = () => {
         stage2_use_rag: taskLLMConfig.stage2_use_rag,
         stage2_use_graphrag: taskLLMConfig.stage2_use_graphrag,
         stage2_rag_top_k: taskLLMConfig.stage2_rag_top_k,
+        graphrag_llm_model: taskLLMConfig.graphrag_llm_model,
       }
 
       await settingsApi.updateSettings(updateRequest)
@@ -652,6 +678,37 @@ export const Settings: React.FC = () => {
     }
   }
 
+  // Save (or clear) a single provider API key. Blank input = no-op; use "Remove"
+  // to clear. On success the provider's model dropdowns are refreshed.
+  const handleSaveApiKey = async (provider: 'anthropic' | 'openai', clear = false) => {
+    const value = clear ? '' : apiKeys[provider].trim()
+    if (!clear && !value) return
+    try {
+      setSavingApiKey(provider)
+      const field = provider === 'anthropic' ? 'anthropic_api_key' : 'openai_api_key'
+      const updated = await settingsApi.updateSettings({ [field]: value } as UpdateSettingsRequest)
+      setApiKeyStatus(prev => ({
+        ...prev,
+        [provider]: {
+          configured: provider === 'anthropic'
+            ? (updated.anthropic_configured ?? false)
+            : (updated.openai_configured ?? false),
+          hint: provider === 'anthropic'
+            ? (updated.anthropic_key_hint ?? null)
+            : (updated.openai_key_hint ?? null),
+        },
+      }))
+      setApiKeys(prev => ({ ...prev, [provider]: '' }))
+      // A newly-enabled provider now has selectable models.
+      loadAllProviderModels()
+    } catch (error: any) {
+      const msg = error?.detail || error?.response?.data?.detail || error?.message || 'Unknown error'
+      alert(`Failed to ${clear ? 'remove' : 'save'} ${provider} API key: ${msg}`)
+    } finally {
+      setSavingApiKey(null)
+    }
+  }
+
   const handleTestOpenEvidence = () => {
     if (openEvidenceCredentials.username && openEvidenceCredentials.password) {
       window.open('https://app.openevidence.com', '_blank')
@@ -763,6 +820,74 @@ export const Settings: React.FC = () => {
                   helpText="Maximum response length"
                 />
               </div>
+            </div>
+          </Card>
+
+          <Card
+            title="LLM Provider API Keys"
+            description="Required to use Anthropic Claude or OpenAI GPT. Keys are encrypted at rest, applied to every processing stage that uses the provider, and never displayed. Ollama (local) needs no key."
+          >
+            <div className="space-y-5">
+              {(['anthropic', 'openai'] as const).map((prov) => {
+                const meta = prov === 'anthropic'
+                  ? { label: 'Anthropic Claude', placeholder: 'sk-ant-...' }
+                  : { label: 'OpenAI GPT', placeholder: 'sk-...' }
+                const status = apiKeyStatus[prov]
+                return (
+                  <div key={prov} className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-medium">{meta.label}</label>
+                      {status.configured ? (
+                        <span className="flex items-center gap-1 text-xs text-success">
+                          <FiCheckCircle /> Configured{status.hint ? ` (${status.hint})` : ''}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-gray-500 dark:text-gray-400">Not configured</span>
+                      )}
+                    </div>
+                    <div className="relative">
+                      <Input
+                        type={showApiKeys[prov] ? 'text' : 'password'}
+                        value={apiKeys[prov]}
+                        onChange={(e) => setApiKeys({ ...apiKeys, [prov]: e.target.value })}
+                        placeholder={status.configured ? 'Enter a new key to replace' : meta.placeholder}
+                        autoComplete="off"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowApiKeys({ ...showApiKeys, [prov]: !showApiKeys[prov] })}
+                        className="absolute right-3 top-3 text-gray-400 hover:text-gray-600"
+                        aria-label={showApiKeys[prov] ? 'Hide key' : 'Show key'}
+                      >
+                        {showApiKeys[prov] ? <FiEyeOff /> : <FiEye />}
+                      </button>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        onClick={() => handleSaveApiKey(prov)}
+                        isLoading={savingApiKey === prov}
+                        disabled={!apiKeys[prov].trim() || savingApiKey === prov}
+                        icon={<FiSave />}
+                      >
+                        Save Key
+                      </Button>
+                      {status.configured && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => handleSaveApiKey(prov, true)}
+                          disabled={savingApiKey === prov}
+                          icon={<FiTrash2 />}
+                        >
+                          Remove
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           </Card>
 
@@ -1064,6 +1189,28 @@ export const Settings: React.FC = () => {
                         helpText="Number of knowledge base results to retrieve"
                       />
                     )}
+
+                    <div>
+                      <label className="block text-sm font-medium mb-1">
+                        GraphRAG Knowledge-Graph Model
+                      </label>
+                      <input
+                        type="text"
+                        list="graphrag-model-options"
+                        value={taskLLMConfig.graphrag_llm_model}
+                        onChange={(e) => setTaskLLMConfig({ ...taskLLMConfig, graphrag_llm_model: e.target.value })}
+                        placeholder="e.g. gpt-oss:120b-cloud"
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-sm"
+                      />
+                      <datalist id="graphrag-model-options">
+                        {availableModels.map((m) => (<option key={m} value={m} />))}
+                      </datalist>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Model used to BUILD and query the knowledge graph (entity extraction,
+                        community summarization, map-reduce). Applies to "Rebuild GraphRAG Layer"
+                        in the Knowledge Base. Leave blank to use the server default.
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>

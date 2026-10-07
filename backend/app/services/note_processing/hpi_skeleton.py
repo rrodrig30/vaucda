@@ -245,12 +245,21 @@ def _format_treatment_timeline(timeline) -> List[str]:
             if (prev is None) or (dk > prev[0]):
                 staging_by_tier[tier] = (dk, dd, e.modality)
 
-    # Emit ordered rows
+    # Emit ordered rows. Treatments begun (or completed) on the SAME date are
+    # combined into ONE beat ("started ADT and radiation") so the HPI renders a
+    # single clause instead of two near-identical repeated sentences.
     rows: List[Tuple[str, str]] = []  # (date_key, phrase)
-    for mod, (dk, dd) in started.items():
-        rows.append((dk, f"[{dd}] started {mod}"))
-    for mod, (dk, dd) in completed.items():
-        rows.append((dk, f"[{dd}] completed {mod}"))
+
+    def _emit_grouped(bucket: dict, verb: str) -> None:
+        by_date: dict = {}  # (dk, dd) -> [modalities]
+        for mod, (dk, dd) in bucket.items():
+            by_date.setdefault((dk, dd), []).append(mod)
+        for (dk, dd), mods in by_date.items():
+            phrase = " and ".join(dict.fromkeys(mods))  # dedup, preserve order
+            rows.append((dk, f"[{dd}] {verb} {phrase}"))
+
+    _emit_grouped(started, "started")
+    _emit_grouped(completed, "completed")
     for mod, (dk, dd) in restarted.items():
         rows.append((dk, f"[{dd}] RESTARTED {mod}"))
     for mod, (dk, dd) in declined.items():
@@ -346,6 +355,11 @@ _REGIMEN_KEEP_PATTERNS = (
 )
 
 
+_REGIMEN_CALCIUM_SALT_RE = re.compile(
+    r"\b\w+statin\s+calcium\b|\bleucovorin\s+calcium\b|\bcalcium\s+channel\b|"
+    r"\b(?:diltiazem|verapamil|amlodipine|nifedipine)\b", re.IGNORECASE)
+
+
 def _clean_current_regimen(items: List[str]) -> List[str]:
     """Filter the raw active-treatments list down to actual med lines.
 
@@ -365,6 +379,11 @@ def _clean_current_regimen(items: List[str]) -> List[str]:
         if not raw or not raw.strip():
             continue
         line = re.sub(r"\s+", " ", raw).strip()
+        # A calcium SALT of a non-urologic drug ("Atorvastatin Calcium 40Mg",
+        # "Rosuvastatin Calcium", "Leucovorin Calcium") is not the calcium /
+        # vitamin D supplement the keep-pattern targets.
+        if _REGIMEN_CALCIUM_SALT_RE.search(line):
+            continue
         # Drop entries whose start is a known noise hint
         ll = line.lower()
         if any(ll.startswith(h) for h in _REGIMEN_DROP_HINTS):
