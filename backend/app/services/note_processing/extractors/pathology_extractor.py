@@ -1232,6 +1232,17 @@ def extract_pathology(clinical_document: str) -> str:
     if addendum_pathology:
         pathology_reports.append(addendum_pathology)
 
+    # Germline / somatic genomic test reports (genetics notes, outside labs) —
+    # a negative BRCA/ATM/HOXB13 panel is a result the Assessment/Plan rely on
+    # (PARP-inhibitor eligibility, cascade testing) and belongs here.
+    try:
+        from .genomics_extractor import extract_genomic_testing
+        for g in extract_genomic_testing(clinical_document):
+            if g not in pathology_reports:
+                pathology_reports.append(g)
+    except Exception:  # noqa: BLE001
+        pass
+
     # Catch-all urologic pathology — runs LAST so it can dedup against
     # all earlier paths (specialized extractors AND the section-split
     # loop below). See the misc_dedup block at the end of this function.

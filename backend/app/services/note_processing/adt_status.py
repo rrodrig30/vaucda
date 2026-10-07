@@ -455,11 +455,45 @@ def _scan_order_lines(text: str, family: str):
     return dose, route, interval, order_status, has_order
 
 
-def _collect_injection_dates(text: str) -> List[Tuple[int, int, int, str]]:
+# A narrative injection date is a SCHEDULED dose, not a given one, when the
+# sentence says so ("Return 09/02/2026 for Eligard injection", "Eligard injection
+# scheduled for 09/02/2026", an ORDERS line) — or when the date falls AFTER the
+# note that mentions it (a note cannot record a dose that hasn't happened).
+_SCHED_CUE_RE = re.compile(
+    r"\breturn\b|\brtc\b|schedul|\bdue\b|\bnext\b|\bwill\b|\borders?\s*:|appointment|"
+    r"\bplan(?:ned|s)?\b|\bfor\s+(?:his|her|the)?\s*(?:eligard|lupron|leuprolide|"
+    r"zoladex|degarelix|adt)\s+injection\b", re.I)
+
+
+def _enclosing_note_dates(text: str) -> List[Tuple[int, Tuple[int, int, int]]]:
+    """[(offset, ymd)] of every recognizable note header, in document order."""
+    out = []
+    for m in _NOTE_HDR_RE.finditer(text or ""):
+        ymd = _header_ymd(m)
+        if ymd:
+            out.append((m.start(), ymd))
+    return out
+
+
+def _collect_injection_dates(text: str, vdt: Optional[Tuple[int, int, int]] = None
+                             ) -> List[Tuple[int, int, int, str]]:
     """Dates TIGHTLY tied to an injection/ADT-start phrase (agent/'injection'
     directly adjacent to the date), most-recent last. Rejects lab / PSA /
-    appointment dates that merely sit near the word 'injection'."""
+    appointment dates that merely sit near the word 'injection', scheduling
+    language, and any date later than the note it appears in (or than the visit
+    date `vdt` when the text has no note headers)."""
     out = []
+    hdrs = _enclosing_note_dates(text)
+
+    def _note_date_at(pos: int):
+        cur = None
+        for off, ymd in hdrs:
+            if off <= pos:
+                cur = ymd
+            else:
+                break
+        return cur
+
     # (regex-template, kind). kind: 'start' (documented first/started), 'last'
     # (documented last injection), 'generic' (agent+injection+date, side unknown).
     # Each template is instantiated for BOTH the numeric (_DATE) and month-name
@@ -500,8 +534,25 @@ def _collect_injection_dates(text: str) -> List[Tuple[int, int, int, str]]:
                     continue
                 g = m.groups()
                 d = _parse_date(g[-3], g[-2], g[-1])
-                if d:
-                    out.append((d[0], d[1], d[2], d[3], kind))
+                if not d:
+                    continue
+                # Scheduling language in the CLAUSE holding the date (from the
+                # previous sentence boundary to just past the date) -> not a dose.
+                # Only that clause: "...administered on January 8, 2026, and he is
+                # due again in July" keeps its dose.
+                cs = max(text.rfind("\n", 0, m.start()), text.rfind(". ", 0, m.start()),
+                         text.rfind("; ", 0, m.start())) + 1
+                clause = text[cs:m.end() + 12]
+                if kind != "start" and _SCHED_CUE_RE.search(clause):
+                    continue
+                # A date AFTER the note that mentions it (or after the visit) is a
+                # future appointment, never a given dose.
+                ref = _note_date_at(m.start()) if hdrs else vdt
+                if ref and (d[0], d[1], d[2]) > ref and d[3].count("/") == 2:
+                    continue
+                if ref and d[3].count("/") == 1 and (d[0], d[1]) > (ref[0], ref[1]):
+                    continue
+                out.append((d[0], d[1], d[2], d[3], kind))
     return out
 
 
@@ -754,7 +805,7 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     # records (the nursing "Administered Eligard 45MG SQ ..." line stamped with
     # its note's date). Deduped so one dose recorded three ways counts once.
     admin_dates = _collect_note_scoped_administrations(raw_text)
-    dates = _dedupe_dates(_collect_injection_dates(raw_text) + admin_dates)
+    dates = _dedupe_dates(_collect_injection_dates(raw_text, vdt) + admin_dates)
     # A documented START/first-injection date exists (vs only last/generic dates).
     st.start_is_documented = any(len(d) > 4 and d[4] == "start" for d in dates)
     if dates:

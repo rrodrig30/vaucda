@@ -394,7 +394,13 @@ def _find_treatment_events(
             # phrasing that dominates real clinician prose.
             preceding = text[max(0, m.start() - 80):m.start()]
             trailing = text[m.end():m.end() + 60]
-            if not (trigger_re.search(preceding) or trigger_re.search(trailing)):
+            # A trailing trigger must sit in the SAME clause as the modality.
+            # "Started eligard 9/2025, completed 30 days of bicalutamide" — the
+            # "completed" after the comma belongs to bicalutamide, and read as
+            # an Eligard COMPLETED event it told the Assessment the patient had
+            # finished ADT he is still receiving.
+            trailing_clause = re.split(r"[,;.\n]|\band\b", trailing, maxsplit=1)[0]
+            if not (trigger_re.search(preceding) or trigger_re.search(trailing_clause)):
                 continue
             if event_type == "TREATMENT_DECLINED":
                 # The decline trigger and treatment word together are the event.
@@ -1536,11 +1542,18 @@ def classify_current_phase(
         if last_adt_action is None or e.date_key > last_adt_action.date_key:
             last_adt_action = e
 
-    if has_mcrpc or (has_ar_pathway_start and has_metastatic):
+    # Castration resistance is a DOCUMENTED determination (mCRPC / castration-
+    # resistant stated in the chart). An AR-pathway agent (enzalutamide,
+    # apalutamide, abiraterone, darolutamide) is standard INTENSIFICATION for
+    # metastatic hormone-SENSITIVE disease, so "ARSI + metastatic" must never
+    # imply resistance — it labelled a responding mHSPC patient (PSA 0.01 on
+    # castrate testosterone) as mCRPC.
+    if has_mcrpc:
         return "METASTATIC_CASTRATION_RESISTANT"
 
-    if has_mhspc or (has_metastatic and last_adt_action
-                     and last_adt_action.event_type in ("TREATMENT_STARTED", "TREATMENT_RESTARTED")):
+    adt_started = any(e.event_type in ("TREATMENT_STARTED", "TREATMENT_RESTARTED")
+                      for e in adt_events)
+    if has_mhspc or (has_metastatic and (has_ar_pathway_start or adt_started)):
         return "METASTATIC_HORMONE_SENSITIVE"
 
     if last_adt_action and last_adt_action.event_type == "TREATMENT_RESTARTED":

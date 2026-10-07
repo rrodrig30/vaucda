@@ -1161,12 +1161,29 @@ def build_urology_note(
         else:
             synthesis_tasks['social'] = lambda: synthesize_social(gu_notes, non_gu_notes)
         if document_family:
-            synthesis_tasks['family'] = lambda: document_family
+            synthesis_tasks['family'] = lambda: _with_genetics_family(document_family)
         else:
-            synthesis_tasks['family'] = lambda: synthesize_family(gu_notes, non_gu_notes)
+            synthesis_tasks['family'] = lambda: _with_genetics_family(
+                synthesize_family(gu_notes, non_gu_notes))
     else:
         synthesis_tasks['social'] = lambda: synthesize_social(gu_notes, non_gu_notes)
-        synthesis_tasks['family'] = lambda: synthesize_family(gu_notes, non_gu_notes)
+        synthesis_tasks['family'] = lambda: _with_genetics_family(
+            synthesize_family(gu_notes, non_gu_notes))
+
+    def _with_genetics_family(family_text):
+        """Append the genetics evaluation's family-cancer history + germline
+        result (lives in a GENETICS note's IMPRESSION, which neither the
+        document-level family extractor nor the note Family fields see)."""
+        try:
+            from .extractors.genomics_extractor import extract_genetics_family_history
+            fh = extract_genetics_family_history(clinical_document or "")
+        except Exception:  # noqa: BLE001
+            fh = None
+        if not fh:
+            return family_text
+        if family_text and fh[:40].lower() in family_text.lower():
+            return family_text
+        return (family_text.rstrip() + "\n" + fh) if (family_text or "").strip() else fh
 
     # PSA synthesis - prefer document-level
     if document_psa:
@@ -1237,11 +1254,17 @@ def build_urology_note(
                 # against the deterministic regex extraction. Keeps the granular
                 # pathology guaranteed-complete IN THE PATHOLOGY SECTION so the
                 # holistic HPI can stay cohesive without restating it.
-                return ensure_pathology_completeness(composed, _doc_path or "")
+                return _ensure_genomic(ensure_pathology_completeness(composed, _doc_path or ""))
         except Exception as _pe:  # noqa: BLE001
             logger.warning(f"Pathology composer error (using regex synth): {_pe}")
-        return ensure_pathology_completeness(
-            synthesize_pathology(_doc_path, gu_notes), _doc_path or "")
+        return _ensure_genomic(ensure_pathology_completeness(
+            synthesize_pathology(_doc_path, gu_notes), _doc_path or ""))
+
+    def _ensure_genomic(text):
+        # A germline/somatic genomic report extracted deterministically must
+        # survive the LLM pathology synthesis (it dropped the negative BRCA panel).
+        from .extractors.genomics_extractor import ensure_genomic_lines
+        return ensure_genomic_lines(text, _doc_path or "")
 
     synthesis_tasks['pathology'] = _pathology_task
 
