@@ -834,6 +834,16 @@ def _render_pathology_from_sp(sp_body: str) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+# Qualitative results on VistA lab rows (urinalysis, microbiology, POC):
+# "URINE PROTEIN    Negative    mg/dL    Ref: Negative", "APPEARANCE  Clear",
+# "URINE COLOR  Dark Yellow". A numeric-only result pattern silently dropped
+# every one of these from the six-month Chem & Hematology block.
+_QUALITATIVE_RESULT = (
+    r"(?:Negative|Positive|Trace|Normal|Abnormal|Clear|Cloudy|Turbid|Hazy|Dark\s+Yellow|"
+    r"Light\s+Yellow|Yellow|Amber|Straw|Orange|Red|Brown|Colorless|Small|Moderate|Large|"
+    r"Rare|Few|Many|Occasional|Detected|Not\s+Detected|Reactive|Non-?reactive|"
+    r"Present|Absent|Intact|Adequate|Inadequate)(?![A-Za-z])"
+)
 _VISTA_LAB_ROW_RE = re.compile(
     # CRITICAL: every inter-field separator uses [ \t]+ rather than \s+
     # so a missing trailing field (e.g. "STRUVITE (442)  0.04" with no
@@ -844,9 +854,9 @@ _VISTA_LAB_ROW_RE = re.compile(
     r"^(\d{1,2})/(\d{1,2})/(\d{4})[ \t]+(\d{1,2}:\d{2})[ \t]+"
     r"(\S+)[ \t]+"             # specimen (SERUM / URINE / FECES / BLOOD)
     r"(.+?)[ \t]{2,}"          # test name (ends at >=2-space gap)
-    r"([<>]?\d+\.?\d*)"        # numeric result
+    r"([<>]?\d+\.?\d*|" + _QUALITATIVE_RESULT + r")"   # numeric OR qualitative result
     r"[ \t]*([HL]?)[ \t]*"     # H / L flag
-    r"([A-Za-z%/0-9.]*)"       # units
+    r"((?!Ref\b)[A-Za-z%/0-9.]*)"   # units (never the 'Ref:' label of a qualitative row)
     r"[ \t]*([^\n]*)$",        # ref range — explicit non-newline
     re.MULTILINE,
 )
@@ -856,8 +866,8 @@ _VISTA_LAB_ROW_RE = re.compile(
 _VISTA_LAB_DITTO_RE = re.compile(
     r'^\s*"\s+"\s+"?\s*'
     r"(.+?)\s{2,}"
-    r"([<>]?\d+\.?\d*)\s*([HL]?)\s*"
-    r"([A-Za-z%/0-9.]*)\s*(.*)$",
+    r"([<>]?\d+\.?\d*|" + _QUALITATIVE_RESULT + r")\s*([HL]?)\s*"
+    r"((?!Ref\b)[A-Za-z%/0-9.]*)\s*(.*)$",
     re.MULTILINE,
 )
 

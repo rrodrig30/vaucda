@@ -21,7 +21,12 @@ GENERAL_LABS_WINDOW_MONTHS = 6
 # Define which labs to keep for each category
 CBC_KEEP = {'WBC', 'HEMOGLOBIN', 'HGB', 'HEMATOCRIT', 'HCT', 'PLT', 'PLATELET', 'PLATELETS'}
 BMP_KEEP = {'BUN', 'CREATININE', 'CREAT', 'EGFR', 'GFR'}
-UA_KEEP = {'SG', 'SPECIFIC GRAVITY', 'PH', 'GLU', 'GLUCOSE', 'PRO', 'PROTEIN', 'URINALYSIS'}
+UA_KEEP = {'SG', 'SPECIFIC GRAVITY', 'PH', 'GLU', 'GLUCOSE', 'PRO', 'PROTEIN', 'URINALYSIS',
+           # urologically decision-driving UA components (hematuria / UTI)
+           'BLOOD', 'RBC', 'NITRITE', 'LEU', 'LEUKOCYTE', 'BACTERIA'}
+# A qualitative ABNORMAL result ("Positive", "Trace", "Large") is kept like an H/L flag.
+_QUAL_ABNORMAL_RE = re.compile(
+    r'\b(?:Positive|Trace|Small|Moderate|Large|Many|Abnormal|Cloudy|Turbid|Hazy|Detected|Reactive)\b')
 
 # Always report these regardless of filtering
 ALWAYS_REPORT = {
@@ -51,8 +56,10 @@ def should_keep_lab(test_name: str, lab_line: str) -> bool:
     if not _is_reasonable_lab_value(test_name, lab_line):
         return False
 
-    # Always keep abnormal results (marked with H or L)
+    # Always keep abnormal results (marked with H or L, or a qualitative abnormal)
     if re.search(r'\d+\.?\d*\s*[HL]\b', lab_line):
+        return True
+    if _QUAL_ABNORMAL_RE.search(lab_line.split('Ref')[0]):
         return True
 
     # Always keep special hormones and tumor markers
@@ -129,6 +136,39 @@ def _is_reasonable_lab_value(test_name: str, lab_line: str) -> bool:
     return True  # Value is reasonable or test not in sanity check list
 
 
+# VistA lab tables ("CH - Chem & Hematology (max 20 occurrences or 6 months)",
+# "SLT - Lab Tests Selected") repeat the collection date/time and specimen of
+# a panel as DITTO MARKS on every row after the first:
+#   07/21/2026 09:45  URINE      URINE PH              5.5               5.0 - 8.0
+#      "        "       "        URINE PROTEIN    Negative    mg/dL    Ref: Negative
+# No row parser recognises a leading ditto, so every analyte after the first
+# in the six-month block was dropped. Expand the dittos to the last dated row's
+# date/time + specimen before any extractor runs.
+_DITTO_ROW_RE = re.compile(r'^(\s*)"\s+"\s+"\s+(\S.*)$')
+_DATED_ROW_RE = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2})\s+([A-Z][A-Z/ .-]{1,14}?)\s{2,}(\S)')
+
+
+def expand_ditto_rows(text: str) -> str:
+    if not text or '"' not in text:
+        return text
+    out = []
+    last_dt = last_spec = None
+    for line in text.split('\n'):
+        m = _DATED_ROW_RE.match(line)
+        if m:
+            last_dt, last_spec = m.group(1), m.group(2).strip()
+            out.append(line)
+            continue
+        d = _DITTO_ROW_RE.match(line)
+        if d and last_dt:
+            out.append(f"{last_dt}  {last_spec:<10} {d.group(2)}")
+            continue
+        if line.startswith('-----') or line.strip().startswith('Collection DT'):
+            last_dt = last_spec = None   # a new table: dittos cannot refer across it
+        out.append(line)
+    return '\n'.join(out)
+
+
 def extract_labs(clinical_document: str, visit_date: str = "") -> str:
     """
     Extract general lab results from clinical documents.
@@ -150,6 +190,7 @@ def extract_labs(clinical_document: str, visit_date: str = "") -> str:
         Clean lab results with dates, or "" if not found
     """
     lab_lines = []
+    clinical_document = expand_ditto_rows(clinical_document)
 
     # First, try to extract human-readable format (priority)
     # Pattern 1: "DATE: LAB VALUES" format
