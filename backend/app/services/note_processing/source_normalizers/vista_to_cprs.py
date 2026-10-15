@@ -182,11 +182,22 @@ _UROLOGIC_BY_MODALITY_ALONE_RE = re.compile(
     r"\b(?:"
     r"bone\s+scan|"
     r"nuclear\s+med(?:icine)?\s+bone|"
+    r"NM\s+bone|"
     r"PSMA(?:[\s\-]?PET(?:/CT)?)?|"
+    # VistA titles a PSMA study by field of view, not tracer: "PET/CT SKULL BASE
+    # TO MID-THIGH", "PET/CT WHOLE BODY" — no anatomy word, so the anatomy gate
+    # dropped every PSMA PET from the IMAGING section (GORDEN 11/15/2024). In a
+    # urology note a PET/CT is kept by modality alone.
+    r"PET(?:[\s/]?CT)?|"
     r"MR\s*UROGRAM"
     r")\b",
     re.IGNORECASE,
 )
+# Radiology report boilerplate that follows the impression in VistA II bodies.
+_II_BOILERPLATE_CUT_RE = re.compile(
+    r"EANM\s+STANDARDIZED\s+REPORTING|PSMA[\s-]?RADS\s+(?:VERSION|V\d|SCORING)|"
+    r"I,\s+the\s+attending\s+physician|SCORE\s+DEFINITION\s+1\.|"
+    r"This\s+report\s+was\s+(?:dictated|generated)|Dictated\s+by|Transcribed\s+by", re.IGNORECASE)
 
 
 def _is_urologic_imaging_study(study_block: str) -> bool:
@@ -541,6 +552,10 @@ def _render_imaging_from_ii(ii_body: str) -> str:
     for chunk in study_blocks:
         # First line: "MM/DD/YYYY  PROCEDURE NAME  CPT  Status  Case#"
         first_line, _, rest = chunk.partition("\n")
+        # Status column: "Verified" (VA read) vs "Electronica[lly filed]" (an
+        # outside study whose report text is usually NOT in the VA record).
+        _st = re.search(r"\s\d{3,5}\s+(Verified|Electronica\w*|Pending|Cancelled)\b", first_line, re.I)
+        is_efiled = bool(_st and _st.group(1).lower().startswith("electronica"))
         m = re.match(
             r"^(\d{1,2})/(\d{1,2})/(\d{4})\s+(.+?)\s+\d{3,5}\s+\w+\s+\d+\s*$",
             first_line,
@@ -649,6 +664,14 @@ def _render_imaging_from_ii(ii_body: str) -> str:
                 continue
             impression_lines.append(ln)
         impression = " ".join(impression_lines).strip()
+        # Cut trailing reporting-standard boilerplate / attestation.
+        impression = _II_BOILERPLATE_CUT_RE.split(impression, maxsplit=1)[0].strip()
+        if not impression and is_efiled:
+            # Electronically filed outside study with no report text in the VA
+            # record (ALEJANDRO: PSMA PET/CT 08/24/2025 at Baptist, CT urogram
+            # 08/06/2025). State that fact — it is not a finding — so the study
+            # is not silently absent from the note.
+            is_outside_study = True
         if not impression and not is_outside_study:
             # No usable body content for this study AND not flagged as
             # an outside study. Per provider direction, do NOT emit a
@@ -664,7 +687,10 @@ def _render_imaging_from_ii(ii_body: str) -> str:
         # existence of an unread outside study than to drop the row.
         if is_outside_study:
             disclaimer = ("This study originated from outside the VA and "
-                          "has not been read by VA radiology.")
+                          "has not been read by VA radiology."
+                          + (" No report text is filed in the VA record; see the "
+                             "clinic-note narrative for the outside read."
+                             if (is_efiled and not impression) else ""))
             impression = (
                 f"{disclaimer} {impression}".strip()
                 if impression else disclaimer

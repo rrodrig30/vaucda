@@ -217,6 +217,15 @@ def extract_imaging(clinical_document: str) -> str:
     if dash_date_imaging:
         imaging_reports.extend(dash_date_imaging)
 
+    # Seventh, outside studies summarized in a clinic note's "IMAGING:" block
+    # without an Impression label — "NM bone scan (UT) 1/2026:" + dash bullets,
+    # or "8/24/2025 PET/CT at Baptist M&S imaging reveals ..." prose. These are
+    # often the ONLY record of a community PSMA PET / bone scan (the VistA II
+    # row is an empty electronically-filed stub).
+    note_narrative_imaging = extract_note_narrative_imaging(clinical_document)
+    if note_narrative_imaging:
+        imaging_reports.extend(note_narrative_imaging)
+
     if not imaging_reports:
         return ""
 
@@ -291,6 +300,7 @@ def extract_imaging(clinical_document: str) -> str:
 
     # Add all unique studies
     unique_reports.extend(seen_study_dates.values())
+    unique_reports = _collapse_same_modality_same_date(unique_reports)
 
     # Strip non-actionable boilerplate from DXA / bone-density studies.
     # VA DXA impressions always tail with the same FRAX/WHO/NOF
@@ -305,6 +315,120 @@ def extract_imaging(clinical_document: str) -> str:
     unique_reports.sort(key=_imaging_report_sort_key, reverse=True)
 
     return '\n\n'.join(unique_reports)
+
+
+_PET_BONE_MODALITY_RE = re.compile(r"PSMA|\bPET\b|bone\s+scan|\bNM\b", re.IGNORECASE)
+
+
+def _collapse_same_modality_same_date(reports: list) -> list:
+    """A PSMA PET / bone scan recorded twice for the same date under different
+    titles (VistA II stub "PET/CT WHOLE BODY" + the clinic-note narrative
+    "PET/CT at Baptist M&S imaging") is one study: keep the version with report
+    text, else the longer one."""
+    best = {}
+    order = []
+    for r in reports:
+        hm = re.match(r'^(.+?)\s*\(([^()]+)\)\s*:', r)
+        if not hm or not _PET_BONE_MODALITY_RE.search(hm.group(1)):
+            order.append((None, r))
+            continue
+        mod = "PET" if re.search(r"PSMA|\bPET\b", hm.group(1), re.I) else "BONE"
+        key = (mod, _normalize_date_for_comparison(hm.group(2).strip()))
+        if key in best:
+            cur = best[key]
+            cur_stub = "No report text is filed" in cur
+            if cur_stub or (len(r) > len(cur) and "No report text is filed" not in r):
+                best[key] = r
+            continue
+        best[key] = r
+        order.append((key, None))
+    return [best[k] if k is not None else r for k, r in order]
+
+
+_NOTE_IMG_HEADER_RE = re.compile(
+    r'^[ \t]*(?P<name>[A-Za-z][^\n:]{1,70}?)[ \t]*\(?(?P<date>' + r'(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}/\d{4}|'
+    r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?:\d{1,2},?\s+)?\d{4})'
+    r')\)?[ \t]*:[ \t]*$', re.IGNORECASE | re.MULTILINE)
+_NOTE_IMG_PROSE_RE = re.compile(
+    r'^[ \t]*(?P<date>\d{1,2}/\d{1,2}/\d{2,4})(?:\s*-\s*\d{1,2}/\d{1,2}/\d{2,4})?[ \t]+'
+    r'(?P<name>[^\n]{0,80}?(?:PET(?:/CT)?|PSMA|bone\s+scan|\bCT\b|\bMRI\b|ultrasound|\bUS\b)[^\n]{0,60}?)'
+    r'\s+(?:reveals?|revealed|shows?|showed|showing|demonstrat(?:es|ed|ing)|notable\s+for|'
+    r'significant\s+for|with\s+(?:no|findings))\s+(?P<body>[^\n]+)', re.IGNORECASE | re.MULTILINE)
+_NOTE_IMG_MODALITY_RE = re.compile(
+    r'PET|PSMA|bone\s+scan|\bNM\b|\bCT\b|\bCTU\b|\bMRI?\b|ultrasound|\bUS\b|urogram|DEXA|DXA|renal\s+scan',
+    re.IGNORECASE)
+
+
+def extract_note_narrative_imaging(clinical_document: str) -> list:
+    """Imaging summarized inside a clinic note's IMAGING: block without an
+    Impression label. Two shapes:
+        NM bone scan (UT) 1/2026:
+        -Widespread abnormal foci ...
+    and
+        8/24/2025-8/24/2025 PET/CT at Baptist M&S imaging reveals heterogeneous ...
+    Body runs to the next blank line, next header, or section stop."""
+    out = []
+    if not clinical_document:
+        return out
+    for sec in re.finditer(r'(?im)^[ \t]*IMAGING\s*:[ \t]*\n(.*?)(?=\n[ \t]*\n[ \t]*[A-Z][A-Z /&-]{2,30}:|' + _IMAGING_BODY_STOP + r'|\Z)',
+                           clinical_document, re.S):
+        block = sec.group(1)
+        lines = block.split('\n')
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            hm = _NOTE_IMG_HEADER_RE.match(ln)
+            pm = None if hm else _NOTE_IMG_PROSE_RE.match(ln)
+            if hm and _NOTE_IMG_MODALITY_RE.search(hm.group('name')):
+                name, date = hm.group('name').strip(), hm.group('date').strip()
+                body = []
+                i += 1
+                while i < len(lines) and lines[i].strip() and not _NOTE_IMG_HEADER_RE.match(lines[i]) \
+                        and not _NOTE_IMG_PROSE_RE.match(lines[i]):
+                    body.append(re.sub(r'^\s*[-*•]\s*', '', lines[i]).strip())
+                    i += 1
+                impression = re.sub(r'\s+', ' ', ' '.join(body)).strip()
+                if len(impression) >= 10:
+                    out.append(f"{name} ({date}):\n{impression}")
+                continue
+            if pm:
+                name, date = pm.group('name').strip(), pm.group('date').strip()
+                body = [pm.group('body').strip()]
+                i += 1
+                while i < len(lines) and lines[i].strip() and not _NOTE_IMG_HEADER_RE.match(lines[i]) \
+                        and not _NOTE_IMG_PROSE_RE.match(lines[i]):
+                    body.append(lines[i].strip())
+                    i += 1
+                impression = re.sub(r'\s+', ' ', ' '.join(body)).strip()
+                if len(impression) >= 10:
+                    out.append(f"{name} ({date}):\n{impression}")
+                continue
+            i += 1
+    # The dated-prose shape also appears inside HPI narrative ("8/24/2025-8/24/2025
+    # PET/CT at Baptist M&S imaging reveals ...") — scan the whole document for
+    # it; the pattern needs a leading date, a modality word, and a reporting
+    # verb, so ordinary prose cannot match.
+    seen = {re.sub(r'\s+', ' ', r.split('\n', 1)[0]).lower() for r in out}
+    lines = clinical_document.split('\n')
+    i = 0
+    while i < len(lines):
+        pm = _NOTE_IMG_PROSE_RE.match(lines[i])
+        if not pm:
+            i += 1
+            continue
+        name, date = pm.group('name').strip(), pm.group('date').strip()
+        body = [pm.group('body').strip()]
+        i += 1
+        while i < len(lines) and lines[i].strip() and not _NOTE_IMG_PROSE_RE.match(lines[i]) \
+                and not re.match(r'^[ \t]*[A-Z][A-Za-z /&-]{2,30}:', lines[i]):
+            body.append(lines[i].strip())
+            i += 1
+        impression = re.sub(r'\s+', ' ', ' '.join(body)).strip()
+        hdr = re.sub(r'\s+', ' ', f"{name} ({date}):").lower()
+        if len(impression) >= 10 and hdr not in seen:
+            seen.add(hdr)
+            out.append(f"{name} ({date}):\n{impression[:900]}")
+    return out
 
 
 def _normalize_date_for_comparison(date_str: str) -> str:
