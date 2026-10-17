@@ -745,6 +745,33 @@ def _dedupe_problems(plan: str) -> str:
     return preamble + "".join(b for _, b in kept)
 
 
+_PROBLEM_REF_BEFORE = re.compile(r"(?:\bsee|\bunder|\bper|\bin|\bof|\bto|\bwith|\bfrom|\()\s*$", re.I)
+_PROBLEM_REF_AFTER = re.compile(r"^\s*(?:below|above|\)|,|;)", re.I)
+
+
+def _break_inline_problem_headers(text: str) -> str:
+    """Put every PROBLEM TITLE on its own line. A header is 'Problem #N:' (with
+    the colon) — at a line start, or run inline onto the end of a bullet by the
+    model ("... CT July 21, 2026 Problem #3: PSA elevation"). A CROSS-REFERENCE
+    ("(see PROBLEM #2 below)", "ordered under PROBLEM #1") is left inline."""
+    if not text:
+        return text
+    out, pos = [], 0
+    for m in re.finditer(r"(?i)[ \t]*Problem\s*#\s*(\d+)\s*:", text):
+        before = text[max(0, m.start() - 16):m.start()]
+        after = text[m.end():m.end() + 8]
+        if _PROBLEM_REF_BEFORE.search(before) or _PROBLEM_REF_AFTER.match(after):
+            continue
+        at_line_start = (m.start() == 0 or text[m.start() - 1] == "\n"
+                         or text[:m.start()].rstrip(" \t").endswith("\n"))
+        out.append(text[pos:m.start()].rstrip(" \t") if not at_line_start else text[pos:m.start()])
+        out.append(("\n\n" if not at_line_start or not text[:m.start()].endswith("\n\n") else "")
+                   + f"PROBLEM #{m.group(1)}:")
+        pos = m.end()
+    out.append(text[pos:])
+    return re.sub(r"\n{3,}", "\n\n", "".join(out))
+
+
 def _renumber_problems(plan: str) -> str:
     """Renumber 'PROBLEM #N:' / 'Problem #N:' headers sequentially (1, 2, 3, ...).
     The LLM sometimes skips or repeats a number (e.g. #1, #2, #4, #5 — #3 dropped
@@ -1452,7 +1479,7 @@ def assemble_complete_note(
     # Only a header — 'PROBLEM #N:' at the start of a line. The old pattern
     # matched EVERY 'Problem #', so a bullet's cross-reference "(see PROBLEM #2
     # below)" was torn in two and rendered as a bogus header (CARO 10/16).
-    final = re.sub(r'(?im)^[ \t]*Problem\s*#(\s*\d+\s*:)', r'\n\nPROBLEM #\1', final)
+    final = _break_inline_problem_headers(final)
     # Clean up any triple+ newlines created above
     final = re.sub(r'\n{3,}', '\n\n', final)
 
