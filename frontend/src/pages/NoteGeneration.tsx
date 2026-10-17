@@ -28,6 +28,7 @@ const AUTO_SAVE_INTERVAL = 30000
 const NOTE_TYPES = [
   { value: 'urology_clinic', label: 'Urology Clinic' },
   { value: 'urology_consult', label: 'Urology Consult' },
+  { value: 'cystoscopy', label: 'Cystoscopy Note' },
 ]
 
 const LLM_PROVIDERS = [
@@ -201,7 +202,7 @@ export const NoteGeneration: React.FC = () => {
     try {
       const request: InitialNoteRequest = {
         clinical_input: combinedInput,
-        note_type: noteType as 'urology_clinic' | 'urology_consult',
+        note_type: noteType as 'urology_clinic' | 'urology_consult' | 'cystoscopy',
         patient_name: patientName || undefined,
         ssn_last4: ssnLast4 || undefined,
         visit_date: visitDate || undefined,

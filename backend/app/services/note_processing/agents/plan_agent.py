@@ -302,12 +302,84 @@ CRITICAL - READ THE CHIEF COMPLAINT FIRST (MANDATORY):
 Look at the "CC:" line in the Stage 1 note. The Chief Complaint is the PRIMARY reason for this visit.
 Problem #1 in your output MUST address this Chief Complaint.
 
+ACTIVE VOICE — AFFIRMATIVE RECOMMENDATIONS ONLY (MANDATORY):
+- Every recommendation MUST be phrased as an ACTION to take: "Continue...",
+  "Order...", "Recommend...", "Schedule...", "Refer...", "Monitor...".
+- NEVER write a negative recommendation — do NOT say "no need for biopsy", "no
+  further imaging is recommended/indicated", "DRE is not indicated", "no
+  surveillance required", "no additional therapy needed", etc. If something is
+  not needed, simply DO NOT MENTION IT — omit it entirely rather than stating it
+  is not needed. (Clinical FINDINGS like "no evidence of metastatic disease" are
+  fine — those are observations, not recommendations.)
+- Do NOT recommend tests/exams that are anatomically impossible or inapplicable
+  (e.g. a rectal exam / DRE or prostate imaging in a patient without a prostate).
+
+GROUNDED, GUIDELINE-CONCORDANT RECOMMENDATIONS (MANDATORY):
+- EMBODY the guideline in the recommendation itself — write the specific
+  guideline-concordant ACTION and cite the SPECIFIC guideline inline (e.g.
+  "...per NCCN Prostate Cancer Guidelines" or "...per AUA Localized Prostate
+  Cancer Guideline"). NEVER append a vague instruction to "follow NCCN/AUA
+  guidelines" — do not tell the reader to follow guidelines; state what the
+  guideline dictates for THIS patient.
+- POST-RADIATION RECURRENCE LOGIC (MANDATORY): after DEFINITIVE RADIATION
+  (IMRT/EBRT/brachytherapy), biochemical recurrence is the PHOENIX criterion =
+  PSA nadir + 2.0 ng/mL — NOT the post-prostatectomy 0.2 threshold. Do NOT
+  recommend PSMA PET/CT, salvage therapy, or a recurrence workup unless the PSA
+  has actually reached nadir + 2.0. A PSA rise that is still BELOW nadir + 2.0 —
+  especially during testosterone recovery after ADT cessation — is expected and
+  warrants PSA surveillance ONLY. A minimum-PSA rule for a test (e.g. "PSMA PET
+  requires PSA >= 0.5") is an AUTHORIZATION FLOOR (a necessary eligibility
+  condition), NOT an indication to order the test — never order PSMA PET just
+  because the PSA cleared that floor.
+- NO IF-THEN HYPOTHETICALS. Do NOT write conditional future-scenario chains
+  ("Check PSA; if PSA exceeds 4, then perform a workup with biopsy ± MRI..."). If
+  a future test is warranted, order it with its interval and stop. Every
+  recommendation must be a concrete action GROUNDED in THIS patient's current,
+  documented status — never a generic contingency that may not even apply to this
+  patient (e.g. a prostate-biopsy pathway in a man who is s/p prostatectomy).
+
 PROBLEM SELECTION RULES:
 - Problem #1 MUST match the Chief Complaint from the "CC:" line
 - ONLY create problems for conditions the patient ACTUALLY HAS (documented in HPI, PMH, or Assessment)
 - Do NOT create problems for conditions the patient does NOT have
 - Do NOT add hypothetical problems ("if the patient had X, we would...")
 - If a condition is not mentioned in the patient's history, do NOT include it as a problem
+- BENIGN INCIDENTALS (MANDATORY): a finding the radiology characterizes as
+  BENIGN — adrenal myelolipoma, lipid-rich / washout adrenal adenoma, simple
+  (Bosniak I/II) renal cyst — needs NO routine imaging follow-up if it is
+  biochemically inactive. Do NOT create a surveillance PROBLEM for it, and do
+  NOT recommend repeat/dedicated imaging, surveillance, CT/MRI, or hormonal
+  work-up for it. If it is named at all, state it is benign and needs no further
+  follow-up. NEVER title a problem "adrenal mass of uncertain significance" for a
+  radiology-benign lesion.
+- CONGRUENCE: do NOT order a workup (routine PSA screening, biopsy, mpMRI,
+  imaging surveillance) that the Assessment did not endorse — honor the AGE /
+  LIFE-EXPECTANCY guardrail (elderly / limited-life-expectancy patients).
+- NO TECHNICAL METADATA in plan items: never include phantom size, kVp/mAs,
+  reconstruction params, CPT/procedure codes, or raw reference-range numbers.
+
+AFFIRMATIVE RECOMMENDATIONS ONLY (MANDATORY — this is a common failure):
+Every plan bullet must be an ACTION to take now, grounded in a real current
+finding. Do NOT write:
+  (a) Recommendations AGAINST a test/procedure that is obviously inapplicable —
+      OMIT it silently, never explain why it isn't needed. E.g. do NOT write
+      "no need for prostate biopsy" for a patient s/p prostatectomy, or "PSMA PET
+      is not indicated as PSA is undetectable", or "no cystoscopy needed". If it
+      doesn't apply, it simply does not appear.
+  (b) HYPOTHETICAL / CONTINGENCY bullets for problems the patient does not
+      currently have. Do NOT write "should he fail to void, we could explore
+      surgical options including...", "if the PSA rises we would consider...",
+      "in the event of recurrence...". Plan only for the patient's ACTUAL current
+      state. (A concrete return-precaution the patient should act on — "return or
+      call for fever, gross hematuria, or inability to void" — is allowed; open-
+      ended future management menus are not.)
+  (c) PATRONIZING or tautological justifications — never justify a
+      recommendation (or its absence) with an obvious anatomical/common-sense
+      fact ("...as the prostate has been removed", "...since he has no measurable
+      PSA"). State the affirmative action without the obvious rationale.
+Exception: a deliberate, guideline-grounded deferral with real clinical weight
+(e.g. "defer routine PSA screening given limited life expectancy per AUA") may be
+stated ONCE, concisely — that is a decision, not a hypothetical.
 
 TASK:
 Using THIS PATIENT'S specific history, labs, imaging, medications, surgical history, and other findings from the Stage 1 note above, create urology-focused plans addressing each of the patient's active problems.

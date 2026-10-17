@@ -4,7 +4,7 @@ import { Button } from '@/components/common/Button'
 import { Select } from '@/components/common/Select'
 import { Textarea } from '@/components/common/Textarea'
 import { ragApi } from '@/api'
-import { FiSearch, FiBook, FiExternalLink, FiCopy, FiChevronDown, FiChevronUp, FiUpload, FiFile, FiCheck, FiX } from 'react-icons/fi'
+import { FiSearch, FiBook, FiExternalLink, FiCopy, FiChevronDown, FiChevronUp, FiUpload, FiFile, FiCheck, FiX, FiShare2, FiRefreshCw } from 'react-icons/fi'
 import type { EvidenceSearchResponse, EvidenceSearchResult } from '@/types/api.types'
 
 const CATEGORIES = [
@@ -46,6 +46,96 @@ export const KnowledgeBase: React.FC = () => {
   const [uploadResults, setUploadResults] = useState<any>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
+
+  // GraphRAG rebuild state
+  const [graphStatus, setGraphStatus] = useState<any>(null)
+  const [isRebuilding, setIsRebuilding] = useState(false)
+  const graphPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [, setTick] = useState(0)  // 1s re-render so the elapsed clock ticks
+
+  const fetchGraphStatus = async () => {
+    try {
+      const s = await ragApi.getGraphRAGStatus()
+      setGraphStatus(s)
+      return s
+    } catch (e) {
+      // Non-admins or a disconnected Neo4j simply won't get status; ignore.
+      return null
+    }
+  }
+
+  // Load current GraphRAG coverage on mount, and stop polling on unmount.
+  React.useEffect(() => {
+    fetchGraphStatus()
+    return () => {
+      if (graphPollRef.current) clearInterval(graphPollRef.current)
+    }
+  }, [])
+
+  // While a build is running, tick every second so the elapsed clock advances
+  // between the 5s status polls.
+  React.useEffect(() => {
+    if (graphStatus?.status !== 'running') return
+    const id = setInterval(() => setTick((t) => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [graphStatus?.status])
+
+  // If a build is already running when the page loads (e.g. after a reload),
+  // resume polling automatically.
+  React.useEffect(() => {
+    if (graphStatus?.status === 'running' && !graphPollRef.current) {
+      startGraphPolling()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graphStatus?.status])
+
+  const formatElapsed = (): string => {
+    let secs = 0
+    if (graphStatus?.started_at) {
+      secs = Math.max(0, Math.floor((Date.now() - Date.parse(graphStatus.started_at)) / 1000))
+    } else if (typeof graphStatus?.elapsed_seconds === 'number') {
+      secs = Math.floor(graphStatus.elapsed_seconds)
+    }
+    const m = Math.floor(secs / 60)
+    const s = secs % 60
+    return `${m}m ${String(s).padStart(2, '0')}s`
+  }
+
+  const startGraphPolling = () => {
+    if (graphPollRef.current) clearInterval(graphPollRef.current)
+    graphPollRef.current = setInterval(async () => {
+      const s = await fetchGraphStatus()
+      if (s && s.status !== 'running') {
+        if (graphPollRef.current) clearInterval(graphPollRef.current)
+        graphPollRef.current = null
+        setIsRebuilding(false)
+      }
+    }, 5000)
+  }
+
+  const handleRebuildGraphRAG = async () => {
+    if (!confirm(
+      'Rebuild the GraphRAG layer?\n\nThis extracts entities from newly-added ' +
+      'chunks, re-detects communities, and regenerates summaries using the ' +
+      'configured GraphRAG model. It runs in the background and can take a while ' +
+      'for large uploads. You can keep using the app while it runs.'
+    )) return
+    try {
+      setIsRebuilding(true)
+      const resp = await ragApi.rebuildGraphRAG()
+      setGraphStatus((prev: any) => ({ ...(prev || {}), status: 'running', models: resp.models, coverage: resp.coverage_before }))
+      startGraphPolling()
+    } catch (error: any) {
+      setIsRebuilding(false)
+      const detail = error?.response?.data?.detail || error?.message || 'Unknown error'
+      if (error?.response?.status === 409) {
+        // Already running — just resume polling.
+        startGraphPolling()
+      } else {
+        alert(`Failed to start GraphRAG rebuild: ${detail}`)
+      }
+    }
+  }
 
   const handleSearch = async () => {
     if (!query.trim()) {
@@ -323,6 +413,112 @@ export const KnowledgeBase: React.FC = () => {
                 </div>
               </div>
             </div>
+          )}
+        </div>
+      </Card>
+
+      <Card
+        title="GraphRAG Knowledge Graph"
+        description="Uploading only fills the vector store. Rebuild the graph layer (entities → communities → summaries) so new material powers GraphRAG global/local search."
+      >
+        <div className="space-y-4">
+          {graphStatus?.coverage && !graphStatus.coverage.error && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
+                <p className="text-xs text-gray-500 dark:text-gray-400">Chunks in graph</p>
+                <p className="text-lg font-semibold">
+                  {graphStatus.coverage.chunks_in_graph?.toLocaleString()} / {graphStatus.coverage.total_chunks?.toLocaleString()}
+                </p>
+                <p className="text-xs text-gray-500 dark:text-gray-400">{graphStatus.coverage.coverage_pct}% covered</p>
+              </div>
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
+                <p className="text-xs text-gray-500 dark:text-gray-400">Entities</p>
+                <p className="text-lg font-semibold">{graphStatus.coverage.entities?.toLocaleString()}</p>
+              </div>
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
+                <p className="text-xs text-gray-500 dark:text-gray-400">Communities</p>
+                <p className="text-lg font-semibold">{graphStatus.coverage.communities?.toLocaleString()}</p>
+              </div>
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
+                <p className="text-xs text-gray-500 dark:text-gray-400">Summaries</p>
+                <p className="text-lg font-semibold">{graphStatus.coverage.summaries?.toLocaleString()}</p>
+              </div>
+            </div>
+          )}
+
+          {graphStatus?.coverage?.chunks_pending > 0 && graphStatus?.status !== 'running' && (
+            <div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-lg text-sm text-amber-800 dark:text-amber-300">
+              ⚠ {graphStatus.coverage.chunks_pending.toLocaleString()} chunk(s) are in the vector store but not yet in the graph layer. Rebuild to add them to GraphRAG.
+            </div>
+          )}
+
+          <div className="flex items-center gap-3">
+            <Button
+              onClick={handleRebuildGraphRAG}
+              isLoading={isRebuilding || graphStatus?.status === 'running'}
+              disabled={isRebuilding || graphStatus?.status === 'running'}
+              icon={<FiShare2 />}
+            >
+              {graphStatus?.status === 'running' ? 'Rebuilding GraphRAG…' : 'Rebuild GraphRAG Layer'}
+            </Button>
+            <button
+              type="button"
+              onClick={() => fetchGraphStatus()}
+              className="inline-flex items-center gap-1 text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200"
+              title="Refresh status"
+            >
+              <FiRefreshCw /> Refresh
+            </button>
+          </div>
+
+          {graphStatus?.status === 'running' && (
+            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg text-sm text-blue-800 dark:text-blue-300 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-medium">GraphRAG rebuild in progress</span>
+                <span className="font-mono">⏱ {formatElapsed()}</span>
+              </div>
+
+              {graphStatus?.progress ? (
+                <>
+                  {graphStatus.progress.phase === 'entity_extraction' && graphStatus.progress.percent < 100 ? (
+                    <div className="text-xs">
+                      Extracting entities: <span className="font-semibold">
+                        {graphStatus.progress.processed_chunks.toLocaleString()} of {graphStatus.progress.target_chunks.toLocaleString()}
+                      </span> new chunks ({graphStatus.progress.percent}%)
+                    </div>
+                  ) : (
+                    <div className="text-xs">
+                      Entity extraction complete — {(graphStatus.progress.label || 'detecting communities & regenerating summaries').toLowerCase()}…
+                    </div>
+                  )}
+                  <div className={`w-full h-2 bg-blue-100 dark:bg-blue-800/40 rounded-full overflow-hidden ${graphStatus.progress.phase !== 'entity_extraction' ? 'animate-pulse' : ''}`}>
+                    <div
+                      className="h-2 bg-blue-500 dark:bg-blue-400 rounded-full transition-all duration-500"
+                      style={{ width: `${Math.min(100, graphStatus.progress.percent)}%` }}
+                    />
+                  </div>
+                </>
+              ) : (
+                <div className="text-xs">
+                  Extracting entities → detecting communities → summarizing. Coverage updates every few seconds.
+                </div>
+              )}
+            </div>
+          )}
+          {graphStatus?.status === 'success' && (
+            <div className="p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-700 rounded-lg text-sm text-green-800 dark:text-green-300">
+              <FiCheck className="inline mr-1" /> Last rebuild completed{graphStatus.elapsed_seconds ? ` in ${graphStatus.elapsed_seconds}s` : ''}.
+            </div>
+          )}
+          {graphStatus?.status === 'error' && (
+            <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 rounded-lg text-sm text-red-800 dark:text-red-300">
+              <FiX className="inline mr-1" /> Last rebuild failed: {graphStatus.error}
+            </div>
+          )}
+          {graphStatus?.models?.llm_model && (
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Model: <span className="font-mono">{graphStatus.models.llm_model}</span> · embeddings: <span className="font-mono">{graphStatus.models.embedding_model}</span>
+            </p>
           )}
         </div>
       </Card>

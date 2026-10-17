@@ -1,0 +1,17 @@
+{
+  "patient_id": "13_LUCKEY_2975",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/Monday_7_6_2026/input/13_LUCKEY_2975.txt",
+  "primary_diagnosis": {
+    "organ": "prostate",
+    "malignancy": "cancer"
+  },
+  "cancer_organs": [
+    "prostate"
+  ],
+  "notes": "low-risk prostate cancer s/p prostatectomy + radiation 2008"
+}

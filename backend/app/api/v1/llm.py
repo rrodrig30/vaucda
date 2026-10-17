@@ -89,6 +89,85 @@ def is_embedding_model(model_name: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Live provider model discovery — only ACTIVELY AVAILABLE models are surfaced.
+# Anthropic and OpenAI each expose a keyed /v1/models endpoint; we query it with
+# the configured key rather than showing a hardcoded (and quickly stale) list.
+# Results are briefly cached (keyed by the key's fingerprint) to avoid hammering
+# the API on the several getProviders() calls the Settings page makes.
+# ---------------------------------------------------------------------------
+import time
+
+_MODEL_CACHE: Dict[str, tuple] = {}   # provider -> (expires_monotonic, key_fp, [LLMModel])
+_MODEL_CACHE_TTL = 120                 # seconds
+
+# OpenAI /models returns everything (embeddings, tts, whisper, image, …). Keep
+# only chat/completion-capable families and drop non-chat modalities.
+_OPENAI_CHAT_PREFIXES = ("gpt-", "chatgpt", "o1", "o3", "o4")
+_OPENAI_EXCLUDE = (
+    "embedding", "whisper", "tts", "dall-e", "audio", "realtime", "moderation",
+    "image", "transcribe", "search", "instruct", "davinci", "babbage",
+)
+
+
+async def _fetch_anthropic_models(api_key: str) -> List["LLMModel"]:
+    """Actively available Claude models from the Anthropic /v1/models API."""
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.anthropic.com/v1/models",
+            headers=headers, params={"limit": 1000},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Anthropic /models HTTP {resp.status}")
+            data = await resp.json()
+    return [
+        LLMModel(name=m["id"], parameter_size=m.get("display_name"))
+        for m in data.get("data", []) if m.get("id")
+    ]
+
+
+async def _fetch_openai_models(api_key: str) -> List["LLMModel"]:
+    """Actively available chat models from the OpenAI /v1/models API."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"OpenAI /models HTTP {resp.status}")
+            data = await resp.json()
+    ids = [
+        m["id"] for m in data.get("data", []) if m.get("id")
+        and any(m["id"].lower().startswith(p) for p in _OPENAI_CHAT_PREFIXES)
+        and not any(x in m["id"].lower() for x in _OPENAI_EXCLUDE)
+    ]
+    return [LLMModel(name=i, parameter_size="N/A") for i in sorted(ids)]
+
+
+async def _list_provider_models(provider: str, api_key: str) -> tuple:
+    """(models, available) for a keyed cloud provider. Live-fetches the actively
+    available models with a short per-key cache; returns ([], False) on any error
+    (invalid key / network) so only genuinely available models are ever shown."""
+    fp = api_key[-6:] if api_key else ""
+    now = time.monotonic()
+    cached = _MODEL_CACHE.get(provider)
+    if cached and cached[0] > now and cached[1] == fp:
+        return cached[2], True
+    try:
+        if provider == "anthropic":
+            models = await _fetch_anthropic_models(api_key)
+        else:
+            models = await _fetch_openai_models(api_key)
+        _MODEL_CACHE[provider] = (now + _MODEL_CACHE_TTL, fp, models)
+        return models, True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not fetch {provider} models: {e}")
+        return [], False
+
+
 @router.get("/providers", response_model=ProvidersResponse)
 async def get_providers(
     current_user: Optional[User] = Depends(get_optional_user)
@@ -159,62 +238,42 @@ async def get_providers(
             default_model=settings.OLLAMA_DEFAULT_MODEL
         ))
 
-        # Anthropic Provider
+        # Anthropic Provider — only actively available models (live /v1/models)
         anthropic_enabled = bool(settings.ANTHROPIC_API_KEY)
         anthropic_models = []
+        anthropic_available = False
         if anthropic_enabled:
-            # List known Anthropic models
-            anthropic_models = [
-                LLMModel(
-                    name="claude-3-5-sonnet-20250101",
-                    parameter_size="N/A",
-                ),
-                LLMModel(
-                    name="claude-3-5-haiku-20250101",
-                    parameter_size="N/A",
-                ),
-                LLMModel(
-                    name="claude-3-opus-20240229",
-                    parameter_size="N/A",
-                ),
-            ]
-
+            anthropic_models, anthropic_available = await _list_provider_models(
+                "anthropic", settings.ANTHROPIC_API_KEY)
+        anthropic_names = [m.name for m in anthropic_models]
         providers.append(LLMProvider(
             name="anthropic",
             display_name="Anthropic Claude",
             enabled=anthropic_enabled,
-            available=anthropic_enabled,  # If key is set, assume available
+            available=anthropic_available,
             models=anthropic_models,
-            default_model=settings.ANTHROPIC_DEFAULT_MODEL if anthropic_enabled else None
+            default_model=(settings.ANTHROPIC_DEFAULT_MODEL
+                           if settings.ANTHROPIC_DEFAULT_MODEL in anthropic_names
+                           else (anthropic_names[0] if anthropic_names else None)),
         ))
 
-        # OpenAI Provider
+        # OpenAI Provider — only actively available chat models (live /v1/models)
         openai_enabled = bool(settings.OPENAI_API_KEY)
         openai_models = []
+        openai_available = False
         if openai_enabled:
-            # List known OpenAI models
-            openai_models = [
-                LLMModel(
-                    name="gpt-4o",
-                    parameter_size="N/A",
-                ),
-                LLMModel(
-                    name="gpt-4o-mini",
-                    parameter_size="N/A",
-                ),
-                LLMModel(
-                    name="gpt-4-turbo",
-                    parameter_size="N/A",
-                ),
-            ]
-
+            openai_models, openai_available = await _list_provider_models(
+                "openai", settings.OPENAI_API_KEY)
+        openai_names = [m.name for m in openai_models]
         providers.append(LLMProvider(
             name="openai",
             display_name="OpenAI GPT",
             enabled=openai_enabled,
-            available=openai_enabled,  # If key is set, assume available
+            available=openai_available,
             models=openai_models,
-            default_model=settings.OPENAI_DEFAULT_MODEL if openai_enabled else None
+            default_model=(settings.OPENAI_DEFAULT_MODEL
+                           if settings.OPENAI_DEFAULT_MODEL in openai_names
+                           else (openai_names[0] if openai_names else None)),
         ))
 
         user_info = f"user {current_user.user_id}" if current_user else "anonymous user"

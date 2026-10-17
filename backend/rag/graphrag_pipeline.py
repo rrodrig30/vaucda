@@ -17,8 +17,9 @@ References:
 import uuid
 import logging
 import asyncio
+import re
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -182,6 +183,10 @@ Synthesize these answers into a single, comprehensive response that:
 3. Provides a well-structured answer
 4. Cites which communities contributed key information
 
+Write every name, term, and citation in plain English EXACTLY as it appears in
+the community answers above. Never encode, cipher, rotate, or otherwise transform
+any text; if unsure of a source's exact name, describe it rather than guessing.
+
 SYNTHESIZED ANSWER:"""
 
     LOCAL_SEARCH_ENTITY_PROMPT = """Extract the key entities from this query that should be used for graph traversal.
@@ -208,16 +213,18 @@ RELATIONSHIPS:
 SUPPORTING TEXT:
 {chunks}
 
-Provide a detailed answer based on the graph context above.
+Provide a detailed answer based on the graph context above. Write every entity
+and source name in plain English EXACTLY as it appears above — never encode,
+cipher, rotate, or otherwise transform any text.
 
 ANSWER:"""
 
     def __init__(
         self,
         neo4j_client,
-        ollama_base_url: str = "http://localhost:11434",
-        llm_model: str = "llama3.1:8b",
-        embedding_model: str = "nomic-embed-text",
+        ollama_base_url: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        embedding_model: Optional[str] = None,
         max_concurrent: int = 5,
         llm_timeout: int = 180
     ):
@@ -226,12 +233,30 @@ ANSWER:"""
 
         Args:
             neo4j_client: Neo4j client for database operations
-            ollama_base_url: Ollama API base URL
-            llm_model: LLM model for text generation
-            embedding_model: Model for embeddings
+            ollama_base_url: Ollama API base URL. None -> resolve from settings.
+            llm_model: LLM model for text generation. None -> resolve from
+                settings (GRAPHRAG_LLM_MODEL). Never falls back to a hardcoded
+                weak model literal (rules.txt: config via .env only).
+            embedding_model: Model for embeddings. None -> resolve from settings.
             max_concurrent: Max concurrent LLM requests
             llm_timeout: LLM request timeout
         """
+        # Resolve any unspecified model config from settings (.env-backed) so a
+        # caller that omits them never silently gets the old llama3.1:8b default.
+        if ollama_base_url is None or llm_model is None or embedding_model is None:
+            try:
+                from app.config import settings as _app_settings
+                gr = _app_settings.graphrag_model_config()
+            except Exception:
+                gr = {
+                    "ollama_base_url": "http://localhost:11434",
+                    "llm_model": "gpt-oss:120b-cloud",
+                    "embedding_model": "nomic-embed-text",
+                }
+            ollama_base_url = ollama_base_url or gr["ollama_base_url"]
+            llm_model = llm_model or gr["llm_model"]
+            embedding_model = embedding_model or gr["embedding_model"]
+
         self.neo4j = neo4j_client
         self.ollama_url = ollama_base_url
         self.llm_model = llm_model
@@ -362,19 +387,31 @@ ANSWER:"""
     async def extract_entities_from_database(
         self,
         batch_size: int = 100,
-        max_chunks: Optional[int] = None
+        max_chunks: Optional[int] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         """
         Extract entities from all chunks in the database.
 
         This is Phase 1 of the GraphRAG pipeline.
+
+        Args:
+            progress_callback: optional ``fn(phase, done, total)`` invoked as each
+                chunk's extraction completes. Entities are written to Neo4j in a
+                single batch at the END of this phase, so chunk-level coverage
+                can't be derived from the DB mid-phase — this callback is the only
+                live signal of entity-extraction progress.
         """
         from .entity_extractor import EntityExtractor, store_entities_in_neo4j
 
-        # Get chunks from database
+        # Get chunks from database. Self-heal: any chunk that lacks a stable
+        # `id` (older ingestions created chunks without one) gets a persistent
+        # UUID now, so entity extraction can link entities back by provenance
+        # (Chunk-[:HAS_ENTITY]->Entity) instead of content-substring matching.
         query = """
         MATCH (c:Chunk)
         WHERE NOT EXISTS((c)-[:HAS_ENTITY]->(:Entity))
+        SET c.id = coalesce(c.id, randomUUID())
         RETURN c.id AS id, c.content AS content
         """
         if max_chunks:
@@ -396,9 +433,17 @@ ANSWER:"""
         )
 
         # Extract entities
+        def _on_chunk(done: int, total: int) -> None:
+            logger.info(f"Progress: {done}/{total}")
+            if progress_callback:
+                try:
+                    progress_callback("entity_extraction", done, total)
+                except Exception:
+                    pass
+
         result = await extractor.extract_from_chunks(
             [{"id": c["id"], "content": c["content"]} for c in chunks],
-            progress_callback=lambda done, total: logger.info(f"Progress: {done}/{total}")
+            progress_callback=_on_chunk
         )
 
         # Store in Neo4j
@@ -964,6 +1009,51 @@ ANSWER:"""
             return 0
         return max(0, min(100, v))
 
+    @staticmethod
+    def _repair_ciphered_text(text: str, *context_texts: str) -> str:
+        """Repair Caesar/ROT-shifted word runs the synthesis model occasionally
+        emits (a gpt-oss quirk) — e.g. it renders the entity 'Abdominal &
+        Intraperitoneal' as 'Degrplqdo & Lqwudshulwrqhdo' (a uniform +3 shift).
+
+        Grounded and conservative: a token is only rewritten when SOME single
+        uniform letter-shift of it exactly matches a word that appears in the
+        retrieved context (community answers / entities / chunks). Because a
+        real English word almost never uniform-shifts into an unrelated
+        domain term, legitimate text is left untouched — no dictionary and no
+        heuristic guessing.
+        """
+        if not text:
+            return text
+        vocab = set()
+        for ct in context_texts:
+            for w in re.findall(r"[A-Za-z]{4,}", ct or ""):
+                vocab.add(w.lower())
+        if not vocab:
+            return text
+
+        def _shift(w: str, n: int) -> str:
+            out = []
+            for ch in w:
+                if 'a' <= ch <= 'z':
+                    out.append(chr((ord(ch) - 97 + n) % 26 + 97))
+                elif 'A' <= ch <= 'Z':
+                    out.append(chr((ord(ch) - 65 + n) % 26 + 65))
+                else:
+                    out.append(ch)
+            return ''.join(out)
+
+        def _fix(m: "re.Match") -> str:
+            tok = m.group(0)
+            if len(tok) < 4 or tok.lower() in vocab:
+                return tok
+            low = tok.lower()
+            for n in range(1, 26):
+                if _shift(low, n) in vocab:
+                    return _shift(tok, n)  # same shift preserves original case
+            return tok
+
+        return re.sub(r"[A-Za-z]{4,}", _fix, text)
+
     async def global_search(
         self,
         query: str,
@@ -1139,6 +1229,11 @@ ANSWER:"""
 
             final_answer = await self._call_llm(reduce_prompt, temperature=0.3)
 
+        # Repair any Caesar/ROT-shifted names the synthesis model emitted,
+        # grounded against the community answers + query it was given.
+        _ctx = " ".join(a.get('response', '') for a in intermediate_answers) + " " + query
+        final_answer = self._repair_ciphered_text(final_answer or "", _ctx)
+
         elapsed = time.time() - start_time
 
         return MapReduceResult(
@@ -1259,6 +1354,12 @@ ANSWER:"""
 
         context = await self._call_llm(response_prompt, temperature=0.3)
 
+        # Repair any Caesar/ROT-shifted names, grounded against the entity /
+        # relationship / chunk text that was fed to the model.
+        context = self._repair_ciphered_text(
+            context or "", entities_text, relationships_text, chunks_text, query
+        )
+
         elapsed = time.time() - start_time
 
         return LocalSearchResult(
@@ -1281,7 +1382,8 @@ ANSWER:"""
         detect_communities: bool = True,
         generate_summaries: bool = True,
         compute_embeddings: bool = True,
-        max_chunks_for_extraction: Optional[int] = None
+        max_chunks_for_extraction: Optional[int] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, Any]:
         """
         Run the complete GraphRAG pipeline.
@@ -1292,10 +1394,20 @@ ANSWER:"""
             generate_summaries: Whether to generate community summaries
             compute_embeddings: Whether to compute community embeddings
             max_chunks_for_extraction: Limit chunks for entity extraction
+            progress_callback: optional ``fn(phase, done, total)`` for live
+                progress reporting. Called per-chunk during entity extraction
+                and once at the start of each subsequent phase
+                (``community_detection`` / ``summarization`` / ``embeddings``).
 
         Returns:
             Pipeline execution results
         """
+        def _phase(name: str) -> None:
+            if progress_callback:
+                try:
+                    progress_callback(name, 0, 0)
+                except Exception:
+                    pass
         results = {
             'started_at': datetime.utcnow().isoformat(),
             'stages': {}
@@ -1309,7 +1421,8 @@ ANSWER:"""
             logger.info("PHASE 1: Entity Extraction")
             logger.info("=" * 50)
             extraction_result = await self.extract_entities_from_database(
-                max_chunks=max_chunks_for_extraction
+                max_chunks=max_chunks_for_extraction,
+                progress_callback=progress_callback,
             )
             results['stages']['entity_extraction'] = extraction_result
 
@@ -1318,6 +1431,7 @@ ANSWER:"""
             logger.info("=" * 50)
             logger.info("PHASE 2: Community Detection")
             logger.info("=" * 50)
+            _phase("community_detection")
             communities = await self.detect_communities()
             stored = await self.store_communities(communities)
             results['stages']['community_detection'] = {
@@ -1330,6 +1444,7 @@ ANSWER:"""
             logger.info("=" * 50)
             logger.info("PHASE 3: Hierarchical Summarization")
             logger.info("=" * 50)
+            _phase("summarization")
             summarized = await self.generate_community_summaries()
             results['stages']['summarization'] = {
                 'summaries_generated': summarized
@@ -1340,6 +1455,7 @@ ANSWER:"""
             logger.info("=" * 50)
             logger.info("PHASE 4: Community Embeddings")
             logger.info("=" * 50)
+            _phase("embeddings")
             embedded = await self.compute_community_embeddings()
             results['stages']['embeddings'] = {
                 'embeddings_computed': embedded

@@ -176,7 +176,7 @@ class HPIFactVerifier:
         # Pattern for PSA curve format: [r] DATE TIME VALUE [H]
         # Handles: [r] Jan 15, 2025 08:00    4.52 H
         patterns = [
-            r'\[r\]\s*([A-Za-z]{3}\s+\d{1,2},?\s+\d{4})\s*(?:\d{2}:\d{2})?\s+(\d+\.?\d*)\s*H?',
+            r'(?:\[r\]\s*)?([A-Za-z]{3}\s+\d{1,2},?\s+\d{4})\s*(?:\d{2}:\d{2})?\s+(\d+\.?\d*)\s*H?',
             r'(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:\d{2}:\d{2})?\s+PSA[:\s]+(\d+\.?\d*)',
             r'PSA[:\s]+(\d+\.?\d*)\s*(?:ng/mL)?\s*[-–]\s*([A-Za-z]{3}\s+\d{1,2},?\s+\d{4})',
             r'PSA[:\s]+(\d+\.?\d*)\s*(?:ng/mL)?',

@@ -136,7 +136,7 @@ class Settings(BaseSettings):
 
     # LLM - Anthropic (Optional)
     ANTHROPIC_API_KEY: Optional[str] = None
-    ANTHROPIC_DEFAULT_MODEL: str = "claude-3-5-sonnet-20250101"
+    ANTHROPIC_DEFAULT_MODEL: str = "claude-opus-5"
     ANTHROPIC_MAX_TOKENS: int = 8096
     ANTHROPIC_TIMEOUT: int = 3600  # 1 hour timeout for complex note generation
 
@@ -193,6 +193,29 @@ class Settings(BaseSettings):
     def OCR_MODEL(self) -> str:
         return self.OCR_LLM_MODEL
 
+    def graphrag_model_config(self, llm_model_override: Optional[str] = None) -> dict:
+        """Single source of truth for the GraphRAG build/retrieval model
+        configuration. Resolves from settings (which load .env), never from a
+        hardcoded model literal at the call site — so the build path uses the
+        same configured model as the runtime retrieval path (rules.txt: no
+        hardcoded elements, all configuration via .env).
+
+        Args:
+            llm_model_override: a user-selected model (from the Settings page,
+                stored in UserPreferences.graphrag_llm_model). When set, it wins
+                over the env GRAPHRAG_LLM_MODEL default.
+
+        Returns keys: ``ollama_base_url``, ``llm_model``, ``embedding_model``.
+        """
+        return {
+            "ollama_base_url": self.OLLAMA_BASE_URL or "http://localhost:11434",
+            # Precedence: explicit user selection > GRAPHRAG_LLM_MODEL env knob.
+            # NOT OLLAMA_DEFAULT_MODEL (llama3.1:8b), which is the weak local
+            # default the build path used to hardcode.
+            "llm_model": (llm_model_override or "").strip() or self.GRAPHRAG_LLM_MODEL,
+            "embedding_model": self.OLLAMA_EMBEDDING_MODEL,
+        }
+
     # LLM Concurrency & Retry
     OLLAMA_LOCAL_CONCURRENCY: int = 4  # Max concurrent requests to local Ollama models (prevents GPU contention)
     LLM_MAX_RETRIES: int = 5  # Max retries on 429 Too Many Requests
@@ -242,8 +265,19 @@ class Settings(BaseSettings):
     BATCH_ALLOWED_DIRS: str = '[]'  # JSON array of allowed base directories for batch processing
     BATCH_MAX_RETRIES: int = 3
     BATCH_FILE_SEPARATOR: str = "+++++++++"
-    BATCH_FILE_TIMEOUT: int = 5400  # seconds per file (90 minutes)
+    BATCH_FILE_TIMEOUT: int = 1200  # seconds per file (20 minutes) — a stuck cloud
+    # call auto-fails that one note so the batch moves on instead of freezing
     BATCH_MAX_FILES: int = 200  # maximum files in a single batch
+    # Reject only ABSURDLY oversized charts before the pipeline. These VistA
+    # exports are routinely 150-240K chars (copy-forward bloat) and process fine,
+    # so the guard must clear them — it only blocks the rare monster that would
+    # peg the server. The 10-min per-note timeout is the backstop for merely slow
+    # files. (Was 120000, which wrongly rejected normal large charts.) Oversized
+    # charts are first passed through copy-forward de-duplication in
+    # batch_processor; the guard applies to the DEDUPED size, so this ceiling only
+    # rejects charts that are genuinely huge even after trimming duplication.
+    # 0 disables the guard.
+    BATCH_MAX_FILE_CHARS: int = 500000
 
     @property
     def batch_allowed_dirs_list(self) -> List[str]:
