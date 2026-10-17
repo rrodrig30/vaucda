@@ -259,19 +259,49 @@ _HEDGE_RE = re.compile(
     r"family\s+history|\bfh\b|\bFHx\b", re.I)
 
 
+# Tissue evidence: the malignancy named in a pathology DIAGNOSIS, an explicit
+# biopsy-/pathology-proven statement, or an extirpative operation for that
+# cancer (a specimen was necessarily examined).
+_TISSUE_CUE_RE = re.compile(
+    r"biopsy[\s-]+(?:proven|confirmed|showed|showing|revealed|demonstrat\w+)|"
+    r"patholog\w*\s+(?:proven|confirmed|showed|showing|revealed|demonstrat\w+|consistent)|"
+    r"histolog\w*\s+(?:confirmed|proven|showed|showing|revealed|consistent)|"
+    r"final\s+patholog|surgical\s+patholog|\bdiagnosis\s*:|\bs/p\s+(?:(?:left|right|bilateral|radical|partial|"
+    r"laparoscopic|robotic|open|simple|total|cytoreductive)\s+){0,3}"
+    r"(?:nephrectomy|nephroureterectomy|cystectomy|cystoprostatectomy|orchiectomy|penectomy|glansectomy)|"
+    r"(?:nephrectomy|nephroureterectomy|cystectomy|orchiectomy|penectomy|glansectomy)\s+(?:for|revealed|showed|with)",
+    re.I)
+
+
 def malignancy_corroborated(organ: str, chart_text: str) -> bool:
-    """True when the chart states a malignancy of `organ` in a NON-hedged clause
-    (pathology diagnosis, 'known/history of RCC', ...). A surgery booking's
-    'Bladder Cancer (Unverified)', an imaging 'concerning for RCC', or cytology
-    'atypical urothelial cells' does not corroborate a cancer."""
+    """True only with TISSUE evidence of a malignancy of `organ`: the term in a
+    pathology report's diagnosis (deterministic extraction), or in a non-hedged
+    clause that also carries a biopsy-/pathology-proven cue or an extirpative
+    operation for that cancer. Imaging ('concerning for RCC'), a tumor-board
+    presumption ('significant for RCC'), a surgery booking ('Bladder Cancer
+    (Unverified)'), cytology atypia, or an ablation without biopsy never
+    corroborate a cancer label (CARO: RFA of an unbiopsied 1.2 cm renal mass)."""
     rx = _ORGAN_MALIGNANCY_RE.get((organ or "").lower())
     if not rx or not chart_text:
         return False
+    try:
+        from ..extractors import extract_pathology
+        path = extract_pathology(chart_text) or ""
+    except Exception:  # noqa: BLE001
+        path = ""
+    for m in rx.finditer(path):
+        s0 = max(path.rfind("\n", 0, m.start()), path.rfind(". ", 0, m.start())) + 1
+        s1 = path.find("\n", m.end())
+        clause = path[s0:(s1 if s1 != -1 else len(path))]
+        if not re.search(r"negative\s+for|no\s+evidence|benign|atypical|suspicious|concern|r/o|rule\s+out", clause, re.I):
+            return True
     for m in rx.finditer(chart_text):
         s0 = max(chart_text.rfind("\n", 0, m.start()), chart_text.rfind(". ", 0, m.start())) + 1
         s1 = chart_text.find("\n", m.end())
-        clause = re.sub(r"\s+", " ", chart_text[max(s0, m.start() - 120):(s1 if s1 != -1 else len(chart_text))][:260])
-        if not _HEDGE_RE.search(clause):
+        clause = re.sub(r"\s+", " ", chart_text[max(s0, m.start() - 160):(s1 if s1 != -1 else len(chart_text))][:320])
+        if _HEDGE_RE.search(clause):
+            continue
+        if _TISSUE_CUE_RE.search(clause):
             return True
     return False
 
