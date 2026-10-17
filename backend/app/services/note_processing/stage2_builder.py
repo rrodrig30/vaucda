@@ -582,9 +582,11 @@ _AP_BRACKET_PLACEHOLDER = re.compile(
 # A sentence asserting a Charlson Comorbidity Index / 10-year-survival figure —
 # stripped when NO CCI calculator was actually run (the LLM otherwise fabricates
 # a score, e.g. "CCI 17 / 2% 10-year survival" in express mode).
+# Bounded to ONE sentence on ONE line: '[^.]*' spanned newlines, so in a bullet
+# list (few periods) it swallowed whole runs of Plan bullets around the match.
 _CCI_SENTENCE = re.compile(
-    r"[^.]*\b(?:charlson\s+comorbidity\s+index|comorbidity\s+index\s+score|\bCCI\b|"
-    r"estimated\s+\d+[\s-]year\s+survival)[^.]*\.\s*", re.I)
+    r"[^.\n]*\b(?:charlson\s+comorbidity\s+index|comorbidity\s+index\s+score|\bCCI\b|"
+    r"estimated\s+\d+[\s-]year\s+survival)[^.\n]*(?:\.|$)[ \t]*", re.I | re.M)
 
 
 def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
@@ -594,6 +596,7 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     header."""
     if not text:
         return text
+    _orig = text
     # Strip LLM meta-preamble the rewrite loops prepend, at the start OR mid-text
     # after the first sentence ("Here is the rewritten treatment plan ...:",
     # "Below is the updated assessment:", "Here is the comprehensive clinical
@@ -605,10 +608,14 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     # "I reported the highest-grade core...").
     text = re.sub(r"(?:^|(?<=[.!?]))\s*Note\s*(?:that|:)\s*I\b[^.!?]*[.!?]?", " ", text, flags=re.I)
     # Trailing edit-log the model appends ("I made the following changes: * ...").
+    # Anchored to the START of a line and bounded to that paragraph (the old
+    # '(?is)...\b...:.*' matched 'Medication changes made today:' inside a Plan
+    # bullet and deleted everything after it — CARO 10/16 lost its whole Plan).
     text = re.sub(
-        r"(?is)\b(?:I\s+(?:have\s+)?(?:also\s+)?made\s+the\s+following|"
+        r"(?im)^[ \t]*(?:I\s+(?:have\s+)?(?:also\s+)?made\s+the\s+following|"
         r"(?:the\s+)?following\s+(?:changes?|edits?)\s+(?:were|have\s+been|are)\s+made|"
-        r"Changes?\s+made|Edits?\s+(?:made|applied))\b[^:\n]{0,40}:\s*[-*\s].*",
+        r"Changes?\s+made|Edits?\s+(?:made|applied))\b[^:\n]{0,40}:[ \t]*"
+        r"(?:[-*][^\n]*)?(?:\n[ \t]*[-*][^\n]*)*",
         "", text)
     text = re.sub(r"(?:^|(?<=[.!?]))\s*I\s+(?:corrected|revised|updated|added|removed|"
                   r"changed|reported|inferred|noted|adjusted|rewrote)\b[^.!?]*[.!?]?",
@@ -646,7 +653,14 @@ def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
     text = re.sub(r"([a-z])\.([A-Z])", r"\1. \2", text)   # restore lost sentence space
     text = re.sub(r"\(\s*\)", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    text = text.strip()
+    # Amputation guard: this function POLISHES — it must never remove most of the
+    # section. If it did (a pattern matched clinical prose), keep the original.
+    if len(_orig) > 400 and len(text) < 0.6 * len(_orig):
+        logger.warning("_scrub_ap_artifacts would cut %d -> %d chars; keeping original",
+                       len(_orig), len(text))
+        return _orig.strip()
+    return text
 
 
 # Filler words dropped when comparing PROBLEM titles for duplication, plus
@@ -743,7 +757,9 @@ def _renumber_problems(plan: str) -> str:
         counter[0] += 1
         return f"PROBLEM #{counter[0]}:"
 
-    return re.sub(r"(?i)\bPROBLEM\s*#\s*\d+\s*:", _sub, plan)
+    # Only HEADER lines (a 'PROBLEM #N:' that starts its line). An in-sentence
+    # cross-reference ("(see PROBLEM #2 below)") is not a header.
+    return re.sub(r"(?im)^[ \t]*PROBLEM\s*#\s*\d+\s*:", _sub, plan)
 
 
 def _strip_leading_header(text: str, header: str) -> str:
@@ -1299,15 +1315,21 @@ def build_stage2_note(
                 return _synth_plan(prompt=_p, temperature=0.0,
                                    task_config=task_config, max_tokens=1200)
 
+            _pl = len(plan)
             plan = finalize_temporal(plan, patient_facts, psa_section(stage1_note),
                                      _plan_temporal_call, "Plan", ref_note=stage1_note,
                                      raw_text=_raw_for_facts or "")
+            logger.info("Plan post: finalize_temporal %d -> %d chars", _pl, len(plan or ""))
             plan = _break_dash_bullets(plan)
+            logger.info("Plan post: break_dash_bullets -> %d chars", len(plan or ""))
             plan = _scrub_unproductive_plan(plan)
+            logger.info("Plan post: scrub_unproductive -> %d chars", len(plan or ""))
             plan = _strip_negative_recs(plan, is_plan=True)
+            logger.info("Plan post: strip_negative_recs -> %d chars", len(plan or ""))
             plan = _strip_contradicted_recurrence_workup(plan, assessment, stage1_note)
-        except Exception:  # noqa: BLE001
-            pass
+            logger.info("Plan post: strip_contradicted_recurrence -> %d chars", len(plan or ""))
+        except Exception as _ppe:  # noqa: BLE001
+            logger.warning("Plan post-processing step failed (keeping last good text): %s", _ppe)
 
     # Deterministic ADT backstop: guarantee the ADT action lands in the Plan. If
     # the LLM plan doesn't already address ADT / the depot agent, append the
@@ -1400,10 +1422,15 @@ def assemble_complete_note(
     if assessment:
         assessment = _scrub_ap_artifacts(_strip_leading_header(assessment, "ASSESSMENT"),
                                          has_cci)
+    logger.info("assemble: assessment=%d chars, plan=%d chars",
+                len(assessment or ""), len(plan or ""))
     if plan:
         plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), has_cci)
+        logger.info("assemble: plan after scrub_ap_artifacts=%d", len(plan or ""))
         plan = _dedupe_problems(plan)
+        logger.info("assemble: plan after dedupe_problems=%d", len(plan or ""))
         plan = _renumber_problems(plan)
+        logger.info("assemble: plan after renumber_problems=%d", len(plan or ""))
 
     # Add Assessment
     if assessment and assessment.strip():
@@ -1422,7 +1449,10 @@ def assemble_complete_note(
 
     # Post-processing: Format "Problem #N" as "\nPROBLEM #N" for visual separation
     import re
-    final = re.sub(r'\n?Problem\s*#', '\n\nPROBLEM #', final, flags=re.IGNORECASE)
+    # Only a header — 'PROBLEM #N:' at the start of a line. The old pattern
+    # matched EVERY 'Problem #', so a bullet's cross-reference "(see PROBLEM #2
+    # below)" was torn in two and rendered as a bogus header (CARO 10/16).
+    final = re.sub(r'(?im)^[ \t]*Problem\s*#(\s*\d+\s*:)', r'\n\nPROBLEM #\1', final)
     # Clean up any triple+ newlines created above
     final = re.sub(r'\n{3,}', '\n\n', final)
 
