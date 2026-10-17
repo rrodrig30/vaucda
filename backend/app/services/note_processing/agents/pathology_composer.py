@@ -150,6 +150,43 @@ PATHOLOGY MATERIAL:
 Write the PATHOLOGY RESULTS content now (no header, just the entries)."""
 
 
+_HISTO_TERM_RE = re.compile(
+    r"clear[\s-]cell|papillary\s+(?:renal|urothelial)|chromophobe|oncocytoma|sarcomatoid|collecting[\s-]duct|"
+    r"urothelial\s+(?:cell\s+)?carcinoma|transitional\s+cell|squamous\s+cell\s+carcinoma|adenocarcinoma|"
+    r"renal\s+cell\s+carcinoma|\bRCC\b|seminoma|embryonal|teratoma|yolk\s+sac|choriocarcinoma|"
+    r"carcinoma\s+in\s+situ|\bCIS\b|small[\s-]cell|neuroendocrine|lymphoma|melanoma|\bPIN\b|\bASAP\b", re.I)
+
+
+def _strip_ungrounded_histology_terms(draft: str, grounded_path: str) -> str:
+    """Remove a 'Histology: <term>' fragment or a whole histology-only line whose
+    term does not appear in any pathology report. Entries that otherwise carry
+    grounded content keep everything except the ungrounded fragment."""
+    if not draft:
+        return draft
+    gp = (grounded_path or "").lower()
+
+    def _grounded(term: str) -> bool:
+        t = re.sub(r"\s+", " ", term.lower()).strip()
+        return bool(t) and (t in gp or re.sub(r"[\s-]", "", t) in re.sub(r"[\s-]", "", gp))
+
+    out = []
+    for line in draft.split("\n"):
+        # "Histology: X." fragments (standalone line or trailing on an entry)
+        def _frag(m):
+            return "" if not _grounded(m.group(1)) else m.group(0)
+        new = re.sub(r"(?i)\bhistology\s*:\s*([^.;\n]{2,60})[.;]?", _frag, line)
+        if new.strip() != line.strip():
+            if not new.strip():
+                continue
+            line = re.sub(r"\s{2,}", " ", new).rstrip()
+        # a line that is ONLY an ungrounded histology claim
+        terms = [t for t in _HISTO_TERM_RE.findall(line)]
+        if terms and len(line.strip()) <= 60 and not any(_grounded(t) for t in terms):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _ungrounded_prompt(ctx: str, draft: str, ungrounded: Set[str]) -> str:
     return f"""\
 Your PATHOLOGY section asserts histology that NO pathology report documents:
@@ -265,6 +302,10 @@ def compose_pathology(
     if not draft or len(draft) < 15:
         logger.warning("Pathology composer produced only scaffolding/echo; falling back")
         return None
+    # Deterministic first: any explicit histology TERM in the draft that no
+    # pathology report contains is removed outright (SAENZ: a stray "Histology:
+    # Clear cell." under a prostate biopsy + medical renal biopsy).
+    draft = _strip_ungrounded_histology_terms(draft, grounded_path)
     # Histology the draft asserts that NO pathology report documents -> ask the
     # model to remove it once; if it persists, fall back to the deterministic
     # pathology rather than ship a fabricated histology.

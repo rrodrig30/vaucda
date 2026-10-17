@@ -360,13 +360,17 @@ def _is_valid_lab_line(line: str) -> bool:
     admin_noise_patterns = [
         'IVPB', 'IV PIGGYBACK', 'IV PUSH', 'INFUSE', 'INFUSION', 'BOLUS',
         'OVER 30 MINUTES', 'OVER 60 MINUTES', 'OVER 15 MINUTES',
-        'GU PRO ADVANCED', 'ALM GU', 'RTC ', 'RETURN TO CLINIC',
+        'GU PRO ADVANCED', 'ALM GU', 'ALM PHONE', 'GU STAFF', 'PRO GEN', 'RTC ', 'RETURN TO CLINIC',
         'FOLLOW UP', 'FOLLOW-UP', 'TO ASSESS', 'SYMPTOM CHECK',
         'APPOINTMENT', 'CLINIC VISIT', 'MONTHS TO', 'WEEKS TO',
     ]
     for pattern in admin_noise_patterns:
         if pattern in line_upper:
             return False
+    # A follow-up interval ("in 4-6 weeks", "3 months") is scheduling, not a result.
+    if re.search(r'\bIN\s+\d+\s*(?:-\s*\d+\s*)?(?:WEEKS?|MONTHS?|DAYS?)\b|\b\d+\s*(?:-\s*\d+\s*)?(?:WEEKS|MONTHS)\b',
+                 line_upper):
+        return False
     # Dosing-frequency tokens mark a medication/administration order, not a lab.
     if re.search(r'\bQ\d{1,2}H\b|\bQ(?:AM|PM|HS|D|OD)\b|\b(?:BID|TID|QID|QHS|QAM|PRN)\b',
                  line_upper):
