@@ -136,6 +136,11 @@ Grade by organ:
 RULES:
   - A patient may have MORE THAN ONE cancer — report each.
   - Use ONLY findings documented in the material. Do NOT invent grades/stages.
+  - Histology comes ONLY from a pathology DIAGNOSIS. An imaging impression
+    ("concerning for renal cell carcinoma"), a surgery booking ("Pre-op Diag:
+    Bladder Cancer (Unverified)"), a problem-list entry, or cytology atypia is
+    NOT histology — never write "Histology: <cancer>" for them. A specimen
+    read as benign / negative for malignancy is reported exactly so.
   - Do not editorialize; this is the pathology record.
   - If NO pathology is documented anywhere, output exactly: None documented
 
@@ -143,6 +148,25 @@ PATHOLOGY MATERIAL:
 {ctx}
 
 Write the PATHOLOGY RESULTS content now (no header, just the entries)."""
+
+
+def _ungrounded_prompt(ctx: str, draft: str, ungrounded: Set[str]) -> str:
+    return f"""\
+Your PATHOLOGY section asserts histology that NO pathology report documents:
+{sorted(ungrounded)}. Imaging impressions ("concerning for renal cell carcinoma"),
+surgery bookings ("Pre-op Diag: Bladder Cancer (Unverified)"), problem-list
+entries, and cytology atypia are NOT histologic diagnoses. Rewrite the COMPLETE
+section reporting ONLY diagnoses stated in a pathology DIAGNOSIS; a specimen
+read as benign / negative for malignancy must be reported exactly so, with no
+histology of a cancer appended.
+
+PATHOLOGY MATERIAL:
+{ctx}
+
+YOUR PREVIOUS DRAFT:
+{draft}
+
+Rewrite the complete PATHOLOGY RESULTS content now:"""
 
 
 def _repair_prompt(ctx: str, draft: str, missing: Set[str]) -> str:
@@ -210,7 +234,19 @@ def compose_pathology(
     ctx = build_pathology_context(chart)
     if not ctx:
         return None
-    source_findings = _findings(ctx)
+    # REQUIRED findings come only from REAL pathology reports (the deterministic
+    # extraction), never from the broad context: that context carries imaging
+    # impressions ("concerning for renal cell carcinoma"), surgery bookings
+    # ("Pre-op Diag: Bladder Cancer (Unverified)") and cytology atypia, and the
+    # repair loop was forcing the model to add "Histology: renal cell carcinoma"
+    # / "urothelial carcinoma" for them (CARO: biopsy read benign).
+    try:
+        from ..extractors import extract_pathology
+        grounded_path = extract_pathology(chart) or ""
+    except Exception:  # noqa: BLE001
+        grounded_path = ""
+    grounded = _findings(grounded_path)
+    source_findings = {f for f in _findings(ctx) if not f.startswith("histology:") or f in grounded}
     try:
         draft = _strip_path_echo((llm_call(_compose_prompt(ctx)) or "").strip())
         repairs = 0
@@ -229,6 +265,21 @@ def compose_pathology(
     if not draft or len(draft) < 15:
         logger.warning("Pathology composer produced only scaffolding/echo; falling back")
         return None
+    # Histology the draft asserts that NO pathology report documents -> ask the
+    # model to remove it once; if it persists, fall back to the deterministic
+    # pathology rather than ship a fabricated histology.
+    ungrounded = {f for f in _findings(draft) if f.startswith("histology:") and f not in grounded}
+    if ungrounded:
+        try:
+            draft2 = _strip_path_echo((llm_call(_ungrounded_prompt(ctx, draft, ungrounded)) or "").strip())
+            if draft2 and len(draft2) >= 15:
+                draft = draft2
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Pathology ungrounded-histology repair failed: {e}")
+        still = {f for f in _findings(draft) if f.startswith("histology:") and f not in grounded}
+        if still:
+            logger.warning(f"[PATH] ungrounded histology {sorted(still)} persisted; using deterministic pathology")
+            return grounded_path or None
     # Report residual completeness / grounding for the audit trail.
     covered = _findings(draft)
     missing = source_findings - covered

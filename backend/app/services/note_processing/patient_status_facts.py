@@ -1262,7 +1262,12 @@ def sanitize_context_against_facts(
     # OR on paragraph breaks (blank lines). A single \n inside a paragraph is
     # NOT a sentence boundary — long sentences wrapped across multiple lines
     # by a prior renderer must stay joined so the negation guard works.
-    for raw in re.split(r"(?<=[.!?])\s+|\n\s*\n+", context_text):
+    # Units: sentences, paragraphs, AND bullet / numbered / 'PROBLEM #N:' lines.
+    # A Plan whose bullets carry no periods was ONE unit — one contradicting
+    # clause anywhere dropped the entire Plan (CARO 10/17: plan=0 chars after
+    # "fact-guard dropped 1 sentence").
+    for raw in re.split(r"(?<=[.!?])\s+|\n\s*\n+|\n(?=[ \t]*(?:[-*\u2022]|\d+[.)]\s|PROBLEM\s*#))",
+                        context_text):
         sentence = raw.strip()
         if not sentence:
             continue
@@ -1322,6 +1327,13 @@ def sanitize_context_against_facts(
         keep.append(sentence)
 
     sanitized = "\n".join(keep).strip()
+    # Amputation cap: the guard removes contradicting SENTENCES; it must never
+    # remove most of a section. If it would, keep the text and log it.
+    _total = len(context_text.strip())
+    if _total > 400 and len(sanitized) < 0.5 * _total:
+        logger.warning("sanitize_context_against_facts would cut %d -> %d chars (%d units); "
+                       "keeping original", _total, len(sanitized), len(stripped))
+        return context_text, []
     return sanitized, stripped
 
 

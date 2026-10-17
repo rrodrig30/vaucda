@@ -239,10 +239,48 @@ def extract_gu_problem_list(context: str, llm_call: LLMCallable) -> List[GUDiagn
     return out
 
 
+_ORGAN_MALIGNANCY_RE = {
+    "bladder": re.compile(r"urothelial\s+(?:cell\s+)?carcinoma|transitional\s+cell\s+carcinoma|\bTCC\b|"
+                          r"carcinoma\s+in\s+situ|\bCIS\b|\bNMIBC\b|\bMIBC\b|"
+                          r"(?:high|low)[\s-]grade\s+(?:papillary\s+)?urothelial|bladder\s+(?:cancer|carcinoma|malignancy)", re.I),
+    "renal": re.compile(r"renal\s+cell\s+carcinoma|\bRCC\b|clear[\s-]cell|papillary\s+renal|chromophobe|"
+                        r"kidney\s+cancer|renal\s+(?:cancer|malignancy)", re.I),
+    "upper_tract": re.compile(r"upper[\s-]tract\s+urothelial|\bUTUC\b|ureteral\s+(?:cancer|carcinoma)", re.I),
+    "testicular": re.compile(r"seminoma|germ[\s-]cell\s+tumou?r|\bNSGCT\b|embryonal|teratoma|testicular\s+cancer", re.I),
+    "penile": re.compile(r"squamous\s+cell\s+carcinoma|penile\s+(?:cancer|carcinoma)", re.I),
+    "adrenal": re.compile(r"adrenocortical\s+carcinoma|pheochromocytoma|adrenal\s+(?:cancer|carcinoma)", re.I),
+    "urethral": re.compile(r"urethral\s+(?:cancer|carcinoma)", re.I),
+}
+_HEDGE_RE = re.compile(
+    r"concern(?:ing|ed)?\s+for|suspicious|suspect\w*|\br/o\b|rule\s+out|question\s+of|possibl\w+|"
+    r"probabl\w+|likely|unverified|pre-?op(?:erative)?\s+diag|post-?op(?:erative)?\s+diag|screen\w*|"
+    r"risk\s+(?:of|for)|\bversus\b|\bvs\.?\b|cannot\s+(?:be\s+)?exclude|not\s+excluded|no\s+evidence\s+of|"
+    r"negative\s+for|without\s+evidence|atypical|\bif\b|would|could|workup\s+for|evaluat\w+\s+for|"
+    r"family\s+history|\bfh\b|\bFHx\b", re.I)
+
+
+def malignancy_corroborated(organ: str, chart_text: str) -> bool:
+    """True when the chart states a malignancy of `organ` in a NON-hedged clause
+    (pathology diagnosis, 'known/history of RCC', ...). A surgery booking's
+    'Bladder Cancer (Unverified)', an imaging 'concerning for RCC', or cytology
+    'atypical urothelial cells' does not corroborate a cancer."""
+    rx = _ORGAN_MALIGNANCY_RE.get((organ or "").lower())
+    if not rx or not chart_text:
+        return False
+    for m in rx.finditer(chart_text):
+        s0 = max(chart_text.rfind("\n", 0, m.start()), chart_text.rfind(". ", 0, m.start())) + 1
+        s1 = chart_text.find("\n", m.end())
+        clause = re.sub(r"\s+", " ", chart_text[max(s0, m.start() - 120):(s1 if s1 != -1 else len(chart_text))][:260])
+        if not _HEDGE_RE.search(clause):
+            return True
+    return False
+
+
 def enrich_facts_with_holistic_diagnoses(
     facts: Any,
     context: str,
     llm_task_config: Any = None,
+    chart_text: str = "",
 ) -> Any:
     """Replace/augment ``facts.other_gu_diagnoses`` with the holistic problem
     list so the HPI anchors on the TRUE primary diagnosis regardless of organ.
@@ -282,6 +320,17 @@ def enrich_facts_with_holistic_diagnoses(
     # cancer as a "secondary" entry for a prostate patient, nor (b) let an
     # incidental "raised PSA" clutter a non-prostate primary's HPI.
     non_prostate = [d for d in holistic if d.organ != "prostate"]
+    # A holistic 'cancer' must be corroborated by non-hedged chart text; a
+    # problem-list 'Neoplasm of uncertain behavior' + a TURBT booking labelled
+    # 'Bladder Cancer (Unverified)' became 'T2 urothelial carcinoma' in the
+    # Assessment (CARO) while the biopsy read benign. Downgrade to indeterminate.
+    if chart_text:
+        for d in non_prostate:
+            if d.category == "cancer" and not malignancy_corroborated(d.organ, chart_text):
+                logger.info(f"Holistic dx downgraded cancer->indeterminate (uncorroborated): {d.organ}:{d.name!r}")
+                d.category = "indeterminate"
+                if not re.search(r"uncertain|indeterminate|lesion|mass", d.name or "", re.I):
+                    d.name = f"{d.name} (histology not established)"
     if not non_prostate:
         # Holistic found no non-prostate GU primary → leave the regex layer as
         # is (e.g. a prostate patient's incidental adrenal nodule stands).

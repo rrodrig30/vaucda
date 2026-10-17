@@ -212,7 +212,8 @@ def build_authoritative_patient_facts(
                 "PATHOLOGY:\n" + _path[:2500]
             )
             facts = enrich_facts_with_holistic_diagnoses(
-                facts, _holistic_ctx, llm_task_config=llm_task_config)
+                facts, _holistic_ctx, llm_task_config=llm_task_config,
+                chart_text=clinical_text)
         except Exception as _e:
             logger.warning(f"Holistic diagnosis pass skipped: {_e}")
     # Dedup + de-noise treatment facts (canonical-modality dedup, drop
