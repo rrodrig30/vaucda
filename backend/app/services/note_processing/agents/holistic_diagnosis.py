@@ -303,6 +303,13 @@ def malignancy_corroborated(organ: str, chart_text: str) -> bool:
             continue
         if _TISSUE_CUE_RE.search(clause):
             return True
+        # Inside a pathology report's DIAGNOSIS block (header within the preceding
+        # lines): the term is a histologic diagnosis even if the extractor did
+        # not render this report.
+        lookback = chart_text[max(0, m.start() - 450):m.start()]
+        if re.search(r"(?i)\bDIAGNOSIS\s*:|Microscopic\s+Exam|FINAL\s+(?:PATHOLOGIC\s+)?DIAGNOSIS", lookback) \
+                and not re.search(r"(?i)pre-?op|post-?op|clinical\s+diag|provisional", lookback[-120:]):
+            return True
     return False
 
 
