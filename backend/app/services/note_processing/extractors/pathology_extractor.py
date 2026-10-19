@@ -1250,10 +1250,24 @@ def extract_misc_urologic_pathology(clinical_document: str) -> list:
             _emit(date, organ_proc, diagnosis)
             emitted_from_block = True
         # If no lettered specimens, but body has urologic + finding,
-        # emit a generic summary line.
+        # emit a generic summary line — labelled by the ORGAN actually named,
+        # never a hard-coded "Prostate biopsy" (BIDDLE: a TURBT block was
+        # emitted as '08/31/2021 - Prostate biopsy: ** MICROSCOPIC EXAM ...').
+        # A MICROSCOPIC EXAM/DIAGNOSIS block is parsed by the dedicated
+        # bladder/prostate parsers; skip it here.
         if not emitted_from_block:
+            if re.search(r'MICROSCOPIC\s+EXAM', body, re.IGNORECASE):
+                continue
             body_clean = re.sub(r'\s+', ' ', body).strip()[:400]
-            _emit(date, "Prostate biopsy", body_clean)
+            if re.search(r'\bbladder\b|urothelial', body_clean, re.IGNORECASE) and \
+                    not re.search(r'\bprostat', body_clean, re.IGNORECASE):
+                label = "Bladder pathology"
+            elif re.search(r'\b(?:kidney|renal|nephr)', body_clean, re.IGNORECASE) and \
+                    not re.search(r'\bprostat', body_clean, re.IGNORECASE):
+                label = "Renal pathology"
+            else:
+                label = "Prostate biopsy"
+            _emit(date, label, body_clean)
 
     return out
 
