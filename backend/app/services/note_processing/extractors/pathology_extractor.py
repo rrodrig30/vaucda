@@ -469,9 +469,16 @@ def extract_turbt_pathology(clinical_document: str) -> str:
 
         _parse_bladder_specimens(diagnosis_block, date_str, all_turbt_results, prefix="TURBT")
 
-    # Fallback: Find MICROSCOPIC EXAM/DIAGNOSIS sections with bladder content (no TURBT prefix)
-    bladder_micro_pattern = r'\*{0,2}\s*MICROSCOPIC\s+EXAM/DIAGNOSIS[:\s]*\n(?:(?!\s*DIAGNOSIS)[^\n]*\n)*\s*DIAGNOSIS[:\s]*\n(.*?)(?=\n\s*(?:Comment:|/es/|Signed|={10,}|$))'
-    for match in re.finditer(bladder_micro_pattern, clinical_document, re.IGNORECASE | re.DOTALL):
+    # Fallback: Find MICROSCOPIC EXAM/DIAGNOSIS sections with bladder content (no TURBT prefix).
+    # The DIAGNOSIS block ends at a report terminator, a dashed/starred divider, a
+    # blank line followed by a non-specimen header, a date label, or a note header
+    # — the old '$'-terminated capture ran to END OF DOCUMENT when none of the
+    # original markers followed (CARSON: 19 KB of consent / time-out prose).
+    bladder_micro_pattern = (r'\*{0,2}\s*MICROSCOPIC\s+EXAM/DIAGNOSIS[:\s]*\n(?:(?!\s*DIAGNOSIS)[^\n]*\n)*\s*DIAGNOSIS[:\s]*\n'
+                             r'(.*?)(?=\n\s*(?:Comment:|/es/|Signed|={10,}|-{6,}|\*\*|\d{1,2}/\d{1,2}/\d{2,4}\s*:?\s*\n|'
+                             r'Local\s+Title|DATE\s+OF\s+NOTE|IDENTIFICATION|CONSENT\s*:|TIME\s+OUT|PROCEDURE\s*:|'
+                             r'INDICATION|IMPRESSION\s*:|Pathology\s+\d|TURBT\s+\d|[A-Z][A-Z ,&/]{3,}:\s*$)|\Z)')
+    for match in re.finditer(bladder_micro_pattern, clinical_document, re.IGNORECASE | re.DOTALL | re.MULTILINE):
         diagnosis_block = match.group(1)
 
         # Only process if this contains bladder content and NOT prostate
@@ -480,15 +487,67 @@ def extract_turbt_pathology(clinical_document: str) -> str:
         if re.search(r'prostate', diagnosis_block, re.IGNORECASE):
             continue
 
-        # Try to find date before this match
-        date = ""
-        date_match = re.search(r'(?:Date\s+(?:obtained|Spec\s+taken):\s*)?([A-Za-z]{3}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})', clinical_document[max(0, match.start()-300):match.start()], re.IGNORECASE)
-        if date_match:
-            date = date_match.group(1)
+        # Date ONLY from a label immediately above the report ("2/10/23:",
+        # "8/2021 TURBT", "Pathology 10/2021", "TURBT 9/11/23", "Collected: ...").
+        # The old 300-char look-back took the enclosing NOTE's date, so one report
+        # copied forward into three notes rendered as three differently-dated
+        # biopsies (TOBIN: 2/10/23 report shown as Feb 2023, 9/2022 and 6/2025).
+        date = _bladder_report_date_label(clinical_document, match.start())
 
         _parse_bladder_specimens(diagnosis_block, date, all_turbt_results, prefix="Bladder biopsy")
 
-    return '\n\n'.join(all_turbt_results)
+    return '\n\n'.join(_dedupe_bladder_reports(all_turbt_results))
+
+
+_BLADDER_DATE_LABEL_RE = re.compile(
+    r'(?:^|\n)[ \t]*(?:(?:TURBT|Pathology|Path|Bladder\s+biopsy|Biopsy)\s+)?'
+    r'(\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}/\d{4}|[A-Za-z]{3}\s+\d{1,2},?\s+\d{4})'
+    r'(?:\s*:|\s+TURBT|\s+biopsy|\s+pathology)?[ \t]*(?=\n)', re.IGNORECASE)
+
+
+def _bladder_report_date_label(doc: str, pos: int) -> str:
+    """A date LABEL within the three lines above a MICROSCOPIC EXAM block, or a
+    'Collected: <date>' line there; '' when the report carries no label."""
+    window = doc[max(0, pos - 220):pos]
+    tail = "\n".join(window.split("\n")[-4:])
+    m = re.search(r'Collected:\s*(\d{1,2}/\d{1,2}/\d{4})', tail)
+    if m:
+        return m.group(1)
+    labels = list(_BLADDER_DATE_LABEL_RE.finditer(tail))
+    return labels[-1].group(1) if labels else ""
+
+
+def _dedupe_bladder_reports(results: list) -> list:
+    """Collapse copy-forward duplicates: the same specimen lines reported under
+    several headers keep ONE entry — a dated one over an undated one."""
+    best = {}
+    order = []
+    for r in results:
+        head, _, body = r.partition('\n')
+        key = re.sub(r'\s+', ' ', body).strip().lower()
+        dated = bool(re.search(r'\d', head))
+        if key in best:
+            if dated and not best[key][0]:
+                best[key] = (dated, r)
+            continue
+        best[key] = (dated, r)
+        order.append(key)
+    return [best[k][1] for k in order]
+
+
+def _muscularis_status(finding_text: str) -> str:
+    """Render the muscularis propria statement with the negation honoured.
+    'MUSCULARIS PROPRIA IS PRESENT AND IS NOT INVOLVED' was rendered 'Muscularis
+    propria involved' (a bare 'INVOLVED' substring test) — a non-invasive tumour
+    reported as muscle-invasive (TOBIN)."""
+    t = re.sub(r'\s+', ' ', finding_text.upper())
+    if re.search(r'NOT\s+INVOLVED|UNINVOLVED|NO\s+INVOLVEMENT|FREE\s+OF\s+TUMOU?R|NOT\s+INVADED|NO\s+TUMOU?R', t):
+        return "Muscularis propria present and not involved"
+    if re.search(r'NOT\s+IDENTIFIED|NO\s+MUSCULARIS|ABSENT|NOT\s+PRESENT|NOT\s+SAMPLED', t):
+        return "No muscularis propria identified"
+    if re.search(r'INVOLVED|INVA(?:DES|DING|SION)\s+(?:INTO\s+|OF\s+)?(?:THE\s+)?MUSCULARIS|MUSCULARIS\s+PROPRIA\s+INVASION', t):
+        return "Muscularis propria involved"
+    return "Muscularis propria present"
 
 
 def _parse_bladder_specimens(diagnosis_block: str, date_str: str, results_list: list, prefix: str = "TURBT"):
@@ -511,9 +570,12 @@ def _parse_bladder_specimens(diagnosis_block: str, date_str: str, results_list: 
     # 157K chart froze a CPU core with the GIL held, so the async note-timeout
     # could never fire and the whole server hung). The location group is length-
     # bounded and newline-free to keep matching linear.
+    # The specimen header may put the site FIRST ("A. RIGHT LOW BLADDER WALL,
+    # BIOPSY:") — the old header pattern required it to START with BLADDER and
+    # silently dropped such specimens (TOBIN).
     specimen_pattern = (
         r'([A-L])\.\s*'
-        r'((?:URINARY\s+)?BLADDER[,\s][^:\n]{0,150})'   # location header (bounded)
+        r'([^:\n]{0,80}?\bBLADDER\b[^:\n]{0,150})'      # location header (bounded, BLADDER anywhere)
         r'\s*:\s*'                                        # colon terminator
         r'(.*?)'                                          # findings (lazy, DOTALL)
         r'(?=\n\s*[A-L]\.\s|\Z)'                          # up to next specimen / end
@@ -524,18 +586,27 @@ def _parse_bladder_specimens(diagnosis_block: str, date_str: str, results_list: 
         spec_location = spec_match.group(2).strip()
         findings_block = spec_match.group(3).strip()
 
-        # Clean up location - extract just the anatomical location
-        location_match = re.search(r'(?:URINARY\s+)?BLADDER[,\s]+([^,]+(?:BLADDER WALL|TUMOR)?)', spec_location, re.IGNORECASE)
-        if location_match:
-            location = location_match.group(1).strip().rstrip(',')
-            location = location.title()
-        else:
-            location = "Bladder"
+        # Clean up location - the anatomical site without the procedure word or
+        # the leading organ ("URINARY BLADDER, LEFT POSTERIOR, BIOPSY" -> "Left
+        # Posterior"; "RIGHT LOW BLADDER WALL, BIOPSY" -> "Right Low Bladder Wall").
+        loc = re.sub(r',?\s*(?:BIOPSY|BIOPSIES|TRANSURETHRAL\s+RESECTION|TURBT|RESECTION|EXCISION)\s*$', '',
+                     spec_location.strip(), flags=re.IGNORECASE)
+        loc = re.sub(r'^(?:URINARY\s+)?BLADDER[,\s]*', '', loc, flags=re.IGNORECASE).strip(' ,')
+        location = loc.title() if loc else "Bladder"
 
-        # Parse findings - combine multi-line findings
+        # Parse findings - combine multi-line findings. The findings of the LAST
+        # specimen run to the end of the captured block, so stop at the first
+        # blank line after a finding, a divider, or a non-finding header line.
         findings_lines = []
         for line in findings_block.split('\n'):
             line = line.strip()
+            if not line:
+                if findings_lines:
+                    break
+                continue
+            if re.match(r'^(?:-{5,}|\*\*|={5,}|IDENTIFICATION|CONSENT|TIME\s+OUT|PROCEDURE\b|'
+                        r'[A-Z][A-Z ,&/]{3,}:\s*$|\d{1,2}/\d{1,2}/\d{2,4}\s*:?\s*$|Comment:|/es/)', line):
+                break
             if line.startswith('-') or line.startswith('•'):
                 line = line[1:].strip()
             if line and not line.startswith('(SEE'):
@@ -555,14 +626,7 @@ def _parse_bladder_specimens(diagnosis_block: str, date_str: str, results_list: 
             if 'NON-INVASIVE' in finding_text.upper() or 'NONINVASIVE' in finding_text.upper():
                 finding_summary += ", non-invasive"
             if 'MUSCULARIS PROPRIA' in finding_text.upper():
-                if 'UNINVOLVED' in finding_text.upper() or 'NO TUMOR' in finding_text.upper():
-                    finding_summary += ". Muscularis propria present and uninvolved"
-                elif 'NOT IDENTIFIED' in finding_text.upper() or 'NO MUSCULARIS' in finding_text.upper():
-                    finding_summary += ". No muscularis propria identified"
-                elif 'INVOLVED' in finding_text.upper():
-                    finding_summary += ". Muscularis propria involved"
-                else:
-                    finding_summary += ". Muscularis propria present"
+                finding_summary += ". " + _muscularis_status(finding_text)
         else:
             # Use the raw finding text, cleaned up
             finding_summary = finding_text.replace('  ', ' ')
@@ -1040,11 +1104,13 @@ def extract_misc_urologic_pathology(clinical_document: str) -> list:
             continue
         # Parse each lettered specimen line in the body
         for spec_m in re.finditer(
-            r'^[\s]*[A-N]\.\s*([^\n]+?):\s*\n\s*-?\s*([^\n]+(?:\n\s*-[^\n]+)*)',
+            # Continuation: a following '-' bullet OR an indented wrapped line that is
+            # not a new specimen label ("NON-\n          INVASIVE (SEE COMMENT).").
+            r'^[\s]*[A-N]\.\s*([^\n]+?):\s*\n\s*-?\s*([^\n]+(?:\n(?![ \t]*[A-N]\.\s|[ \t]*\n)[ \t]+-?[^\n]+)*)',
             body, re.MULTILINE,
         ):
             organ_proc = re.sub(r'\s+', ' ', spec_m.group(1)).strip()
-            diagnosis = re.sub(r'\s+', ' ', spec_m.group(2)).strip()
+            diagnosis = re.sub(r'\s+', ' ', re.sub(r'-\n\s+', '-', spec_m.group(2))).strip()
             if not _UROLOGIC_ORGAN_RE.search(organ_proc):
                 continue
             _emit(date, organ_proc, diagnosis)
@@ -1100,11 +1166,13 @@ def extract_misc_urologic_pathology(clinical_document: str) -> list:
         if not date_str:
             continue
         for spec_m in re.finditer(
-            r'^[\s]*[A-N]\.\s*([^\n]+?):\s*\n\s*-?\s*([^\n]+(?:\n\s*-[^\n]+)*)',
+            # Continuation: a following '-' bullet OR an indented wrapped line that is
+            # not a new specimen label ("NON-\n          INVASIVE (SEE COMMENT).").
+            r'^[\s]*[A-N]\.\s*([^\n]+?):\s*\n\s*-?\s*([^\n]+(?:\n(?![ \t]*[A-N]\.\s|[ \t]*\n)[ \t]+-?[^\n]+)*)',
             body, re.MULTILINE,
         ):
             organ_proc = re.sub(r'\s+', ' ', spec_m.group(1)).strip()
-            diagnosis = re.sub(r'\s+', ' ', spec_m.group(2)).strip()
+            diagnosis = re.sub(r'\s+', ' ', re.sub(r'-\n\s+', '-', spec_m.group(2))).strip()
             if not _UROLOGIC_ORGAN_RE.search(organ_proc):
                 continue
             _emit(date_str, organ_proc, diagnosis)
@@ -1176,7 +1244,7 @@ def extract_misc_urologic_pathology(clinical_document: str) -> list:
             body, re.MULTILINE,
         ):
             organ_proc = re.sub(r'\s+', ' ', spec_m.group(1)).strip()
-            diagnosis = re.sub(r'\s+', ' ', spec_m.group(2)).strip()
+            diagnosis = re.sub(r'\s+', ' ', re.sub(r'-\n\s+', '-', spec_m.group(2))).strip()
             if not _UROLOGIC_ORGAN_RE.search(organ_proc):
                 continue
             _emit(date, organ_proc, diagnosis)
@@ -1513,7 +1581,45 @@ def extract_pathology(clinical_document: str) -> str:
     if not pathology_reports:
         return ""
 
-    return _truncate_pathology_bleed('\n\n'.join(pathology_reports))
+    return _drop_shadowed_bladder_blocks(_truncate_pathology_bleed('\n\n'.join(pathology_reports)))
+
+
+_FORMAL_BLADDER_ENTRY_RE = re.compile(
+    r'(?im)^([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})\s+-\s+[^\n]*\bBLADDER\b')
+_NOTE_BLADDER_HEADER_RE = re.compile(r'(?i)^(?:Bladder biopsy|TURBT)\s*(\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}/\d{4})?\s*:')
+
+
+def _drop_shadowed_bladder_blocks(text: str) -> str:
+    """A bladder report copied into clinic notes ("Bladder biopsy 2/10/23:" blocks)
+    is SHADOWED by the formal surgical-pathology entry of the same month
+    ("Feb 10, 2023 - URINARY BLADDER, LEFT POSTERIOR, BIOPSY: ..."); an undated
+    note copy is shadowed by any formal bladder entry. Keep the formal one."""
+    if not text:
+        return text
+    formal = set()
+    for m in _FORMAL_BLADDER_ENTRY_RE.finditer(text):
+        try:
+            from datetime import datetime as _dt
+            d = _dt.strptime(m.group(1).replace(',', ''), '%b %d %Y')
+            formal.add((d.year, d.month))
+        except ValueError:
+            pass
+    if not formal:
+        return text
+    kept = []
+    for block in text.split('\n\n'):
+        head = block.split('\n', 1)[0]
+        hm = _NOTE_BLADDER_HEADER_RE.match(head.strip())
+        if hm:
+            d = hm.group(1)
+            if not d:
+                continue
+            parts = d.split('/')
+            mo = int(parts[0]); y = int(parts[-1]); y = y + 2000 if y < 100 else y
+            if (y, mo) in formal:
+                continue
+        kept.append(block)
+    return '\n\n'.join(kept)
 
 
 # Non-pathology section headers that must TERMINATE a pathology report — a
