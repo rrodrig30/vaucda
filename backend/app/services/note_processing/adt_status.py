@@ -130,6 +130,12 @@ _META_SENT_BLOCK = re.compile(
     r"work[\s-]?up|\(-\)|not\s+identified|\bif\b|should\s+(?:he|show)|"
     r"progress\w*\s+to|risk\s+of|screen|to\s+assess|potential|question|\blikely\b|"
     r"lack\s+of|chance\s+of|c(?:an|ould)\s+occur|"
+    # radiology hedges that DENY metastasis while naming it (SAENZ: "less c/w
+    # metastatic disease", "unlikely to represent metastatic prostate cancer";
+    # ARIAS: "more typical of fibrosis/scarring than metastatic prostate cancer")
+    r"less\s+c/w|less\s+consistent|unlikely|more\s+typical\s+of|rather\s+than|\bthan\s+metasta|"
+    r"doubt|low\s+suspicion|atypical\s+for|favou?r(?:s|ed|ing)?\s+(?:a\s+)?(?:benign|non|mechanical|degenerative|"
+    r"post[\s-]?treatment|inflammat|infect|fibros|scar)|"
     # family history, not the patient
     r"family\s+history|\bFHx\b|brothers?\s+had|father\s+had|sibling|"
     r"(?:brother|father|son|relative|paternal|maternal)",
@@ -868,6 +874,7 @@ def build_adt_status(raw_text: str, visit_date: str = "",
     if given_today and vdt:
         dates = _dedupe_dates(dates + [(vdt[0], vdt[1], vdt[2],
                                         f"{vdt[1]:02d}/{vdt[2]:02d}/{vdt[0]}", "last")])
+    indefinite_documented = _adt_ctx_hit(_CONTINUE_INDEF_RE, raw_text)
     finite_done = bool(_FINITE_COMPLETED_RE.search(raw_text))
     disc_tox = _adt_ctx_hit(_DISCONTINUED_TOX_RE, _since)
     new_course = bool(_NEW_COURSE_RE.search(raw_text))
@@ -960,8 +967,10 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         else:
             st.evidence.append("completed short/single-dose ADT course "
                                "(testosterone recovering)")
-    # 2) Finite course finished (and not restarting).
-    elif (finite_done or dc_done) and not active_order:
+    # 2) Finite course finished (and not restarting). A bare PENDING clinic
+    #    order does not reopen a documented completed course — it is a note.
+    elif (finite_done or dc_done) and not (given_today or new_course
+                                           or (st.order_status == "ACTIVE" and not off_now)):
         st.status = "COMPLETED"
         st.evidence.append("finite ADT course completed" + (f" ({dc_txt})" if dc_done else ""))
     # 3) Finite course still underway (adjuvant/neoadjuvant, not yet finished).
@@ -1049,7 +1058,9 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.determination = f"INJECTION GIVEN TODAY — {_regimen(st)}."
     elif st.status == "COMPLETED":
         st.injection = "NOT_DUE"
-        st.determination = "No injection due — finite ADT course completed."
+        st.determination = ("No injection indicated — finite ADT course completed."
+                            + (" The PENDING pharmacy order is stale — do not administer on its basis."
+                               if pending else ""))
     elif st.status == "DISCONTINUED":
         st.injection = "NOT_DUE"
         st.determination = ("No injection due — ADT discontinued (off therapy)."
@@ -1058,41 +1069,55 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.injection = "NOT_DUE"
         st.determination = ("No injection due — off-cycle (intermittent ADT); "
                             "resume per PSA threshold." + _psa_tail(psa_data))
-    elif (st.order_status == "PENDING" and st.last_injection_ymd and st.interval_months
-          and vdt and _cmp(vdt, _add_months(st.last_injection_ymd, st.interval_months)) < -14):
-        # A standing clinic order can sit PENDING for months after the last dose
-        # was consumed. The dosing math governs: last dose + interval is still
-        # more than 2 weeks away, so a dose today would be early.
-        nd = _add_months(st.last_injection_ymd, st.interval_months)
-        st.next_due_display = f"{nd[1]:02d}/{nd[2]:02d}/{nd[0]}"
-        st.injection = "NOT_DUE"
-        st.determination = (f"No injection due — next due {st.next_due_display} "
-                            f"(last {st.last_injection_display}, {st.interval_display}); "
-                            f"a pharmacy order is PENDING but the dose is not yet due.")
-    elif st.order_status == "PENDING":
-        st.injection = "ORDERED_PENDING"
-        st.determination = (f"INJECTION ORDERED — {_regimen(st)} "
-                            f"(pharmacy order PENDING this visit).")
     elif st.last_injection_ymd and st.interval_months:
+        # The DOSING HISTORY governs. A standing clinic order sits PENDING in the
+        # chart for years after the course it was written for ended (GAMBOA: last
+        # dose 07/2023, ROSIE: 10/2022, both post-radiation with a near-
+        # undetectable PSA — and the note said "administer Eligard today"). A
+        # pending order is only a NOTE on the dosing determination, never the
+        # reason to give a dose.
         nd = _add_months(st.last_injection_ymd, st.interval_months)
         st.next_due_display = f"{nd[1]:02d}/{nd[2]:02d}/{nd[0]}"
+        _pend = " A pharmacy order is PENDING in the chart." if pending else ""
         if gap_days is not None and gap_days > _interval_days + 120:
-            # Last dose is far past the dosing interval — ADT looks lapsed/stopped,
-            # not simply "due". Do NOT suggest a dose on this basis; flag it.
-            st.injection = "UNKNOWN"
-            st.determination = (
-                f"Last injection {st.last_injection_display} was ~{round(gap_days / 30)} "
-                f"months ago (interval {st.interval_display}) — ADT appears "
-                f"lapsed/discontinued; confirm status before any dose."
-                + _psa_tail(psa_data))
+            _months = round(gap_days / 30)
+            if metastatic or indefinite_documented:
+                # Indefinite ADT (documented metastatic disease / explicit
+                # continuous intent) with a gap: the dose is OVERDUE, not finished.
+                st.injection = "DUE"
+                st.determination = (
+                    f"INJECTION OVERDUE — {_regimen(st)}; last injection "
+                    f"{st.last_injection_display} was ~{_months} months ago on indefinite ADT."
+                    + _pend + _psa_tail(psa_data))
+            else:
+                # Finite / surveillance setting: the course has ended. There is no
+                # indication to resume ADT on a stale order — especially post-
+                # radiation with an undetectable PSA.
+                st.injection = "NOT_DUE"
+                st.status = "COMPLETED" if (finite_done or dc_done or finite_planned) else "DISCONTINUED"
+                st.determination = (
+                    f"No injection indicated — last injection {st.last_injection_display} was "
+                    f"~{_months} months ago ({st.interval_display}); the ADT course is complete/"
+                    f"lapsed and no new course is documented."
+                    + (" The PENDING pharmacy order is stale — do not administer on its basis."
+                       if pending else "")
+                    + _psa_tail(psa_data))
+                st.evidence.append("stale dosing history: course complete/lapsed"
+                                   + ("; stale PENDING order" if pending else ""))
         elif vdt is None or _cmp(vdt, nd) >= -14:   # due within a 2-week grace window
             st.injection = "DUE"
             st.determination = (f"INJECTION DUE — {_regimen(st)} "
-                                f"(last {st.last_injection_display}, due {st.next_due_display}).")
+                                f"(last {st.last_injection_display}, due {st.next_due_display})."
+                                + (" Pharmacy order pending." if pending else ""))
         else:
             st.injection = "NOT_DUE"
             st.determination = (f"No injection due — next due {st.next_due_display} "
-                                f"(last {st.last_injection_display}, {st.interval_display}).")
+                                f"(last {st.last_injection_display}, {st.interval_display})." + _pend)
+    elif st.order_status == "PENDING":
+        # No dosing history at all: a pending order is the first dose of a course.
+        st.injection = "ORDERED_PENDING"
+        st.determination = (f"INJECTION ORDERED — {_regimen(st)} "
+                            f"(pharmacy order PENDING this visit; no prior injection documented).")
     else:
         st.injection = "UNKNOWN"
         miss = "interval" if not st.interval_months else "last-injection date"
@@ -1184,6 +1209,12 @@ def _plan_directive_from_determination(det: str, agent: str) -> Optional[str]:
         return (f"Clarify ADT intent before dosing — a completed short course but a "
                 f"pending {agent} depot order exists; confirm a stale order vs. an "
                 f"intended new course.")
+    if "no injection indicated" in d or "complete/lapsed" in d:
+        return (f"No ADT injection indicated — the {agent} course is complete; do not "
+                f"administer on the stale pharmacy order; continue PSA surveillance.")
+    if "overdue" in d:
+        return (f"{agent} depot is OVERDUE on indefinite ADT — administer today and "
+                f"re-establish the dosing schedule.")
     if "discontinued" in d:
         return ("ADT remains discontinued; continue PSA surveillance and manage per "
                 "shared decision-making.")
