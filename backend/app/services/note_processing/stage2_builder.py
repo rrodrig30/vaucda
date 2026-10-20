@@ -1359,6 +1359,10 @@ def build_stage2_note(
                                      raw_text=_raw_for_facts or "")
             logger.info("Plan post: finalize_temporal %d -> %d chars", _pl, len(plan or ""))
             plan = _break_dash_bullets(plan)
+            # Headers on their own lines BEFORE the bullet-level scrubs, so a
+            # 'Problem #N:' the model (or a rewrite) ran inline onto a bullet is
+            # never trimmed away as if it were a clause of that bullet.
+            plan = _break_inline_problem_headers(plan)
             logger.info("Plan post: break_dash_bullets -> %d chars", len(plan or ""))
             plan = _scrub_unproductive_plan(plan)
             logger.info("Plan post: scrub_unproductive -> %d chars", len(plan or ""))
@@ -1465,6 +1469,10 @@ def assemble_complete_note(
     if plan:
         plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), has_cci)
         logger.info("assemble: plan after scrub_ap_artifacts=%d", len(plan or ""))
+        # Inline headers onto their own lines FIRST: dedupe and renumber only
+        # see a header at a line start, so an inline 'Problem #4:' used to skip
+        # renumbering and ship as '#1, #2, #4'.
+        plan = _break_inline_problem_headers(plan)
         plan = _dedupe_problems(plan)
         logger.info("assemble: plan after dedupe_problems=%d", len(plan or ""))
         plan = _renumber_problems(plan)

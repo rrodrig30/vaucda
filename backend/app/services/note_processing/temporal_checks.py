@@ -91,14 +91,29 @@ def temporal_violations(text: str) -> List[str]:
 
 def scrub_vague_recency(text: str) -> str:
     """Guarantee no bare 'recent/recently' survives in an UNDATED sentence (keep
-    'most recent'); the date is preferred, but the vague wording must never ship."""
-    out = []
-    for s in sentences(text):
-        if VAGUE_RECENCY.search(s) and not DATE_IN_SENT.search(s):
-            s = VAGUE_RECENCY.sub("", s)
-            s = re.sub(r"\s{2,}", " ", s).replace(" ,", ",").replace(" .", ".")
-        out.append(s.strip())
-    return " ".join(x for x in out if x)
+    'most recent'); the date is preferred, but the vague wording must never ship.
+
+    LINE-PRESERVING: the Plan is a bullet list whose structure lives in its
+    newlines. The old sentence-split-and-space-join flattened every line break
+    that followed a period, so a bullet ending in '.' swallowed the next
+    'PROBLEM #N:' header onto its own line (GAMBOA 10/19: headers run inline,
+    one header dropped by the clause trimmer, renumbering skipped). Each line is
+    scrubbed on its own and the newline structure is returned unchanged."""
+    if not text:
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        body = line.lstrip()
+        prefix = line[:len(line) - len(body)]
+        out = []
+        for s in sentences(body):
+            if VAGUE_RECENCY.search(s) and not DATE_IN_SENT.search(s):
+                s = VAGUE_RECENCY.sub("", s)
+                s = re.sub(r"\s{2,}", " ", s).replace(" ,", ",").replace(" .", ".")
+            out.append(s.strip())
+        joined = " ".join(x for x in out if x)
+        out_lines.append(prefix + joined if joined else "")
+    return "\n".join(out_lines).strip("\n")
 
 
 def psa_pairs(psa_data: str) -> List[Tuple[str, float]]:
