@@ -1273,17 +1273,28 @@ def build_stage2_note(
             # format) and NOT the rendered prose (which misfires the extractor).
             # This preserves the full dosing directive (DUE/ordered/lapsed) for
             # the Plan even though the visible ADT section is minimal.
-            from .adt_status import build_adt_status, adt_plan_directive, adt_text_from_notes
+            from .adt_status import (build_adt_status, adt_plan_directive,
+                                     adt_plan_constraint, adt_text_from_notes)
             # Each body is re-dated with its note's date so the nursing
             # "Administered Eligard ..." record keeps the date the splitter
             # stripped (the "Local Title" header line).
             _adt_raw = adt_text_from_notes((gu_notes or []) + (non_gu_notes or []))
-            _adt_directive = adt_plan_directive(build_adt_status(_adt_raw)) if _adt_raw else None
+            _adt_st = build_adt_status(_adt_raw) if _adt_raw else None
+            _adt_directive = adt_plan_directive(_adt_st) if _adt_st else None
             if _adt_directive:
                 _plan_facts = ((authoritative_facts or "")
                                + "\n\nADT — PLAN DIRECTIVE (deterministic ADT scheduler; "
                                "reflect this action in the Plan and do not contradict it):\n- "
                                + _adt_directive + "\n")
+            else:
+                # Historical course: no Plan item at all, only a prompt-side
+                # guard so the LLM does not copy an injection forward.
+                _adt_guard = adt_plan_constraint(_adt_st) if _adt_st else None
+                if _adt_guard:
+                    _plan_facts = ((authoritative_facts or "")
+                                   + "\n\nADT — HISTORICAL (deterministic ADT scheduler; "
+                                   "this is a constraint, not note text):\n- "
+                                   + _adt_guard + "\n")
         except Exception as _ade:  # noqa: BLE001
             logger.warning(f"ADT plan directive skipped: {_ade}")
 

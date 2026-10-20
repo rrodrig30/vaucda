@@ -1058,13 +1058,14 @@ def build_adt_status(raw_text: str, visit_date: str = "",
         st.determination = f"INJECTION GIVEN TODAY — {_regimen(st)}."
     elif st.status == "COMPLETED":
         st.injection = "NOT_DUE"
-        st.determination = ("No injection indicated — finite ADT course completed."
-                            + (" The PENDING pharmacy order is stale — do not administer on its basis."
-                               if pending else ""))
+        # Historical fact only. A finished course is not a recommendation to
+        # withhold anything — the note never says "no injection indicated".
+        st.determination = f"ADT course completed — {_regimen(st)}."
+        if pending:
+            st.evidence.append("PENDING pharmacy order is a stale standing order (course completed)")
     elif st.status == "DISCONTINUED":
         st.injection = "NOT_DUE"
-        st.determination = ("No injection due — ADT discontinued (off therapy)."
-                            + _psa_tail(psa_data))
+        st.determination = "ADT discontinued (off therapy)." + _psa_tail(psa_data)
     elif st.status == "INTERMITTENT_HOLDING":
         st.injection = "NOT_DUE"
         st.determination = ("No injection due — off-cycle (intermittent ADT); "
@@ -1096,11 +1097,8 @@ def build_adt_status(raw_text: str, visit_date: str = "",
                 st.injection = "NOT_DUE"
                 st.status = "COMPLETED" if (finite_done or dc_done or finite_planned) else "DISCONTINUED"
                 st.determination = (
-                    f"No injection indicated — last injection {st.last_injection_display} was "
-                    f"~{_months} months ago ({st.interval_display}); the ADT course is complete/"
-                    f"lapsed and no new course is documented."
-                    + (" The PENDING pharmacy order is stale — do not administer on its basis."
-                       if pending else "")
+                    f"ADT course complete — last injection {st.last_injection_display} was "
+                    f"~{_months} months ago ({st.interval_display}); no new course is documented."
                     + _psa_tail(psa_data))
                 st.evidence.append("stale dosing history: course complete/lapsed"
                                    + ("; stale PENDING order" if pending else ""))
@@ -1209,20 +1207,19 @@ def _plan_directive_from_determination(det: str, agent: str) -> Optional[str]:
         return (f"Clarify ADT intent before dosing — a completed short course but a "
                 f"pending {agent} depot order exists; confirm a stale order vs. an "
                 f"intended new course.")
-    if "no injection indicated" in d or "complete/lapsed" in d:
-        return (f"No ADT injection indicated — the {agent} course is complete; do not "
-                f"administer on the stale pharmacy order; continue PSA surveillance.")
+    # A completed, lapsed or discontinued course is HISTORY, not a Plan item.
+    # Saying "no ADT injection indicated" is as empty as "no amputation
+    # indicated" — nothing goes into the Plan (see adt_plan_constraint for the
+    # prompt-only guard that keeps the LLM from copying an old injection forward).
+    if ("course complete" in d or "course completed" in d or "discontinued" in d) \
+            and "overdue" not in d:
+        return None
     if "overdue" in d:
         return (f"{agent} depot is OVERDUE on indefinite ADT — administer today and "
                 f"re-establish the dosing schedule.")
-    if "discontinued" in d:
-        return ("ADT remains discontinued; continue PSA surveillance and manage per "
-                "shared decision-making.")
     if "off-cycle" in d or "intermittent" in d:
         return (f"Continue the intermittent ADT holiday ({agent}); monitor PSA and "
                 f"testosterone, resume ADT per the PSA threshold.")
-    if "course completed" in d:
-        return "ADT course completed; monitor PSA and testosterone recovery."
     if "being initiated" in d or "first injection scheduled" in d or "initiat" in d:
         return (f"Initiate ADT ({agent}); counsel on side effects and obtain baseline "
                 f"bone-health monitoring (DEXA, calcium/vitamin D).")
@@ -1236,6 +1233,23 @@ def _plan_directive_from_determination(det: str, agent: str) -> Optional[str]:
         return (f"Administer {agent} depot today (pharmacy order pending); confirm "
                 f"dose/route/interval.")
     return f"ADT — {det}"
+
+
+def adt_plan_constraint(st: "ADTStatus") -> Optional[str]:
+    """Prompt-only guard for the Plan LLM when ADT is historical (course
+    completed / lapsed / discontinued). It is NOT note text and must never be
+    rendered: it exists so a stale pharmacy order or a copied-forward prior Plan
+    cannot re-introduce an injection the dosing history does not support."""
+    if not st or not st.present or st.is_active:
+        return None
+    if st.status not in ("COMPLETED", "DISCONTINUED"):
+        return None
+    agent = (st.agent.split(",")[0].strip() or "ADT")
+    last = f" (last dose {st.last_injection_display})" if st.last_injection_display else ""
+    return (f"The {agent} course is {st.status.lower()}{last}; ADT is historical for this "
+            f"visit. Do NOT include an ADT injection, a 'no ADT indicated' statement, or any "
+            f"other ADT item in the Plan, even if a pending pharmacy order or an earlier "
+            f"Plan mentions one.")
 
 
 def render_adt_section(st: ADTStatus) -> str:
