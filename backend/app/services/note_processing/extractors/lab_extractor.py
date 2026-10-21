@@ -231,6 +231,9 @@ def extract_labs(clinical_document: str, visit_date: str = "") -> str:
     if va_format_labs:
         lab_lines.extend(va_format_labs)
 
+    # Third, generic dated "TEST RESULT UNITS RANGE SPECIMEN" table rows.
+    lab_lines.extend(extract_specimen_rows(clinical_document))
+
     if not lab_lines:
         return ""
 
@@ -773,6 +776,34 @@ def extract_human_readable_labs(clinical_document: str) -> list:
     return lab_results
 
 
+# Generic inpatient lab table row — "DATE  TEST  RESULT  UNITS  RANGE  SPECIMEN"
+# with no CHAM header and no clock time (BRIDGWATERS 10/21: his freshest CBC/CMP,
+# "10/05/2026  WBC  21.3 H  10.e3/uL4.0 - 10.0  BLOOD", was never extracted).
+# The trailing SPECIMEN word is mandatory: radiology order lines share the
+# date-first shape ("01/02/2024  CHEST SINGLE VW  71045  Verified  266").
+_SPECIMEN_ROW_RE = re.compile(
+    r'^\s*(\d{1,2}/\d{1,2}/\d{2,4})(?:\s+\d{1,2}:\d{2})?\s+'
+    r'([A-Z][A-Z0-9 ,./()\-]{1,30}?)\s{2,}'
+    r'([<>]?\d+\.?\d*(?:\s*[HL]\b)?|Negative|Positive|Trace|Normal|Abnormal)\s*'
+    r'(.*?)\s+(BLOOD|WHOLE BLOOD|PLASMA|SERUM|URINE|UR|PLEURAL|CSF|FLUID|STOOL|SWAB)\s*$')
+
+
+def extract_specimen_rows(clinical_document: str) -> list:
+    out = []
+    for line in clinical_document.split('\n'):
+        m = _SPECIMEN_ROW_RE.match(line)
+        if not m:
+            continue
+        d = parse_lab_date(m.group(1))
+        if not d:
+            continue
+        name, value, rest = m.group(2).strip(), m.group(3).strip(), re.sub(r'\s+', ' ', m.group(4)).strip()
+        row = f"{name}  {value}" + (f"  {rest}" if rest else "")
+        if should_keep_lab(name.upper(), row):
+            out.append(f"{row}  ({d.strftime('%b %d, %Y')})")
+    return out
+
+
 def extract_va_format_labs(clinical_document: str) -> list:
     """
     Extract VA-formatted lab results (traditional format).
@@ -836,6 +867,30 @@ def extract_va_format_labs(clinical_document: str) -> list:
             current_collection_date = date_match.group(1)
             continue
 
+        # Pattern 3: the copied-forward panel header "CBCCBC Coll. date 6/18/25 04:00"
+        # / "CHEM 20CHEM 20 Coll. date 6/18/25 04:00" (TAYLOR 10/21: its rows
+        # rendered undated and therefore 'assumed recent' 16 months later).
+        date_match = re.search(r'\bColl\.?\s*date\s*:?\s*(\d{1,2}/\d{1,2}/\d{2,4})', line, re.IGNORECASE)
+        if date_match:
+            _d = parse_lab_date(date_match.group(1))
+            if _d:
+                current_collection_date = _d.strftime("%b %d, %Y")
+            continue
+
+        # A new NOTE starts: a collection date never carries across notes. Rows
+        # in this note that have no collection line of their own are dated by
+        # the NOTE date (an upper bound — a lab quoted in a note was drawn on or
+        # before the note's date), so the recency window still applies to
+        # copied-forward panels.
+        _hdr = (re.match(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}\s+Local Title:', line)
+                or re.search(r'DATE OF NOTE:\s*([A-Za-z]{3}\s+\d{1,2},\s*\d{4})', line))
+        if _hdr:
+            _d = parse_lab_date(_hdr.group(1))
+            current_collection_date = _d.strftime("%b %d, %Y") if _d else None
+            continue
+        if re.search(r'STANDARD TITLE:', line):
+            continue
+
         # Check if line is VA metadata
         is_metadata = False
         for pattern in va_metadata_patterns:
@@ -870,8 +925,10 @@ def extract_va_format_labs(clinical_document: str) -> list:
 
             # Only keep if we extracted a test name AND it passes filtering
             if test_name and should_keep_lab(test_name, cleaned):
-                # Append collection date if available
-                if current_collection_date:
+                # Append the collection date only when the row has none of its
+                # own (a dated CH row must not get a second, note-level date).
+                if current_collection_date and not re.search(
+                        r'\([A-Za-z]{3}\s+\d{1,2},\s*\d{4}\)|\b\d{1,2}/\d{1,2}/\d{2,4}\b', cleaned):
                     lab_with_date = f"{cleaned} ({current_collection_date})"
                     lab_lines.append(lab_with_date)
                 else:
