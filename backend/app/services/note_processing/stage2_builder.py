@@ -1383,7 +1383,8 @@ def build_stage2_note(
                               bool(calculator_results and any("charlson" in str(k).lower() or "cci" in str(k).lower()
                                                                for k in (calculator_results or {}).keys())))
             if _v3:
-                return to_vista_ascii(_v3)
+                from .text_normalizer import to_vista_ascii as _tva_v3
+                return _tva_v3(_v3)
     except Exception as _v3e:  # noqa: BLE001
         logger.warning("[v3] composition failed, using legacy agents: %s", _v3e)
 
