@@ -427,8 +427,13 @@ def enrich_facts_with_holistic_diagnoses(
             kept.append(d)
         non_prostate = kept
         if not non_prostate:
+            # Keep deterministic cancers AND indeterminate lesions (a Bosniak 2F
+            # mass awaiting follow-up MRI must not vanish because the holistic
+            # LLM omitted it on one run — MARTINEZ). With prostate cancer
+            # primary they render as SECONDARY findings only.
             facts.other_gu_diagnoses = [
-                d for d in (getattr(facts, "other_gu_diagnoses", None) or []) if d.category == "cancer"]
+                d for d in (getattr(facts, "other_gu_diagnoses", None) or [])
+                if d.category in ("cancer", "indeterminate")]
             return facts
         holistic_organs = {d.organ for d in non_prostate}
 
@@ -443,6 +448,11 @@ def enrich_facts_with_holistic_diagnoses(
         # omitted, so it can't resurface as "of uncertain significance" and
         # hijack the CC over the patient's actual cancer.
         if d.category == "cancer":
+            merged.append(d)
+        elif d.category == "indeterminate" and getattr(facts, "cancer_status", "") in ("PRESENT", "TREATED"):
+            # Prostate cancer is the primary problem, so a deterministic
+            # indeterminate lesion is a SECONDARY finding that still needs its
+            # follow-up — re-inject it (it cannot hijack the CC here).
             merged.append(d)
     facts.other_gu_diagnoses = merged
     # Note: definitive-cancer surgery (glansectomy, ILND, etc.) is carried in

@@ -623,6 +623,9 @@ def _collect_note_scoped_administrations(text: str) -> List[Tuple[int, int, int,
             if ymd:
                 cur = ymd
             continue
+        if re.match(r"\s*DATE\s+OF\s+NOTE:\s*\(undated\)", line, re.I):
+            cur = None          # scope reset: an undated fragment has no date to lend
+            continue
         if cur is None:
             continue
         am = _ADMIN_LINE_RE.search(line)
@@ -743,7 +746,12 @@ def adt_text_from_notes(notes) -> str:
         if not body:
             continue
         date = (n.get("date") or "").strip()
-        parts.append((f"DATE OF NOTE: {date}\n" if date else "") + body)
+        # An UNDATED fragment (the splitter cut a note at its 'Standard Title'
+        # line, leaving the date on the previous piece) gets an explicit
+        # 'undated' header that RESETS the note scope — otherwise its
+        # "Administered Eligard" line was filed under the preceding note's date
+        # (MARTINEZ: a 05/08/2026 ED note became a phantom Eligard dose).
+        parts.append((f"DATE OF NOTE: {date}\n" if date else "DATE OF NOTE: (undated)\n") + body)
     return "\n\n".join(parts)
 
 

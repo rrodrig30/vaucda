@@ -767,6 +767,28 @@ _ADMINISTER_TODAY_RE = re.compile(
     r"\b(?:today|this\s+visit)\b[^.\n]{0,50}\b(?:injection|depot|administer)", re.I)
 
 
+_POST_RT_FRAMING_RE = re.compile(
+    r"\b(?:per\s+NCCN[^;,.]{0,40}?\s+for\s+)?post[\s-]?radiation\s+(?:monitoring|surveillance|follow[\s-]?up)\b|"
+    r"\bs/p\s+(?:definitive\s+)?(?:radiation(?:\s+therapy)?|IMRT|XRT|EBRT)\b|"
+    r"\bstatus\s+post\s+(?:definitive\s+)?(?:radiation(?:\s+therapy)?|IMRT|XRT|EBRT)\b|"
+    r"\bcompleted\s+(?:definitive\s+)?(?:radiation(?:\s+therapy)?|IMRT|XRT|EBRT)\b", re.I)
+
+
+def _scrub_incomplete_radiation_framing(text: str, facts) -> str:
+    """After an INCOMPLETE (aborted) radiation course, 'post-radiation
+    surveillance' / 's/p radiation' / 'completed radiation' framing is false
+    (MARTINEZ: 'per NCCN ... for post-radiation monitoring' survived the prompt
+    rule). Replace with neutral surveillance wording."""
+    if not text or (getattr(facts, "treatment_active_status", {}) or {}).get("radiation") != "INCOMPLETE":
+        return text
+    def _sub(m):
+        t = m.group(0).lower()
+        if "monitoring" in t or "surveillance" in t or "follow" in t:
+            return "surveillance"
+        return "after an incomplete radiation course"
+    return _POST_RT_FRAMING_RE.sub(_sub, text)
+
+
 def _enforce_adt_directive(plan: str, st, directive: str) -> str:
     """When the deterministic scheduler says the depot is DUE (administer today),
     the Plan must say so and must not carry an invented 'next injection due
@@ -1304,6 +1326,7 @@ def build_stage2_note(
             assessment = _break_dash_bullets(assessment)
             assessment = _scrub_unproductive_assessment(assessment)
             assessment = _strip_negative_recs(assessment, is_plan=False)
+            assessment = _scrub_incomplete_radiation_framing(assessment, patient_facts)
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
@@ -1358,7 +1381,20 @@ def build_stage2_note(
             # "Administered Eligard ..." record keeps the date the splitter
             # stripped (the "Local Title" header line).
             _adt_raw = adt_text_from_notes((gu_notes or []) + (non_gu_notes or []))
-            _adt_st = build_adt_status(_adt_raw) if _adt_raw else None
+            # The scheduler must judge DUE/NOT_DUE against TODAY's visit, not the
+            # newest note date (MARTINEZ: last depot 03/18, visit 10/21 -> DUE,
+            # but without the visit date it read 'up to date, due 09/18').
+            from .adt_status import _extract_header_visit_date as _hdr_vd
+            _vd = ""
+            _vm = re.search(r"VISIT\s+DATE:\s*(\d{1,2}/\d{1,2}/\d{4})",
+                            (stage1_note or "") + "\n" + (_raw_for_facts or ""))
+            if _vm:
+                _vd = _vm.group(1)
+            else:
+                _hv = _hdr_vd(_raw_for_facts or "")
+                if _hv:
+                    _vd = f"{_hv[1]:02d}/{_hv[2]:02d}/{_hv[0]}"
+            _adt_st = build_adt_status(_adt_raw, visit_date=_vd) if _adt_raw else None
             _adt_directive = adt_plan_directive(_adt_st) if _adt_st else None
             if _adt_directive:
                 _plan_facts = ((authoritative_facts or "")
@@ -1449,6 +1485,7 @@ def build_stage2_note(
             logger.info("Plan post: strip_negative_recs -> %d chars", len(plan or ""))
             plan = _strip_contradicted_recurrence_workup(plan, assessment, stage1_note)
             logger.info("Plan post: strip_contradicted_recurrence -> %d chars", len(plan or ""))
+            plan = _scrub_incomplete_radiation_framing(plan, patient_facts)
         except Exception as _ppe:  # noqa: BLE001
             logger.warning("Plan post-processing step failed (keeping last good text): %s", _ppe)
 
