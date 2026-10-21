@@ -169,7 +169,7 @@ class Settings(BaseSettings):
     # These are used as database column defaults when no user preference exists
     # OCR Task: Vision model for document OCR
     OCR_LLM_PROVIDER: str = "ollama"
-    OCR_LLM_MODEL: str = "qwen3.5:397b-cloud"  # Vision-capable CLOUD model for document OCR (the local qwen3-vl:32b parked 59 GiB on the shared GPU for 24 h)
+    OCR_LLM_MODEL: str = "gemma4:cloud"  # Vision-capable CLOUD model for document OCR (the local qwen3-vl:32b parked 59 GiB on the shared GPU for 24 h)
     OCR_LLM_TEMPERATURE: float = 0.1
     OCR_LLM_MAX_TOKENS: int = 4096
 
