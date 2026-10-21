@@ -20,7 +20,7 @@ GENERAL_LABS_WINDOW_MONTHS = 6
 # Lab filtering configuration
 # Define which labs to keep for each category
 CBC_KEEP = {'WBC', 'HEMOGLOBIN', 'HGB', 'HEMATOCRIT', 'HCT', 'PLT', 'PLATELET', 'PLATELETS'}
-BMP_KEEP = {'BUN', 'CREATININE', 'CREAT', 'EGFR', 'GFR'}
+BMP_KEEP = {'EGFRCKDEPI',  'BUN', 'CREATININE', 'CREAT', 'EGFR', 'GFR'}
 UA_KEEP = {'SG', 'SPECIFIC GRAVITY', 'PH', 'GLU', 'GLUCOSE', 'PRO', 'PROTEIN', 'URINALYSIS',
            # urologically decision-driving UA components (hematuria / UTI)
            'BLOOD', 'RBC', 'NITRITE', 'LEU', 'LEUKOCYTE', 'BACTERIA'}
@@ -30,6 +30,9 @@ _QUAL_ABNORMAL_RE = re.compile(
 
 # Always report these regardless of filtering
 ALWAYS_REPORT = {
+    # Bone-metastasis marker in prostate cancer (was only ever kept by the old
+    # 'PH' substring accident — keep it on purpose).
+    'ALKALINE PHOSPHATASE', 'ALK PHOS', 'ALKP',
     'TESTOSTERONE', 'TOTAL TESTOSTERONE', 'FREE TESTOSTERONE',
     'ESTROGEN', 'ESTROGENS', 'TOTAL ESTROGENS',
     'LH', 'FSH',
@@ -39,6 +42,22 @@ ALWAYS_REPORT = {
     'LDH', 'LACTATE DEHYDROGENASE',
     'URORISK'  # Report all Urorisk components
 }
+
+
+def _name_has_token(test_name: str, token: str) -> bool:
+    """Keep-list membership by WHOLE token (an optional plural S allowed:
+    PLT/PLTS), never by substring — 'PH' used to match DERMATOPHYTOSIS and
+    'PRO' matched 'R PROSTATE BIOPSY', so a service-connected disability
+    rating and a pathology header rendered as labs (TAYLOR 10/21)."""
+    return bool(re.search(r"(?<![A-Z0-9])" + re.escape(token) + r"S?(?![A-Z0-9])", test_name.upper()))
+
+
+# Qualitative result words — a line with no number may still be a lab.
+_QUAL_RESULT_RE = re.compile(
+    r"\b(?:Negative|Positive|Trace|Normal|Abnormal|Clear|Cloudy|Turbid|Hazy|Yellow|Amber|"
+    r"Straw|Small|Moderate|Large|Reactive|Non-?reactive|Detected|Not\s+detected|Few|Many|"
+    r"Rare|Occasional|Present|Absent)\b", re.I)
+_DATE_TOKEN_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b[A-Za-z]{3}\s+\d{1,2},\s*\d{4}\b|\b\d{1,2}:\d{2}\b")
 
 
 def should_keep_lab(test_name: str, lab_line: str) -> bool:
@@ -64,19 +83,19 @@ def should_keep_lab(test_name: str, lab_line: str) -> bool:
 
     # Always keep special hormones and tumor markers
     for always_test in ALWAYS_REPORT:
-        if always_test in test_name:
+        if _name_has_token(test_name, always_test):
             return True
 
     # Check if it's a CBC component
-    if any(cbc_test in test_name for cbc_test in CBC_KEEP):
+    if any(_name_has_token(test_name, cbc_test) for cbc_test in CBC_KEEP):
         return True
 
     # Check if it's a BMP component
-    if any(bmp_test in test_name for bmp_test in BMP_KEEP):
+    if any(_name_has_token(test_name, bmp_test) for bmp_test in BMP_KEEP):
         return True
 
     # Check if it's a UA component
-    if any(ua_test in test_name for ua_test in UA_KEEP):
+    if any(_name_has_token(test_name, ua_test) for ua_test in UA_KEEP):
         return True
 
     # Default: don't keep (will be filtered out)
@@ -420,11 +439,16 @@ def _is_valid_lab_line(line: str) -> bool:
         if marker in line_upper:
             return False
 
-    # Valid lab lines typically contain numbers and units
-    has_number = re.search(r'\d+\.?\d*', line)
+    # A service-connected disability rating ("DERMATOPHYTOSIS  30% SC") from
+    # the demographics block is not a lab.
+    if re.search(r'\d+\s*%\s*SC\b', line_upper):
+        return False
 
-    # If no number, it's probably not a lab result
-    if not has_number:
+    # Valid lab lines carry a numeric value or a qualitative result. A line
+    # whose only digits are a DATE/time ("R PROSTATE BIOPSY  1/20/2015") is a
+    # header or procedure entry, not a result.
+    sans_dates = _DATE_TOKEN_RE.sub(' ', line)
+    if not re.search(r'\d+\.?\d*', sans_dates) and not _QUAL_RESULT_RE.search(sans_dates):
         return False
 
     return True
