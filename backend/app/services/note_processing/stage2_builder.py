@@ -17,6 +17,7 @@ Stage 2 leverages:
 
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 import logging
+import os
 import re
 from .agents.assessment_agent import synthesize_assessment
 from .agents.plan_agent import synthesize_plan
@@ -1051,6 +1052,82 @@ def extract_prior_assessments_and_plans(
     return prior_assessments, prior_plans
 
 
+
+def _stage2_adt(stage1_note: str, gu_notes, non_gu_notes, raw_for_facts: str):
+    """(ADTStatus|None, directive|None, constraint|None) from the note bodies,
+    judged against the VISIT date (Stage 1 banner '| Visit:' / 'VISIT DATE:' /
+    extract banner / today)."""
+    from .adt_status import (build_adt_status, adt_plan_directive, adt_plan_constraint,
+                             adt_text_from_notes, _extract_header_visit_date as _hdr_vd)
+    raw = adt_text_from_notes((gu_notes or []) + list(non_gu_notes or []))
+    if not raw:
+        return None, None, None
+    vd = ""
+    vm = (re.search(r"\|\s*Visit:\s*(\d{1,2}/\d{1,2}/\d{4})", (stage1_note or "")[:600])
+          or re.search(r"VISIT\s+DATE:\s*(\d{1,2}/\d{1,2}/\d{4})", (stage1_note or "") + "\n" + (raw_for_facts or "")))
+    if vm:
+        vd = vm.group(1)
+    else:
+        hv = _hdr_vd(raw_for_facts or "")
+        if hv:
+            vd = f"{hv[1]:02d}/{hv[2]:02d}/{hv[0]}"
+    if not vd:
+        from datetime import datetime as _dt
+        vd = _dt.now().strftime("%m/%d/%Y")
+    st = build_adt_status(raw, visit_date=vd)
+    return st, adt_plan_directive(st), adt_plan_constraint(st)
+
+
+def _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_facts,
+                rag_content, task_config, note_type, patient_name, ssn_last4, has_cci):
+    """LLM-forward Assessment + Plan with deterministic verification. Returns the
+    assembled note, or None to fall back to the legacy agents."""
+    from .composition.context import build_chart_context
+    from .composition.ap_compose import compose_assessment_plan
+    from .composition.verify import verify_section, render_verification_notes
+    from .llm_helper import synthesize_with_llm as _synth
+
+    def _call(prompt: str) -> str:
+        return _synth(prompt=prompt, temperature=0.0, task_config=task_config, max_tokens=16000)
+
+    raw_for_facts = clinical_document or ""
+    st, directive, constraint = _stage2_adt(stage1_note, gu_notes, non_gu_notes, raw_for_facts)
+    ctx = build_chart_context(stage1_note, clinical_document or "", gu_notes, non_gu_notes,
+                              patient_facts, rag_content, directive, constraint)
+    print("\n[v3] Composing Assessment + Plan from the whole chart "
+          f"(chart {len(ctx.chart)} chars, prior notes {len(ctx.prior_clinician_notes)} chars, "
+          f"guidelines {len(ctx.guidelines)} chars)...")
+    composed = compose_assessment_plan(ctx, _call)
+    if not composed:
+        print("      [v3] composer gave nothing usable — falling back to legacy agents")
+        return None
+    assessment, plan, audit = composed
+    print(f"      [v3] Assessment {len(assessment)} chars; Plan {len(plan)} chars; "
+          f"attempts {audit.get('attempts')}")
+    # Deterministic VERIFICATION with quote-grounded adjudication (never silent edits).
+    va = verify_section(assessment, ctx, patient_facts, _call, is_plan=False, section="Assessment")
+    vp = verify_section(plan, ctx, patient_facts, _call, is_plan=True, section="Plan")
+    assessment, plan = va.text, vp.text
+    for a in va.applied + vp.applied:
+        print(f"      [v3] verified edit: {a[:160]}")
+    # Arithmetic authorities stay deterministic: the ADT scheduler and the data tables.
+    try:
+        if st is not None and directive:
+            plan = _enforce_adt_directive(plan, st, directive)
+            assessment = _enforce_adt_in_assessment(assessment, st)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[v3] ADT enforcement skipped: %s", e)
+    notes_block = render_verification_notes([va, vp], audit.get("open_questions"))
+    if notes_block:
+        print("      " + notes_block.replace("\n", "\n      "))
+    final = assemble_complete_note(stage1_note=stage1_note, assessment=assessment, plan=plan,
+                                   note_type=note_type, patient_name=patient_name,
+                                   ssn_last4=ssn_last4, has_cci=has_cci)
+    if notes_block and os.environ.get("VAUCDA_COMPOSE_V3_NOTES", "1") == "1":
+        final = final.rstrip() + "\n\n" + notes_block + "\n"
+    return final
+
+
 def build_stage2_note(
     stage1_note: str,
     gu_notes: List[Dict[str, str]],
@@ -1064,6 +1141,7 @@ def build_stage2_note(
     ssn_last4: Optional[str] = None,
     task_config: Optional["LLMTaskConfig"] = None,
     patient_facts: Optional["PatientStatusFacts"] = None,
+    clinical_document: Optional[str] = None,
 ) -> str:
     """
     Complete the clinical note by adding Assessment and Plan (Stage 2).
@@ -1296,6 +1374,19 @@ def build_stage2_note(
     )
 
     # Step 2: Synthesize Assessment
+    # ---- LLM-forward composition (VAUCDA_COMPOSE_V3) ---------------------
+    try:
+        from .composition import compose_v3_enabled
+        if compose_v3_enabled():
+            _v3 = _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_facts,
+                              rag_content, task_config, note_type, patient_name, ssn_last4,
+                              bool(calculator_results and any("charlson" in str(k).lower() or "cci" in str(k).lower()
+                                                               for k in (calculator_results or {}).keys())))
+            if _v3:
+                return to_vista_ascii(_v3)
+    except Exception as _v3e:  # noqa: BLE001
+        logger.warning("[v3] composition failed, using legacy agents: %s", _v3e)
+
     print("\n[2/6] Synthesizing Assessment (clinical impression)...")
 
     def _do_synthesize_assessment():

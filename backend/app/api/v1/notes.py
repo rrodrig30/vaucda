@@ -747,6 +747,7 @@ async def generate_final_note(
         # Pass non_gu_notes for cross-specialty urologic content extraction
         complete_note = build_stage2_note(
             stage1_note=request.preliminary_note,
+            clinical_document=_final_input,
             gu_notes=gu_notes,
             non_gu_notes=non_gu_notes,
             ambient_transcript=ambient_transcript,
@@ -975,6 +976,7 @@ async def generate_express_note(
         logger.info("Express Step 2: Building Stage 2 final note (no calculators)...")
         complete_note = build_stage2_note(
             stage1_note=preliminary_note,
+            clinical_document=request.clinical_input,
             gu_notes=gu_notes,
             non_gu_notes=non_gu_notes,
             ambient_transcript=None,
@@ -1226,6 +1228,7 @@ async def generate_express_note_stream(
             complete_note = await asyncio.to_thread(
                 build_stage2_note,
                 stage1_note=preliminary_note,
+                clinical_document=clinical_input,
                 gu_notes=gu_notes,
                 non_gu_notes=non_gu_notes,
                 ambient_transcript=None,
@@ -1576,6 +1579,7 @@ async def generate_stage2_agent(
         # Pass non_gu_notes for cross-specialty urologic content extraction
         complete_note = build_stage2_note(
             stage1_note=request.preliminary_note,
+            clinical_document=_final_input,
             gu_notes=gu_notes,
             non_gu_notes=non_gu_notes,
             ambient_transcript=ambient_transcript,
@@ -1901,6 +1905,7 @@ async def batch_upload_and_process(
                 return await asyncio.to_thread(
                     build_stage2_note,
                     stage1_note=preliminary_note, gu_notes=gu_notes, non_gu_notes=non_gu_notes,
+                    clinical_document=clinical_input,
                     ambient_transcript=None, calculator_results=calculator_results_dict,
                     rag_content=rag_content, task_config=stage2_config,
                     note_type=note_type, patient_name=None, ssn_last4=None,
@@ -2219,6 +2224,7 @@ async def batch_process_folder(
                 complete_note = await asyncio.to_thread(
                     build_stage2_note,
                     stage1_note=preliminary_note,
+                    clinical_document=clinical_input,
                     gu_notes=gu_notes,
                     non_gu_notes=non_gu_notes,
                     ambient_transcript=None,
@@ -2429,6 +2435,7 @@ async def batch_process_folder_stream(
             complete_note = await asyncio.to_thread(
                 build_stage2_note,
                 stage1_note=preliminary_note, gu_notes=gu_notes, non_gu_notes=non_gu_notes,
+                clinical_document=clinical_input,
                 ambient_transcript=None, calculator_results=calculator_results_dict,
                 rag_content=rag_content, task_config=stage2_config,
                 note_type=note_type, patient_name=None, ssn_last4=None,
