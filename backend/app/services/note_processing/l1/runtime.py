@@ -28,13 +28,63 @@ _DEFAULT_ADAPTER = _BACKEND.parent / "tests" / "l1_model" / "medgemma27b-l1-lora
 _DEFAULT_BASE = "google/medgemma-27b-text-it"
 _MAXLEN = 8192
 
-_STATE = {"loaded": False, "tok": None, "model": None, "eos": None}
+_STATE = {"loaded": False, "tok": None, "model": None, "eos": None,
+          "unavailable_until": 0.0, "unavailable_reason": ""}
+
+# medgemma-27b in nf4 needs ~18 GiB of VRAM plus KV cache for 8k-token batches.
+_MIN_FREE_GIB_DEFAULT = 22.0
+_RETRY_AFTER_S = 600.0
+
+
+class L1Unavailable(RuntimeError):
+    """The L1 model cannot run right now (no GPU / not enough free VRAM). The
+    caller degrades to the deterministic facts; note generation proceeds."""
+
+
+def _cuda_free_gib() -> Optional[float]:
+    """Free VRAM on cuda:0 in GiB, or None when CUDA is absent."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info(0)
+        return free / 2 ** 30
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gpu_has_room(free_gib: Optional[float], need_gib: float) -> bool:
+    return free_gib is not None and free_gib >= need_gib
+
+
+def _require_gpu_room():
+    """Refuse to load unless the GPU can hold the whole model. On 10/21 the GPU
+    was full (an Ollama runner held 59 GiB); device_map='auto' silently put the
+    model on the CPU and one note sat for >1 h in a bitsandbytes CPU matmul."""
+    import time
+    if time.time() < _STATE["unavailable_until"]:
+        raise L1Unavailable(_STATE["unavailable_reason"] + " (retry later)")
+    need = float(os.getenv("VAUCDA_L1_MIN_FREE_GIB", str(_MIN_FREE_GIB_DEFAULT)))
+    free = _cuda_free_gib()
+    if not _gpu_has_room(free, need):
+        reason = ("L1 needs a GPU with >= %.0f GiB free; %s" % (
+            need, "no CUDA device" if free is None else "only %.1f GiB free" % free))
+        _mark_unavailable(reason)
+        raise L1Unavailable(reason)
+
+
+def _mark_unavailable(reason: str):
+    import time
+    _STATE["unavailable_until"] = time.time() + _RETRY_AFTER_S
+    _STATE["unavailable_reason"] = reason
+    print(f"[L1] unavailable: {reason}")
 
 
 def _load():
     """Load tokenizer + base(4-bit) + adapter once; cache on _STATE."""
     if _STATE["loaded"]:
         return
+    _require_gpu_room()
     import torch
     from transformers import (AutoModelForCausalLM, AutoTokenizer,
                               BitsAndBytesConfig)
@@ -54,10 +104,22 @@ def _load():
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                              bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_use_double_quant=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        base, quantization_config=bnb, torch_dtype=torch.bfloat16,
-        device_map="auto", attn_implementation="sdpa")
-    model = PeftModel.from_pretrained(model, adapter)
+    try:
+        # GPU ONLY — never let accelerate spill layers onto the CPU.
+        model = AutoModelForCausalLM.from_pretrained(
+            base, quantization_config=bnb, dtype=torch.bfloat16,
+            device_map={"": 0}, attn_implementation="sdpa")
+        model = PeftModel.from_pretrained(model, adapter)
+    except torch.cuda.OutOfMemoryError as exc:
+        import gc
+        gc.collect(); torch.cuda.empty_cache()
+        _mark_unavailable(f"CUDA out of memory while loading L1: {exc}")
+        raise L1Unavailable("CUDA out of memory while loading L1") from exc
+    on_cpu = {str(d) for d in getattr(model, "hf_device_map", {}).values()
+              if str(d) in ("cpu", "disk")}
+    if on_cpu:
+        _mark_unavailable("L1 layers were offloaded to " + ",".join(sorted(on_cpu)))
+        raise L1Unavailable("L1 would run on the CPU")
     model.eval()
     eot = tok.convert_tokens_to_ids("<end_of_turn>")
     eos = [i for i in {tok.eos_token_id, eot} if i is not None and i >= 0]

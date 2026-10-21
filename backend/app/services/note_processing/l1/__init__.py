@@ -51,5 +51,8 @@ def enrich_patient_facts_with_l1(facts, source_text):
     except Exception as exc:  # pragma: no cover - defensive degrade-to-deterministic
         if os.getenv("VAUCDA_L1_STRICT", "0").strip() in ("1", "true", "True", "on"):
             raise
+        import logging
+        logging.getLogger(__name__).warning(
+            "L1 enrichment skipped (deterministic facts kept): %r", exc)
         print(f"[L1] enrichment skipped (deterministic facts kept): {exc!r}")
         return facts
