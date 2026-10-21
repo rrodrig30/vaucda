@@ -24,6 +24,15 @@ def _parse_surgery_with_date(surgery_line: str) -> Tuple[str, str]:
         Tuple of (surgery_name, date_string) - date may be empty string
     """
     surgery_line = surgery_line.strip()
+    # A STATUS parenthetical ("(COMPLETED)") is bookkeeping, never part of the name.
+    surgery_line = re.sub(r"\s*\((?:COMPLETED|SCHEDULED|CANCELL?ED|PENDING|NOT\s+COMPLETED|"
+                          r"IN\s+PROGRESS|REQUESTED|ABORTED|DONE)\)\s*", " ", surgery_line,
+                          flags=re.IGNORECASE).strip()
+
+    # Pattern 0: date FIRST (CPRS surgical-history table row)
+    match = re.match(r'^(\d{1,2}/\d{1,2}/\d{2,4})\s+(.+?)\s*$', surgery_line)
+    if match:
+        return re.sub(r"\s+", " ", match.group(2)).strip(), match.group(1)
 
     # Pattern 1: Date in parentheses at end "(MM/DD/YYYY)" or "(MM/DD/YY)"
     match = re.match(r'^(.+?)\s*\((\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}/\d{4}|\d{4})\)\s*$', surgery_line)
@@ -70,7 +79,9 @@ def _format_surgery_entry(surgery: str, date: str, number: int) -> str:
     """
     surgery = surgery.strip()
     # Clean up surgery name - remove leading numbers/bullets if present
-    surgery = re.sub(r'^[\d\.\-\*\)]+\s*', '', surgery)
+    # Leading list numbers / bullets only — never the month of a leading date
+    # ("03/07/2024 ..." used to lose its "03").
+    surgery = re.sub(r'^(?:\d+[\.\)]\s*|[\-\*•]+\s*)+', '', surgery)
     # Remove markdown formatting
     surgery = re.sub(r'\*\*([^*]+)\*\*', r'\1', surgery)
     # Capitalize first letter
