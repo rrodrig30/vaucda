@@ -21,6 +21,10 @@ GENERAL_LABS_WINDOW_MONTHS = 6
 # Define which labs to keep for each category
 CBC_KEEP = {'WBC', 'HEMOGLOBIN', 'HGB', 'HEMATOCRIT', 'HCT', 'PLT', 'PLATELET', 'PLATELETS'}
 BMP_KEEP = {'EGFRCKDEPI',  'BUN', 'CREATININE', 'CREAT', 'EGFR', 'GFR'}
+# Liver enzymes (user 10/21: keep routinely — ARPI/abiraterone monitoring, pre-op).
+HEPATIC_KEEP = {'AST', 'ALT', 'SGOT', 'SGPT', 'SGOT(AST)', 'SGPT(ALT)', 'AST(SGOT)', 'ALT(SGPT)',
+                'ALKALINE PHOSPHATASE', 'ALK PHOS', 'ALKP', 'BILIRUBIN', 'BILIRUBIN,TOTAL',
+                'TOTAL BILIRUBIN', 'GGT', 'GAMMA GT'}
 UA_KEEP = {'SG', 'SPECIFIC GRAVITY', 'PH', 'GLU', 'GLUCOSE', 'PRO', 'PROTEIN', 'URINALYSIS',
            # urologically decision-driving UA components (hematuria / UTI)
            'BLOOD', 'RBC', 'NITRITE', 'LEU', 'LEUKOCYTE', 'BACTERIA'}
@@ -96,6 +100,10 @@ def should_keep_lab(test_name: str, lab_line: str) -> bool:
 
     # Check if it's a UA component
     if any(_name_has_token(test_name, ua_test) for ua_test in UA_KEEP):
+        return True
+
+    # Liver enzymes
+    if any(_name_has_token(test_name, h) for h in HEPATIC_KEEP):
         return True
 
     # Default: don't keep (will be filtered out)
