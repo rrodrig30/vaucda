@@ -169,7 +169,7 @@ class Settings(BaseSettings):
     # These are used as database column defaults when no user preference exists
     # OCR Task: Vision model for document OCR
     OCR_LLM_PROVIDER: str = "ollama"
-    OCR_LLM_MODEL: str = "qwen3-vl:32b"  # Vision model for document OCR (glm-ocr crashes on Ollama 0.17.x)
+    OCR_LLM_MODEL: str = "qwen3.5:397b-cloud"  # Vision-capable CLOUD model for document OCR (the local qwen3-vl:32b parked 59 GiB on the shared GPU for 24 h)
     OCR_LLM_TEMPERATURE: float = 0.1
     OCR_LLM_MAX_TOKENS: int = 4096
 
@@ -226,6 +226,11 @@ class Settings(BaseSettings):
     # keeps the model resident. Set high to avoid 30s cold-start on the
     # first request after backend idle.
     OLLAMA_KEEP_ALIVE: str = "24h"
+
+    # Cloud-only operation: when true, no LOCAL Ollama model is ever pre-warmed
+    # and a request for one is logged as a configuration error. The clinician's
+    # workstation GPU is shared with other apps; VAUCDA runs on `:cloud` models.
+    OLLAMA_CLOUD_ONLY: bool = False
 
     # Maximum num_ctx vaucda will automatically request for a LOCAL
     # (non-cloud) Ollama model when no per-task user override is set.

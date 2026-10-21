@@ -322,8 +322,17 @@ else
     # backend). --reload is disabled in FULL mode so the resident 27B model isn't
     # reloaded on every file-watch event.
     RELOAD_FLAG="--reload"
+    # The L1 flag is OPT-IN from backend/.env (VAUCDA_L1=1); the venv alone never
+    # turns it on. Cloud-only deployments leave it at 0.
+    if [ -z "$VAUCDA_L1" ]; then
+        _l1=$(grep -E '^VAUCDA_L1=' .env 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+        export VAUCDA_L1="${_l1:-0}"
+    fi
+    if [ "$RUN_FULL_L1" = true ] && [ "$VAUCDA_L1" != "1" ]; then
+        echo -e "${GREEN}✓ L1 narrative extractor OFF (VAUCDA_L1=${VAUCDA_L1}; cloud models only)${NC}"
+        RUN_FULL_L1=false
+    fi
     if [ "$RUN_FULL_L1" = true ]; then
-        export VAUCDA_L1=1
         export VAUCDA_L1_MAX_NEW="${VAUCDA_L1_MAX_NEW:-2048}"
         export TOKENIZERS_PARALLELISM=false
         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

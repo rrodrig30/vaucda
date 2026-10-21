@@ -222,8 +222,14 @@ async def lifespan(app: FastAPI):
 
                         filtered = []
                         for m in sorted(prewarm_models):
-                            if ":cloud" in m.lower():
+                            if ":cloud" in m.lower() or m.lower().endswith("-cloud"):
                                 filtered.append(m)
+                                continue
+                            if getattr(settings, "OLLAMA_CLOUD_ONLY", False):
+                                logger.warning(
+                                    f"  Pre-warm: skipping LOCAL model {m} "
+                                    f"(OLLAMA_CLOUD_ONLY=true) — fix the preference that names it"
+                                )
                                 continue
                             sz = size_by_name.get(m)
                             if sz is None:
