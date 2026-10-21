@@ -757,6 +757,36 @@ _PROSTATE_CANCER_TITLE_RE = re.compile(
     r"\bbiochemical\s+recurrence\b", re.I)
 
 
+_ADT_WORD_RE = re.compile(r"leuprolide|eligard|lupron|degarelix|firmagon|goserelin|zoladex|triptorelin|"
+                          r"relugolix|orgovyx|\bADT\b|androgen[\s-]+deprivation|depot", re.I)
+_NEXT_DUE_CLAUSE_RE = re.compile(
+    r"\s*[;,]?\s*(?:with\s+|and\s+)?(?:the\s+)?next\s+(?:depot\s+)?(?:injection\s+|dose\s+)?(?:is\s+|will\s+be\s+)?"
+    r"due\s+(?:on\s+|in\s+|around\s+|approximately\s+)?(?:\d{1,2}/\d{1,2}/\d{2,4}|[A-Z][a-z]+\s+\d{4}|\d{1,2}/\d{4})", re.I)
+_ADMINISTER_TODAY_RE = re.compile(
+    r"administer\w*\s+[^.\n]{0,80}?\b(?:today|this\s+visit|at\s+today)|"
+    r"\b(?:today|this\s+visit)\b[^.\n]{0,50}\b(?:injection|depot|administer)", re.I)
+
+
+def _enforce_adt_directive(plan: str, st, directive: str) -> str:
+    """When the deterministic scheduler says the depot is DUE (administer today),
+    the Plan must say so and must not carry an invented 'next injection due
+    <date>' (MARTINEZ 10/21: the model copied a pharmacy refill date, 11/08/2026,
+    as the next dose while the depot was a month overdue)."""
+    if not plan or st is None or getattr(st, "injection", "") != "DUE" or not directive:
+        return plan
+    out = []
+    for line in plan.split("\n"):
+        if _ADT_WORD_RE.search(line):
+            line = _NEXT_DUE_CLAUSE_RE.sub("", line).rstrip(" ;,")
+        out.append(line)
+    plan = "\n".join(out)
+    if not _ADMINISTER_TODAY_RE.search(plan):
+        m = re.search(r"(?im)^[ \t]*PROBLEM\s*#\s*1\s*:[^\n]*\n", plan)
+        bullet = "- " + directive.strip() + "\n"
+        plan = (plan[:m.end()] + bullet + plan[m.end():]) if m else (plan.rstrip() + "\n" + bullet)
+    return plan
+
+
 def _fold_psa_into_cancer_problem(plan: str) -> str:
     """With an ESTABLISHED prostate-cancer problem on the list, an 'Elevated /
     Rising PSA' problem is a finding of that cancer, not a second problem
@@ -1125,7 +1155,9 @@ def build_stage2_note(
     # Deterministic biochemical-recurrence status for post-RADIATION patients —
     # injected so the Assessment AND Plan agents never frame a sub-Phoenix PSA as
     # recurrence and never order PSMA PET / salvage / metastatic workup.
-    _phoenix = _phoenix_directive(stage1_note)
+    # No Phoenix framing when the facts say the course was not definitive
+    # (INCOMPLETE radiation -> phoenix_applicable False).
+    _phoenix = _phoenix_directive(stage1_note) if getattr(patient_facts, "phoenix_applicable", True) else ""
     if _phoenix:
         authoritative_facts = (authoritative_facts or "") + "\n\n" + _phoenix
 
@@ -1312,6 +1344,7 @@ def build_stage2_note(
     import os as _os_adt
     _adt_directive = None
     _plan_facts = authoritative_facts
+    _adt_st = None
     if _os_adt.environ.get("VAUCDA_ADT_PLAN", "1") == "1":
         try:
             # Recompute the ADT status from the RAW notes (gu + non-gu content) —
@@ -1427,6 +1460,11 @@ def build_stage2_note(
             r"\b(?:ADT|androgen\s+deprivation|eligard|lupron|leuprolide|degarelix|"
             r"goserelin|firmagon|orgovyx|relugolix|depot\s+injection)\b", plan, re.I):
         plan = plan.rstrip() + "\n- " + _adt_directive
+    try:
+        if plan and _adt_directive:
+            plan = _enforce_adt_directive(plan, _adt_st, _adt_directive)
+    except Exception as _ade2:  # noqa: BLE001
+        logger.warning("ADT directive enforcement skipped: %s", _ade2)
 
     # Step 5: Verify Plan
     print("\n[5/6] Verifying Plan against source data...")

@@ -1105,6 +1105,8 @@ def extract_patient_status_facts(
     if (treatment_active.get("radiation") == "COMPLETED"
             and any(c.startswith("RADIATION INCOMPLETE") for c in treatment_constraints)):
         treatment_active["radiation"] = "INCOMPLETE"
+        # Phoenix (nadir + 2) presumes a DEFINITIVE course was delivered.
+        phoenix = False
 
     # ADT: the deterministic injection scheduler (adt_status) is authoritative
     # for depot status — the verb-based detector left MARTINEZ 'UNCERTAIN' while

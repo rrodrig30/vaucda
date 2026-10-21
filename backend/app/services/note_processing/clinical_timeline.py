@@ -1195,6 +1195,30 @@ def _extract_diagnosis_events(raw_text: str) -> List[TimelineEvent]:
             detail="prostate adenocarcinoma diagnosed",
             source_quote=re.sub(r"\s+", " ", raw_text[max(0, m.start() - 40):m.end() + 80]).strip()[:300],
         ))
+    # Reversed order: "history of prostate cancer originally diagnosed in 2020
+    # at Urology San Antonio" (MARTINEZ: the only DIAGNOSIS event was the 2025
+    # re-biopsy, so the HPI dated the cancer to 2025).
+    from .patient_status_facts import is_family_history_context
+    for m in re.finditer(
+        r"\bprostate\s+(?:cancer|adenocarcinoma)\b[^.\n]{0,60}?\b(?:originally|initially|first)?\s*"
+        r"diagnos(?:ed|is)\s+(?:in\s+|on\s+|at\s+)?((?:19|20)\d{2}|\d{1,2}/(?:19|20)\d{2}|\d{1,2}/\d{1,2}/(?:19|20)?\d{2})\b",
+        raw_text, re.IGNORECASE,
+    ):
+        if is_family_history_context(raw_text, m.start()):
+            continue
+        d = _date_in_window(raw_text, m.start(1), 4)
+        if not d:
+            continue
+        date_key, date_display = d
+        key = ("DIAGNOSIS", date_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        events.append(TimelineEvent(
+            date_key=date_key, date_display=date_display, event_type="DIAGNOSIS",
+            modality="prostate cancer", detail="prostate cancer diagnosed",
+            source_quote=re.sub(r"\s+", " ", raw_text[max(0, m.start() - 40):m.end() + 80]).strip()[:300],
+        ))
     return events
 
 

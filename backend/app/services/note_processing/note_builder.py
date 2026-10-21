@@ -1462,6 +1462,13 @@ def build_urology_note(
             # fix stays well above the 0.9 floor; MORENO's fix was longer.)
             if _hpi_fixed and len(_hpi_fixed) >= 0.9 * len(_hpi_before):
                 hpi = _hpi_fixed
+                # The repair LLM may 'date' a status by inventing "PSA was last
+                # documented in <old year> and has not been reassessed since"
+                # (MARTINEZ: a 2020 radiation date became a 2020 PSA claim
+                # above a 2026 PSA curve). Drop any PSA-absence claim the PSA
+                # curve contradicts.
+                from .tx_timeline_llm import drop_unsupported_psa_absence_claims as _dpa
+                hpi = _dpa(hpi, _doc_psa or "")
             elif _hpi_fixed and _hpi_fixed != _hpi_before:
                 logger.warning(
                     f"HPI temporal rewrite rejected (len {len(_hpi_fixed)} < "
