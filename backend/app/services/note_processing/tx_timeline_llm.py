@@ -255,7 +255,13 @@ def verify_events(raw_text: str, items: List[dict]) -> Tuple[list, List[str]]:
         # Eligard injection", "Administered Eligard 45MG") is a START, never a
         # completed course.
         if status in ("completed", "discontinued") and mod in ("adt", "arsi", "chemotherapy"):
-            if not _COURSE_DONE_CUE.search(quote) and not _COURSE_DONE_CUE.search(window):
+            # A nursing ADMINISTRATION record ("Administered Eligard 45MG SQ") is a
+            # dose, never a finished course — even when the surrounding window
+            # happens to contain 'completed' (checklists). MARTINEZ/TAYLOR: the
+            # HPI said 'completed a course of ADT at an unspecified date'.
+            if re.search(r"\badminister\w*\b|\binject\w*\b", quote, re.I) and not _COURSE_DONE_CUE.search(quote):
+                status = "started"
+            elif not _COURSE_DONE_CUE.search(quote) and not _COURSE_DONE_CUE.search(window):
                 if _STARTED_CUE.search(quote) or re.search(r"administer|inject|received|given", quote, re.I):
                     status = "started"
                 else:
