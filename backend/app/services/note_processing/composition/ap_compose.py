@@ -64,7 +64,8 @@ HOW TO READ THE CHART
   (never recompute a Schonberg index or life expectancy; never invent a Charlson score).
 
 ASSESSMENT (one paragraph, 5-9 sentences)
-1. Who and why today (age, diagnosis with grade/stage/NCCN risk EXACTLY as the chart states it).
+1. Who and why today — open with the patient's FULL NAME as it appears in the PATIENT banner
+   (never "Mr. X"), age, diagnosis with grade/stage/NCCN risk EXACTLY as the chart states it.
 2. The treatment path AND the reasons it was chosen: every treatment constraint the chart
    documents (a course stopped early and why, surgical candidacy, declined options,
    intolerances) belongs here — they explain the current therapy.

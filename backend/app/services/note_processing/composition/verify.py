@@ -63,7 +63,11 @@ def _norm(s: str) -> str:
 # ---------------------------------------------------------------------------
 # Deterministic checks (each returns Discrepancy objects, never edits)
 # ---------------------------------------------------------------------------
-_PSA_NUM_RE = re.compile(r"(?i)\bPSA\b[^.;\n]{0,40}?(\d+\.\d+|\d+)\s*(?:ng/mL)?|(\d+\.\d+)\s*ng/mL")
+_PSA_NUM_RE = re.compile(
+    r"(?i)\bPSA\b(?:\s+(?:of|was|is|at|to|level|value|rose\s+to|fell\s+to|declined\s+to|dropped\s+to|remains?|remained))?"
+    r"\s*(?:\(|:)?\s*(\d+\.\d+|\d+)(?!\s*(?:/|,?\s*20\d\d|\s*%|\s*(?:months?|weeks?|years?|cores?|fractions?|points?)))\s*(?:ng/mL)?"
+    r"|(\d+\.\d+)\s*ng/mL")
+_YEAR_LIKE_RE = re.compile(r"^(?:19|20)\d{2}$")
 _TX_CLAIM_RE = re.compile(
     r"(?i)\b(completed|underwent|s/p|status post|received|finished)\s+(?:definitive\s+|salvage\s+|adjuvant\s+|a\s+course\s+of\s+)?"
     r"(?:external\s+beam\s+)?(radiation(?:\s+therapy)?|radiotherapy|IMRT|EBRT|XRT|SBRT|brachytherapy|"
@@ -74,12 +78,22 @@ _RISK_RE = re.compile(r"(?i)\b(very[\s-]low|low|favou?rable[\s-]intermediate|unf
                       r"intermediate[\s-](?:un)?favou?rable|intermediate|high|very[\s-]high)[\s-]risk\b")
 
 
+def _visit_tuple(ctx: ChartContext):
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", ctx.visit_date or "")
+    return (int(m.group(3)), int(m.group(1)), int(m.group(2))) if m else None
+
+
 def check_dates(units: List[str], ctx: ChartContext) -> List[Discrepancy]:
     out = []
+    vt = _visit_tuple(ctx)
     for u in units:
         for (y, m, d) in date_tuples(u):
             if d is None and m is None:
                 continue                      # bare years are too loose to police
+            # A PLANNED date after the visit (next depot, next labs, RTC) is
+            # schedule arithmetic the clinician asked for, not a chart fact.
+            if vt and (y, m, d or 1) > vt:
+                continue
             if (y, m, d) not in ctx.chart_dates and (y, m, None) not in ctx.chart_dates:
                 shown = f"{m:02d}/{d:02d}/{y}" if d else f"{m:02d}/{y}"
                 out.append(Discrepancy("DATE_NOT_IN_CHART", u, f"the date {shown} does not appear in the chart or the data tables",
@@ -96,7 +110,12 @@ def check_psa_values(units: List[str], ctx: ChartContext) -> List[Discrepancy]:
     for u in units:
         for m in _PSA_NUM_RE.finditer(u):
             v = m.group(1) or m.group(2)
-            if not v:
+            if not v or _YEAR_LIKE_RE.match(v):
+                continue
+            # a number that is part of a date ("rose to 2.83 ng/mL on 01/03/2025" is fine;
+            # "May 2023" is not a PSA) — skip when preceded by a month name
+            pre = u[max(0, m.start() - 12):m.start()].lower()
+            if re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*$", pre):
                 continue
             try:
                 f = float(v)

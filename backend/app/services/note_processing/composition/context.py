@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 _CHART_CAP = 90_000          # deepseek 64k-token context; the chart is the bulk
 _PRIOR_NOTE_CAP = 3_000      # per clinician note (HPI + A + P)
-_MAX_PRIOR_NOTES = 3
+_MAX_PRIOR_NOTES = 4
 
 # Stage 1 section headers (plain and banner forms) whose bodies are DATA.
 _TABLE_HEADERS = (
