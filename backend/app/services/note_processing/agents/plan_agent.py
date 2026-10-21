@@ -412,6 +412,7 @@ PLAN REQUIREMENTS:
 PROBLEM ORDERING (MANDATORY):
 - Problem #1: ALWAYS the Chief Complaint from the "CC:" line
 - Problem #2-N: Other urologic issues in order of clinical importance
+- When prostate cancer is an ESTABLISHED diagnosis, "Elevated PSA" / "Rising PSA" is a finding of that cancer: put PSA monitoring under the cancer problem, never as its own Problem
 - Non-urologic problems (hypertension, diabetes) should be listed LAST or omitted
 
 CRITICAL PLAN FORMATTING RULES (MUST FOLLOW EXACTLY):

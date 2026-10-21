@@ -745,6 +745,52 @@ def _dedupe_problems(plan: str) -> str:
     return preamble + "".join(b for _, b in kept)
 
 
+_PSA_PROBLEM_TITLE_RE = re.compile(
+    r"^\s*(?:(?:elevated|rising|raised|increasing|persistent(?:ly)?\s+elevated|abnormal|"
+    r"high)\s+(?:serum\s+)?PSA(?:\s+(?:level|value|elevation|monitoring|surveillance|trend|kinetics))?"
+    r"|PSA\s+(?:elevation|rise|increase|monitoring|surveillance|trend|kinetics)"
+    r"|(?:R97\.2\s*)?elevated\s+prostate[\s-]+specific\s+antigen(?:\s+\[?PSA\]?)?)"
+    r"\s*(?:\(.*?\))?\s*$", re.I)
+_PROSTATE_CANCER_TITLE_RE = re.compile(
+    r"\bprostat(?:e|ic)\b.*\b(?:cancer|adenocarcinoma|carcinoma|malignan)|"
+    r"\b(?:cancer|adenocarcinoma|carcinoma)\b.*\bprostat(?:e|ic)\b|\bCaP\b|\bmCRPC\b|\bCRPC\b|"
+    r"\bbiochemical\s+recurrence\b", re.I)
+
+
+def _fold_psa_into_cancer_problem(plan: str) -> str:
+    """With an ESTABLISHED prostate-cancer problem on the list, an 'Elevated /
+    Rising PSA' problem is a finding of that cancer, not a second problem
+    (RIOJAS 10/21: 'PROBLEM #2: Elevated PSA' beside 'PROBLEM #1: Treatment-naive
+    prostate adenocarcinoma'). Its bullets move under the cancer problem (novel
+    ones only) and the header is dropped; renumbering happens afterward."""
+    if not plan or "PROBLEM" not in plan.upper():
+        return plan
+    parts = re.split(r"(?i)(?=^[ \t]*PROBLEM\s*#\s*\d+\s*:)", plan, flags=re.M)
+    preamble, blocks = parts[0], parts[1:]
+    if len(blocks) < 2:
+        return plan
+    titled = []
+    for b in blocks:
+        m = re.match(r"(?i)\s*PROBLEM\s*#\s*\d+\s*:\s*([^\n]*)", b)
+        titled.append((m.group(1).strip() if m else "", b, m.end() if m else 0))
+    cancer_idx = next((i for i, (t, _, _) in enumerate(titled) if _PROSTATE_CANCER_TITLE_RE.search(t)), None)
+    if cancer_idx is None:
+        return plan
+    keep = []
+    for i, (t, b, body_at) in enumerate(titled):
+        if i != cancer_idx and _PSA_PROBLEM_TITLE_RE.match(t):
+            seen = {re.sub(r"[^a-z0-9]", "", u.lower()) for u in _bullet_units(titled[cancer_idx][1])}
+            extra = [u for u in _bullet_units(b[body_at:])
+                     if re.sub(r"[^a-z0-9]", "", u.lower()) not in seen]
+            if extra:
+                ct, cb, _ = titled[cancer_idx]
+                cb = cb.rstrip() + "".join(f"\n- {u}" for u in extra) + "\n\n"
+                titled[cancer_idx] = (ct, cb, _)
+            continue
+        keep.append(i)
+    return preamble + "".join(titled[i][1] for i in keep)
+
+
 _PROBLEM_REF_BEFORE = re.compile(r"(?:\bsee|\bunder|\bper|\bin|\bof|\bto|\bwith|\bfrom|\()\s*$", re.I)
 _PROBLEM_REF_AFTER = re.compile(r"^\s*(?:below|above|\)|,|;)", re.I)
 
@@ -1473,6 +1519,7 @@ def assemble_complete_note(
         # see a header at a line start, so an inline 'Problem #4:' used to skip
         # renumbering and ship as '#1, #2, #4'.
         plan = _break_inline_problem_headers(plan)
+        plan = _fold_psa_into_cancer_problem(plan)
         plan = _dedupe_problems(plan)
         logger.info("assemble: plan after dedupe_problems=%d", len(plan or ""))
         plan = _renumber_problems(plan)
