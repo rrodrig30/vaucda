@@ -761,7 +761,16 @@ _ADT_WORD_RE = re.compile(r"leuprolide|eligard|lupron|degarelix|firmagon|goserel
                           r"relugolix|orgovyx|\bADT\b|androgen[\s-]+deprivation|depot", re.I)
 _NEXT_DUE_CLAUSE_RE = re.compile(
     r"\s*[;,]?\s*(?:with\s+|and\s+)?(?:the\s+)?next\s+(?:depot\s+)?(?:injection\s+|dose\s+)?(?:is\s+|will\s+be\s+)?"
-    r"due\s+(?:on\s+|in\s+|around\s+|approximately\s+)?(?:\d{1,2}/\d{1,2}/\d{2,4}|[A-Z][a-z]+\s+\d{4}|\d{1,2}/\d{4})", re.I)
+    r"(?:due|scheduled|planned|anticipated|expected)\s+(?:for\s+|on\s+|in\s+|around\s+|approximately\s+)?"
+    r"(?:\d{1,2}/\d{1,2}/\d{2,4}|[A-Z][a-z]+\s+\d{4}|\d{1,2}/\d{4})", re.I)
+
+
+def _enforce_adt_in_assessment(assessment: str, st) -> str:
+    """Assessment counterpart: a DUE depot is 'due today', never 'scheduled for
+    <past month>'."""
+    if not assessment or st is None or getattr(st, "injection", "") != "DUE":
+        return assessment
+    return _NEXT_DUE_CLAUSE_RE.sub(", with the next depot injection due today", assessment)
 _ADMINISTER_TODAY_RE = re.compile(
     r"administer\w*\s+[^.\n]{0,80}?\b(?:today|this\s+visit|at\s+today)|"
     r"\b(?:today|this\s+visit)\b[^.\n]{0,50}\b(?:injection|depot|administer)", re.I)
@@ -779,14 +788,47 @@ def _scrub_incomplete_radiation_framing(text: str, facts) -> str:
     surveillance' / 's/p radiation' / 'completed radiation' framing is false
     (MARTINEZ: 'per NCCN ... for post-radiation monitoring' survived the prompt
     rule). Replace with neutral surveillance wording."""
-    if not text or (getattr(facts, "treatment_active_status", {}) or {}).get("radiation") != "INCOMPLETE":
+    tas = getattr(facts, "treatment_active_status", {}) or {}
+    if not text:
+        return text
+    if tas.get("adt") == "ACTIVE":
+        # On ongoing ADT the patient is ON treatment, not in post-treatment surveillance.
+        text = re.sub(r"\b(?:now\s+)?in\s+post[\s-]?treatment\s+surveillance\b", "on ongoing androgen deprivation therapy", text, flags=re.I)
+        text = re.sub(r"\bpost[\s-]?treatment\s+surveillance\b", "ongoing androgen deprivation therapy", text, flags=re.I)
+        text = re.sub(r"\breturning\s+for\s+urology\s+surveillance\s+follow-up\s+after\s+prior\s+prostate[\s-]cancer\s+treatment\b",
+                      "returning for urology follow-up on androgen deprivation therapy for prostate cancer", text, flags=re.I)
+    if tas.get("radiation") != "INCOMPLETE":
         return text
     def _sub(m):
         t = m.group(0).lower()
         if "monitoring" in t or "surveillance" in t or "follow" in t:
             return "surveillance"
         return "after an incomplete radiation course"
-    return _POST_RT_FRAMING_RE.sub(_sub, text)
+    text = _POST_RT_FRAMING_RE.sub(_sub, text)
+    # Phoenix / 'post-radiation patients' presume a delivered definitive course:
+    # drop the bullet (Plan) or the sentence (Assessment) that carries it.
+    if "\n- " in text or text.lstrip().startswith("- "):
+        text = "\n".join(l for l in text.split("\n")
+                         if not (l.lstrip().startswith("-") and re.search(r"phoenix|post[\s-]?radiation\s+patients", l, re.I)))
+    else:
+        text = " ".join(x for x in re.split(r"(?<=[.!?])\s+", text)
+                        if not re.search(r"phoenix|post[\s-]?radiation\s+patients", x, re.I))
+    return text
+
+
+_RISK_PHRASE_RE = re.compile(
+    r"\b(?:very[\s-]low|low|favou?rable[\s-]intermediate|unfavou?rable[\s-]intermediate|"
+    r"intermediate[\s-](?:un)?favou?rable|intermediate|high|very[\s-]high)[\s-]risk\b"
+    r"(?=[^.\n]{0,40}\b(?:prostate|disease|localized|cancer|adenocarcinoma))", re.I)
+
+
+def _enforce_risk_category(text: str, facts) -> str:
+    """The chart's NCCN risk category is authoritative (MARTINEZ: 'NCCN
+    intermediate unfavorable risk' became 'high-risk localized')."""
+    risk = (getattr(facts, "nccn_risk", "") or "").strip()
+    if not text or not risk:
+        return text
+    return _RISK_PHRASE_RE.sub(lambda m: m.group(0) if m.group(0).lower().replace("-", " ").startswith(risk.lower()) else f"{risk} risk", text)
 
 
 def _enforce_adt_directive(plan: str, st, directive: str) -> str:
@@ -1327,6 +1369,7 @@ def build_stage2_note(
             assessment = _scrub_unproductive_assessment(assessment)
             assessment = _strip_negative_recs(assessment, is_plan=False)
             assessment = _scrub_incomplete_radiation_framing(assessment, patient_facts)
+            assessment = _enforce_risk_category(assessment, patient_facts)
         except Exception as _ae:  # noqa: BLE001
             logger.warning(f"Assessment finalize skipped: {_ae}")
 
@@ -1386,14 +1429,18 @@ def build_stage2_note(
             # but without the visit date it read 'up to date, due 09/18').
             from .adt_status import _extract_header_visit_date as _hdr_vd
             _vd = ""
-            _vm = re.search(r"VISIT\s+DATE:\s*(\d{1,2}/\d{1,2}/\d{4})",
-                            (stage1_note or "") + "\n" + (_raw_for_facts or ""))
+            _vm = (re.search(r"\|\s*Visit:\s*(\d{1,2}/\d{1,2}/\d{4})", (stage1_note or "")[:600])
+                   or re.search(r"VISIT\s+DATE:\s*(\d{1,2}/\d{1,2}/\d{4})",
+                                (stage1_note or "") + "\n" + (_raw_for_facts or "")))
             if _vm:
                 _vd = _vm.group(1)
             else:
                 _hv = _hdr_vd(_raw_for_facts or "")
                 if _hv:
                     _vd = f"{_hv[1]:02d}/{_hv[2]:02d}/{_hv[0]}"
+            if not _vd:
+                from datetime import datetime as _dt_now
+                _vd = _dt_now.now().strftime("%m/%d/%Y")   # Stage 2 runs at/after the visit
             _adt_st = build_adt_status(_adt_raw, visit_date=_vd) if _adt_raw else None
             _adt_directive = adt_plan_directive(_adt_st) if _adt_st else None
             if _adt_directive:
@@ -1486,6 +1533,7 @@ def build_stage2_note(
             plan = _strip_contradicted_recurrence_workup(plan, assessment, stage1_note)
             logger.info("Plan post: strip_contradicted_recurrence -> %d chars", len(plan or ""))
             plan = _scrub_incomplete_radiation_framing(plan, patient_facts)
+            plan = _enforce_risk_category(plan, patient_facts)
         except Exception as _ppe:  # noqa: BLE001
             logger.warning("Plan post-processing step failed (keeping last good text): %s", _ppe)
 
@@ -1500,6 +1548,8 @@ def build_stage2_note(
     try:
         if plan and _adt_directive:
             plan = _enforce_adt_directive(plan, _adt_st, _adt_directive)
+        if assessment and _adt_st is not None:
+            assessment = _enforce_adt_in_assessment(assessment, _adt_st)
     except Exception as _ade2:  # noqa: BLE001
         logger.warning("ADT directive enforcement skipped: %s", _ade2)
 

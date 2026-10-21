@@ -893,6 +893,8 @@ class PatientStatusFacts:
     # One-line depot summary from the deterministic ADT scheduler when ADT is
     # ongoing ("last injection 03/18/2026; next due 09/18/2026").
     adt_summary: str = ""
+    # NCCN risk category as the chart states it ("intermediate unfavorable")
+    nccn_risk: str = ""
     """Per-category current-status verdict for the HPI agent. Categories:
     'adt' (DISCONTINUED | ACTIVE), 'radiation'/'prostatectomy'/'focal'
     (COMPLETED if present). Empty when no treatments detected. The HPI
@@ -935,6 +937,31 @@ def _enclosing_sentence(text: str, pos: int, cap: int = 320) -> str:
     end = pos + (end_m.end() if end_m else cap)
     sent = re.sub(r"\s+", " ", text[start:end]).strip()
     return sent[:cap]
+
+
+_NCCN_RISK_RE = re.compile(
+    r"\bNCCN\s+(?:risk\s+(?:group|category)\s*:?\s*)?(very[\s-]low|low|favou?rable[\s-]intermediate|"
+    r"unfavou?rable[\s-]intermediate|intermediate[\s-](?:un)?favou?rable|intermediate|high|very[\s-]high)"
+    r"[\s-]risk\b|\b(very[\s-]low|low|favou?rable[\s-]intermediate|unfavou?rable[\s-]intermediate|"
+    r"intermediate[\s-](?:un)?favou?rable|intermediate|high|very[\s-]high)[\s-]risk\s+(?:prostate\s+)?"
+    r"(?:cancer|adenocarcinoma|disease)\b", re.I)
+
+
+def extract_nccn_risk(text: str) -> str:
+    """The most recently stated NCCN risk category (last mention wins), with
+    'intermediate unfavorable' / 'unfavorable intermediate' normalised."""
+    best = ""
+    for m in _NCCN_RISK_RE.finditer(text or ""):
+        if is_family_history_context(text, m.start()):
+            continue
+        r = (m.group(1) or m.group(2) or "").lower().replace("-", " ")
+        r = re.sub(r"\s+", " ", r).strip()
+        if r in ("unfavorable intermediate", "unfavourable intermediate"):
+            r = "intermediate unfavorable"
+        if r in ("favorable intermediate", "favourable intermediate"):
+            r = "intermediate favorable"
+        best = r
+    return best
 
 
 def extract_treatment_constraints(text: str) -> List[str]:
@@ -1102,6 +1129,7 @@ def extract_patient_status_facts(
     # Clinician-stated treatment constraints (why this treatment path).
     _constraint_src = "\n".join(t for t in (raw_source_text or "", raw_clinical_text or "", stage1_note or "") if t)
     treatment_constraints = extract_treatment_constraints(_constraint_src)
+    _nccn_risk = extract_nccn_risk(_constraint_src)
     if (treatment_active.get("radiation") == "COMPLETED"
             and any(c.startswith("RADIATION INCOMPLETE") for c in treatment_constraints)):
         treatment_active["radiation"] = "INCOMPLETE"
@@ -1218,6 +1246,7 @@ def extract_patient_status_facts(
         treatment_active_status=treatment_active,
         treatment_constraints=treatment_constraints,
         adt_summary=_adt_summary,
+        nccn_risk=_nccn_risk,
         clinical_timeline=timeline,
         current_phase=current_phase,
         current_active_treatments=active_meds,
@@ -1600,6 +1629,10 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
                 "'post-radiation surveillance', or apply Phoenix criteria; write that the course "
                 "was stopped early and why.")
 
+    if getattr(facts, "nccn_risk", ""):
+        lines.append("")
+        lines.append(f"NCCN RISK CATEGORY (as stated in the chart): {facts.nccn_risk} risk — use this exact "
+                     "category; never upgrade or downgrade it.")
     _constraints = getattr(facts, "treatment_constraints", None) or []
     if _constraints:
         lines.append("")

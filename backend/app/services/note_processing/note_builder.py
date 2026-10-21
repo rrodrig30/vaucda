@@ -306,6 +306,7 @@ def _extract_prior_hpi_and_plan(clinical_document: str) -> tuple:
     return _scrub_psa_values(best_hpi[:2200]), _scrub_psa_values(prior_plan)
 
 
+
 def build_urology_note(
     clinical_text: str,
     task_config: Optional["LLMTaskConfig"] = None,
@@ -1520,6 +1521,7 @@ def build_urology_note(
     # Step 5: Assemble final note
     print("\n[5/5] Assembling final note...")
     final_note = assemble_note(
+        visit_date=_visit_date,
         cc=cc,
         hpi=hpi,
         ipss=ipss,
@@ -1735,6 +1737,20 @@ def assemble_note(**sections) -> str:
             demographics_parts.append(f"Sex: {patient_sex}")
         if patient_race:
             demographics_parts.append(f"Race: {patient_race}")
+        # Visit date in the banner: Stage 2 (which never sees the raw
+        # document) reads it to judge depot timing against TODAY.
+        try:
+            from datetime import datetime as _dt_banner
+            _vd_banner = ""
+            _vd_src = (sections.get("visit_date") or "")
+            for _fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%b %d, %Y"):
+                try:
+                    _vd_banner = _dt_banner.strptime(_vd_src, _fmt).strftime("%m/%d/%Y"); break
+                except Exception:
+                    continue
+            demographics_parts.append(f"Visit: {_vd_banner or _dt_banner.now().strftime('%m/%d/%Y')}")
+        except Exception:  # noqa: BLE001
+            pass
 
         patient_header = " ".join(header_parts)
         if demographics_parts:
