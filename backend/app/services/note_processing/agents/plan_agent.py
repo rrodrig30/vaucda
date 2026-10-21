@@ -413,6 +413,7 @@ PROBLEM ORDERING (MANDATORY):
 - Problem #1: ALWAYS the Chief Complaint from the "CC:" line
 - Problem #2-N: Other urologic issues in order of clinical importance
 - When prostate cancer is an ESTABLISHED diagnosis, "Elevated PSA" / "Rising PSA" is a finding of that cancer: put PSA monitoring under the cancer problem, never as its own Problem
+- PROBLEM WEIGHTING (MANDATORY): Problem #1 (the active cancer / the reason for this visit) gets the fullest plan and MUST carry the TREATMENT CONSTRAINTS from the facts (why the current therapy was chosen — e.g. radiation stopped early for bowel/bladder toxicity, not a surgical candidate after bowel resections for carcinoid, declined brachytherapy, therefore ADT). An incidental or surveillance-only finding (indeterminate / Bosniak 2F renal mass, pulmonary nodule) is listed AFTER it with at most TWO bullets — never expanded to equal billing with the cancer problem
 - Non-urologic problems (hypertension, diabetes) should be listed LAST or omitted
 
 CRITICAL PLAN FORMATTING RULES (MUST FOLLOW EXACTLY):

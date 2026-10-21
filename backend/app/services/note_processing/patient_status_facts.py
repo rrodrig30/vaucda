@@ -883,12 +883,88 @@ class PatientStatusFacts:
     a prostate/PSA narrative (or hallucinate prostate cancer)."""
 
     treatment_active_status: Dict[str, str] = field(default_factory=dict)
+    # Clinician-stated reasons that DETERMINED the treatment choice ("IMRT
+    # stopped early after 8-10 fractions for bowel/bladder toxicity", "not a
+    # surgical candidate after multiple bowel resections for carcinoid",
+    # "declined further radiation"). MARTINEZ 10/21: without these the HPI and
+    # Assessment called an aborted course "completed" and never said why the
+    # patient is on ADT alone.
+    treatment_constraints: List[str] = field(default_factory=list)
+    # One-line depot summary from the deterministic ADT scheduler when ADT is
+    # ongoing ("last injection 03/18/2026; next due 09/18/2026").
+    adt_summary: str = ""
     """Per-category current-status verdict for the HPI agent. Categories:
     'adt' (DISCONTINUED | ACTIVE), 'radiation'/'prostatectomy'/'focal'
     (COMPLETED if present). Empty when no treatments detected. The HPI
     prompt uses this to distinguish 'remains on continuous ADT' (wrong
     when status is DISCONTINUED) from the correct 'previously received
     ADT and elected against restart in favor of monitoring' framing."""
+
+
+
+# ---------------------------------------------------------------------------
+# Treatment constraints — the clinician's stated reasons for the treatment path
+# ---------------------------------------------------------------------------
+_RT_VOCAB_RE = re.compile(r"\b(?:radiation|radiotherapy|IMRT|EBRT|XRT|SBRT|IGRT|fractions?|RT)\b", re.I)
+_CONSTRAINT_KINDS = (
+    ("RADIATION INCOMPLETE", re.compile(
+        r"(?:did\s+not|could\s+not|couldn'?t|didn'?t|unable\s+to|not)\s+tolerate|stopped\s+early|"
+        r"(?:stopped|discontinued|aborted|halted)\s+(?:(?:the\s+)?(?:treatment|course|radiation|IMRT|XRT)\s+)?after\s+"
+        r"(?:approximately\s+|about\s+|~)?\d+|did\s+not\s+complete|not\s+complete\s+(?:the\s+)?(?:complete\s+)?"
+        r"(?:IMRT|radiation|XRT|course)|incomplete\s+(?:course|radiation|IMRT)|aborted\s+(?:radiation|IMRT|course)|"
+        r"only\s+(?:received|completed|got)\s+\d+\s*(?:of|/)\s*\d+\s+fractions", re.I), True),
+    ("NOT A SURGICAL CANDIDATE", re.compile(
+        r"not\s+a\s+(?:good\s+|suitable\s+|surgical\s+)?(?:surgical\s+)?candidate|not\s+(?:a\s+)?candidate\s+for\s+"
+        r"(?:surgery|prostatectomy|RALP|RARP|surgical)|preclud\w*\s+(?:any\s+)?(?:surgery|surgical|prostatectomy)|"
+        r"surgery\s+(?:is\s+|was\s+)?not\s+(?:an?\s+)?(?:option|recommended|feasible)|poor\s+surgical\s+candidate|"
+        r"surgical\s+candidacy\s+(?:is\s+|was\s+)?(?:poor|limited)|(?:hostile|frozen)\s+(?:abdomen|pelvis)", re.I), False),
+    ("DECLINED", re.compile(
+        r"(?:declined|refused|does\s+not\s+want|not\s+interested\s+in)\s+(?:any\s+)?(?:further\s+|additional\s+|more\s+)?"
+        r"(?:radiation|radiotherapy|brachytherapy|XRT|IMRT|surgery|prostatectomy|ADT|androgen|hormone|chemotherapy|"
+        r"focal|HIFU|cryo)", re.I), False),
+    ("INTOLERANCE", re.compile(
+        r"(?:did\s+not|could\s+not|unable\s+to|cannot|can'?t)\s+tolerate\s+(?:the\s+)?(?:ADT|androgen|bicalutamide|"
+        r"abiraterone|enzalutamide|apalutamide|darolutamide|leuprolide|Lupron|Eligard|chemotherapy|docetaxel)", re.I), False),
+)
+
+
+def _enclosing_sentence(text: str, pos: int, cap: int = 320) -> str:
+    start = max(text.rfind(". ", 0, pos), text.rfind("\n\n", 0, pos), text.rfind("! ", 0, pos), text.rfind("? ", 0, pos))
+    start = start + 2 if start >= 0 else max(0, pos - cap)
+    end_m = re.search(r"[.!?](?:\s|$)|\n\s*\n", text[pos:pos + cap])
+    end = pos + (end_m.end() if end_m else cap)
+    sent = re.sub(r"\s+", " ", text[start:end]).strip()
+    return sent[:cap]
+
+
+def extract_treatment_constraints(text: str) -> List[str]:
+    """Verbatim clinician sentences explaining why a treatment was stopped,
+    is unsuitable, was declined, or was not tolerated. Family-history and
+    option-discussion ('we discussed that surgery would be...') contexts are
+    excluded. Deduplicated; at most 2 quotes per kind; earliest-in-document
+    first within a kind."""
+    if not text:
+        return []
+    out: List[str] = []
+    seen = set()
+    per_kind: Dict[str, int] = {}
+    for kind, rx, needs_rt in _CONSTRAINT_KINDS:
+        for m in rx.finditer(text):
+            if is_family_history_context(text, m.start()):
+                continue
+            sent = _enclosing_sentence(text, m.start())
+            if needs_rt and not _RT_VOCAB_RE.search(sent):
+                continue
+            # Same sentence copied forward with a different subject ("He
+            # underwent..." / "Patient underwent...") is ONE constraint.
+            _core = re.sub(r"^(?:the\s+)?(?:he|she|they|patient|pt|veteran|mr\.?|ms\.?)\s+", "", sent.lower())
+            key = kind + "|" + re.sub(r"[^a-z0-9]", "", _core)[:80]
+            if key in seen or per_kind.get(kind, 0) >= 2:
+                continue
+            seen.add(key)
+            per_kind[kind] = per_kind.get(kind, 0) + 1
+            out.append(f'{kind}: "{sent}"')
+    return out
 
 
 def extract_patient_status_facts(
@@ -1023,6 +1099,38 @@ def extract_patient_status_facts(
             active_search, confirmed_treatments=treatments,
         )
 
+    # Clinician-stated treatment constraints (why this treatment path).
+    _constraint_src = "\n".join(t for t in (raw_source_text or "", raw_clinical_text or "", stage1_note or "") if t)
+    treatment_constraints = extract_treatment_constraints(_constraint_src)
+    if (treatment_active.get("radiation") == "COMPLETED"
+            and any(c.startswith("RADIATION INCOMPLETE") for c in treatment_constraints)):
+        treatment_active["radiation"] = "INCOMPLETE"
+
+    # ADT: the deterministic injection scheduler (adt_status) is authoritative
+    # for depot status — the verb-based detector left MARTINEZ 'UNCERTAIN' while
+    # he was mid-course on Eligard, and the HPI invented 'completed a course'.
+    _adt_summary = ""
+    try:
+        from .adt_status import build_adt_status as _build_adt
+        _adt = _build_adt(raw_source_text or raw_clinical_text or stage1_note or "")
+        if getattr(_adt, "present", False) and _adt.status != "UNCERTAIN":
+            _map = {"ACTIVE": "ACTIVE", "CONTINUOUS": "ACTIVE", "INITIATING": "ACTIVE",
+                    "INTERMITTENT_ON": "ACTIVE", "FINITE_IN_PROGRESS": "ACTIVE",
+                    "COMPLETED": "COMPLETED", "DISCONTINUED": "DISCONTINUED",
+                    "INTERMITTENT_HOLDING": "DISCONTINUED"}
+            _v = _map.get(_adt.status)
+            if _v:
+                treatment_active["adt"] = _v
+            if _v == "ACTIVE":
+                _bits = []
+                if getattr(_adt, "last_injection_display", ""):
+                    _bits.append(f"last injection {_adt.last_injection_display}")
+                if getattr(_adt, "next_due_display", ""):
+                    _bits.append(f"next due {_adt.next_due_display}")
+                _adt_summary = (f"{_adt.agent}: " if getattr(_adt, "agent", "") else "") + "; ".join(_bits) + " (course ONGOING)"
+    except Exception:  # noqa: BLE001
+        pass
+
     # Clinical timeline + phase classifier + current active treatments
     # + procedure findings. Built from the raw clinician text so the
     # CC/HPI/Assessment/Plan agents see a structured chronological view
@@ -1106,6 +1214,8 @@ def extract_patient_status_facts(
         patient_sex=patient_sex,
         other_gu_diagnoses=other_gu,
         treatment_active_status=treatment_active,
+        treatment_constraints=treatment_constraints,
+        adt_summary=_adt_summary,
         clinical_timeline=timeline,
         current_phase=current_phase,
         current_active_treatments=active_meds,
@@ -1413,7 +1523,9 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
             lines.append("  - " + " ".join(bits))
         lines.append(
             ("  -> These are SECONDARY problems; the prostate cancer is PROBLEM #1 and the "
-             "CC/HPI/Assessment lead with it. " if _pca_primary else
+             "CC/HPI/Assessment lead with it. In the HPI they belong in the FINAL "
+             "sentence(s) only — never in the opening two sentences; in the Assessment/Plan "
+             "they follow the primary problem with at most two bullets. " if _pca_primary else
              "  -> Center the CC and HPI on these when present. ")
             + "An 'indeterminate' "
             "mass is NEITHER cancer NOR benign — frame it as a mass/lesion of "
@@ -1476,6 +1588,27 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
                 "recent injection date from the source before writing "
                 "'continues on' / 'remains on'."
             )
+        if getattr(facts, "adt_summary", ""):
+            lines.append(f"    -> ADT depot per the injection scheduler: {facts.adt_summary}. "
+                         "The course is ONGOING — never describe it as completed.")
+        if facts.treatment_active_status.get("radiation") == "INCOMPLETE":
+            lines.append(
+                "    -> Radiation is INCOMPLETE: the course was STOPPED EARLY (see TREATMENT "
+                "CONSTRAINTS). NEVER write 'completed radiation', 's/p definitive radiation', "
+                "'post-radiation surveillance', or apply Phoenix criteria; write that the course "
+                "was stopped early and why.")
+
+    _constraints = getattr(facts, "treatment_constraints", None) or []
+    if _constraints:
+        lines.append("")
+        lines.append("TREATMENT CONSTRAINTS (clinician-stated reasons that DETERMINED the treatment choice):")
+        for c in _constraints[:6]:
+            lines.append(f"  - {c}")
+        lines.append(
+            "  -> The HPI's treatment history AND the Assessment MUST state these reasons inside "
+            "the cancer narrative — they explain WHY the current therapy was chosen (e.g. ADT alone "
+            "because radiation was not tolerated and surgery is precluded by prior bowel resections). "
+            "Never omit them, and never recommend an option they rule out.")
 
     # Clinical phase + current active treatments + timeline + procedure
     # findings. These four sections are the structured-state foundation
@@ -1603,12 +1736,21 @@ def format_facts_for_prompt(facts: PatientStatusFacts) -> str:
             "'clarify the status of' a treatment the chart says was completed — state it as "
             "completed history with its date."
         )
-    _done_cats = [c for c, s in (facts.treatment_active_status or {}).items() if s == "COMPLETED"]
+    _done_cats = [c for c, s in (facts.treatment_active_status or {}).items() if s in ("COMPLETED", "INCOMPLETE")]
     if _done_cats:
         lines.append(
-            "  - COMPLETED treatments (" + ", ".join(_done_cats) + ") are HISTORY: never "
+            "  - COMPLETED/STOPPED treatments (" + ", ".join(_done_cats) + ") are HISTORY: never "
             "recommend, consider, refer for, or question whether they have been initiated."
         )
+    if (facts.treatment_active_status or {}).get("radiation") == "INCOMPLETE":
+        lines.append(
+            "  - The radiation course was NOT completed (stopped early — see TREATMENT CONSTRAINTS). "
+            "Describe it as an aborted/partial course with its reason; never as 'completed', "
+            "'definitive', or 's/p radiation'; never invoke Phoenix criteria or 'post-radiation' framing.")
+    if getattr(facts, "treatment_constraints", None):
+        lines.append(
+            "  - State the TREATMENT CONSTRAINTS (why the current therapy was chosen) in the HPI "
+            "and in the Assessment's cancer narrative.")
     if facts.treatment_naive and not _unresolved:
         lines.append(
             "  - The patient is TREATMENT-NAIVE for prostate cancer. "

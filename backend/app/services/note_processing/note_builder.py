@@ -1129,6 +1129,7 @@ def build_urology_note(
                 # around the real diagnosis and continues the established story
                 # rather than collapsing to a prostate-only / empty stub.
                 other_gu_diagnoses=(_hpi_pf.other_gu_diagnoses if _hpi_pf else []),
+                treatment_constraints=getattr(_hpi_pf, "treatment_constraints", None),
                 prior_hpi=_prior_hpi_text,
                 prior_plan=_prior_plan_text,
             )

@@ -218,8 +218,13 @@ def render_treatment_history(events: Optional[List[Dict]], sex: str) -> str:
                 sentence = (f"{p['sub'].capitalize()} {status_verb} "
                             f"{modality_label}{started_part}.")
         elif evt["status"] == "discontinued":
-            sentence = (f"{p['sub'].capitalize()} previously received "
-                        f"{modality_label}{date_part}, since discontinued.")
+            if evt["modality"] in ("radiation", "brachytherapy"):
+                # A discontinued radiation course is an ABORTED course.
+                sentence = (f"{p['sub'].capitalize()} began {modality_label}{date_part} "
+                            f"but did not complete the course.")
+            else:
+                sentence = (f"{p['sub'].capitalize()} previously received "
+                            f"{modality_label}{date_part}, since discontinued.")
         elif evt["status"] == "declined":
             sentence = f"{p['sub'].capitalize()} declined {modality_label}."
         elif evt["status"] == "scheduled":

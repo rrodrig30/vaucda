@@ -71,6 +71,10 @@ class HPISkeleton:
 
     # Outstanding non-cancer urologic issues
     outstanding_issues: List[str] = field(default_factory=list)
+    # Clinician-stated reasons for the treatment path (render them)
+    treatment_constraints: List[str] = field(default_factory=list)
+    # Secondary / incidental GU findings — one clause at the END of the HPI
+    secondary_findings: List[str] = field(default_factory=list)
 
     # Provenance for verification
     sources_used: List[str] = field(default_factory=list)
@@ -529,6 +533,21 @@ def build_hpi_skeleton(
     skel.diagnosis_stage = dx_extras
 
     skel.prior_treatment_events = _format_treatment_timeline(facts.clinical_timeline)
+    _tas = getattr(facts, "treatment_active_status", {}) or {}
+    if _tas.get("radiation") == "INCOMPLETE":
+        # An aborted course is never 'completed' (MARTINEZ: IMRT stopped after 8-10 fractions).
+        skel.prior_treatment_events = [
+            re.sub(r"\b(started|completed) ((?:external beam )?radiation(?: therapy)?|IMRT|EBRT|XRT)",
+                   r"started \2 — STOPPED EARLY, course NOT completed", e, flags=re.I)
+            if re.search(r"radiation|IMRT|EBRT|XRT", e, re.I) else e
+            for e in skel.prior_treatment_events]
+    skel.treatment_constraints = list(getattr(facts, "treatment_constraints", []) or [])
+    if facts.cancer_status in ("PRESENT", "TREATED"):
+        skel.secondary_findings = [
+            f"{getattr(d, 'organ', '')}: {getattr(d, 'name', '')}"
+            + (f" ({d.status})" if getattr(d, "status", "") else "")
+            for d in (getattr(facts, "other_gu_diagnoses", []) or [])
+            if getattr(d, "category", "") != "cancer"]
     skel.psa_trajectory_text, skel.response_assessment = _format_psa_trajectory(
         raw_clinical_text or "",
     )
@@ -578,6 +597,13 @@ def format_skeleton_for_prompt(skel: HPISkeleton) -> str:
         for evt in skel.prior_treatment_events:
             lines.append(f"   - {evt}")
 
+    # 3b. TREATMENT CONSTRAINTS
+    if skel.treatment_constraints:
+        lines.append("3b. TREATMENT CONSTRAINTS (render these inside the treatment history — they explain "
+                     "WHY the patient is on the current therapy):")
+        for c in skel.treatment_constraints:
+            lines.append(f"   - {c}")
+
     # 4. PSA / RESPONSE
     if skel.psa_trajectory_text:
         line = f"4. PSA TRAJECTORY: {skel.psa_trajectory_text}"
@@ -607,6 +633,13 @@ def format_skeleton_for_prompt(skel: HPISkeleton) -> str:
         lines.append("7. TODAY:")
         lines.append("   " + "; ".join(today_lines))
 
+    # 8. SECONDARY FINDINGS — last, one clause
+    if skel.secondary_findings:
+        lines.append("8. SECONDARY / INCIDENTAL FINDINGS (ONE clause at the very END of the HPI — never "
+                     "in the opening sentences, never framed as the reason for the visit):")
+        for sf in skel.secondary_findings:
+            lines.append(f"   - {sf}")
+
     lines.append("=== END HPI SKELETON ===")
     lines.append(
         "RENDER RULES:\n"
@@ -621,6 +654,10 @@ def format_skeleton_for_prompt(skel: HPISkeleton) -> str:
         "    plan. Every med listed must be named in the narrative (or in\n"
         "    a 'continues' summary clause) so downstream Plan / Assessment\n"
         "    do not drop a continuing therapy.\n"
+        "  - A treatment marked 'STOPPED EARLY, course NOT completed' must be\n"
+        "    rendered as an aborted course with its reason from section 3b —\n"
+        "    never as 'completed'. Render EVERY section-3b constraint.\n"
+        "  - Section 8 findings go in the LAST sentence only.\n"
         "  - Use the PROCEDURE FINDINGS section to reference cystoscopy /\n"
         "    urodynamics / biopsy / DEXA results by date when present.\n"
         "  - Output 1-2 paragraphs of fluent clinical prose. No bullets in\n"

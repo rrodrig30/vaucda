@@ -279,6 +279,7 @@ def build_ground_truth(
     other_gu_diagnoses: Optional[List] = None,
     prior_hpi: str = "",
     prior_plan: str = "",
+    treatment_constraints: Optional[List[str]] = None,
 ) -> GroundTruth:
     """Build a GroundTruth from existing-extractor outputs.
 
@@ -359,6 +360,14 @@ def build_ground_truth(
             or _treated_status:
         treatment_naive = False
 
+    # An aborted radiation course is flagged on its timeline line so the
+    # prompt/validator never let it become 'completed' (MARTINEZ).
+    if any(str(c).startswith("RADIATION INCOMPLETE") for c in (treatment_constraints or [])):
+        treatment_timeline = [
+            (ln + " — STOPPED EARLY (course NOT completed; status must be 'discontinued' with the reason)")
+            if re.search(r"radiation|IMRT|EBRT|XRT", ln, re.I) and re.search(r"started|completed", ln, re.I)
+            else ln for ln in treatment_timeline]
+
     return GroundTruth(
         name=patient_name,
         age=int(patient_age) if patient_age else 0,
@@ -369,6 +378,7 @@ def build_ground_truth(
         treatment_naive=treatment_naive,
         treatment_timeline=treatment_timeline,
         current_active_treatments=list(current_active_treatments or []),
+        treatment_constraints=list(treatment_constraints or []),
         cancer_status=cancer_status or "",
         narrative_text=narrative_text or "",
         other_gu_diagnoses=list(other_gu_diagnoses or []),

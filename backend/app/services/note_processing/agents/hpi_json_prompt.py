@@ -217,6 +217,19 @@ def _ground_truth_block(gt: GroundTruth) -> str:
         for line in gt.treatment_timeline[:40]:
             lines.append(f"  - {line}")
         lines.append("")
+    if getattr(gt, "treatment_constraints", None):
+        lines.append("TREATMENT CONSTRAINTS (clinician-stated; they DETERMINED the treatment choice — "
+                     "render every one):")
+        for c in gt.treatment_constraints[:6]:
+            lines.append(f"  - {c}")
+        lines.append(
+            "  -> Put the reason in narrative_note of the relevant treatment_history entry. A "
+            "radiation course marked STOPPED EARLY has status 'discontinued' and a narrative_note "
+            "such as 'stopped early after 8-10 fractions due to bowel and bladder toxicity' — NEVER "
+            "'completed'. Reflect the constraints in today_reason / interval_status.summary (e.g. "
+            "'on ADT alone because radiation was not tolerated and surgery is precluded by prior "
+            "bowel resections for carcinoid').")
+        lines.append("")
     if gt.current_active_treatments:
         lines.append(
             "CURRENTLY ACTIVE TREATMENTS (the patient is presently on these):"
@@ -404,6 +417,11 @@ def build_hpi_json_prompt(
         "(when treatment_history has completed prostatectomy AND PSA "
         "is rising). NEVER mix incompatible terms (e.g., 'high-risk "
         "cancer on active surveillance' for a patient s/p IMRT).",
+        "  11a. TREATMENT CONSTRAINTS listed in the ground truth MUST be "
+        "rendered (narrative_note on the treatment entry and in the visit "
+        "reason). A radiation course marked STOPPED EARLY is 'discontinued' "
+        "with its reason — never 'completed'. SECONDARY / INCIDENTAL findings "
+        "are mentioned LAST, never in the opening sentences.",
         "  11. Populate interval_status whenever the source documents a "
         "prior urology visit. Include a 1-2-sentence summary of the "
         "interval (symptoms, treatment continuation, any changes) "

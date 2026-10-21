@@ -66,6 +66,7 @@ class GroundTruth:
     treatment_timeline: List[str] = field(default_factory=list)
     # Currently-active systemic/local therapies (e.g. ["abiraterone", "leuprolide"]).
     current_active_treatments: List[str] = field(default_factory=list)
+    treatment_constraints: List[str] = field(default_factory=list)
     # Authoritative cancer status from PatientStatusFacts
     # ("TREATED" / "ACTIVE" / "NED" / "TREATMENT_NAIVE" / ...).
     cancer_status: str = ""

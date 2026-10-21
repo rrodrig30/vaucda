@@ -518,6 +518,15 @@ CLINICAL REASONING REQUIREMENTS:
    secondary clause at most, never the opening subject when a cancer is present.
    Address EVERY active problem / every cancer the patient has (a patient may
    have more than one cancer).
+9b. TREATMENT RATIONALE (MANDATORY when the facts list TREATMENT CONSTRAINTS):
+   state them inside the cancer sentences — e.g. "IMRT in 2020 was stopped after
+   8-10 fractions for bowel and bladder toxicity; he is not a surgical candidate
+   after multiple small-bowel resections for carcinoid; he declined brachytherapy;
+   he is therefore managed with ADT alone." A radiation course marked INCOMPLETE
+   is never 'completed' / 'definitive' and never gets Phoenix / post-radiation
+   framing. Weight the narrative by clinical importance: the active cancer and
+   its rationale dominate; an incidental or surveillance finding gets ONE clause
+   at the end, never a sentence-for-sentence match with the cancer.
 10. BENIGN INCIDENTALS (MANDATORY): A finding the radiology characterizes as
     BENIGN — adrenal myelolipoma, lipid-rich / washout adrenal adenoma, simple
     (Bosniak I/II) renal cyst — requires NO routine imaging follow-up if it is
