@@ -108,29 +108,52 @@ def extract_genomic_testing(clinical_document: str) -> List[str]:
     return out
 
 
+_GENETICS_NOTE_HDR_RE = re.compile(
+    r"(?im)^[^\n]*\b(?:GENETIC(?:S)?|GENOMIC)\b[^\n]*\b(?:COUNSEL\w*|CONSULT\w*|EVALUATION|CLINIC|NOTE|VVC|VISIT)\b[^\n]*$")
+# A line that opens ANOTHER note section — an impression item that contains one
+# has run past the end of the impression (WILLIAMS 10/21: 16k chars of a prior
+# note, from a PSMA PET impression through LABS / PSA CURVE / FAMILY HISTORY /
+# PAST MEDICAL HISTORY, landed in the Family History as one 'genetics' item).
+_SECTION_HDR_IN_ITEM_RE = re.compile(
+    r"\b(?:LABS?|PSA\s+CURVE|IMAGING|PATHOLOGY(?:\s+RESULTS)?|MEDICATIONS?|ALLERGIES|"
+    r"(?:PAST\s+)?(?:MEDICAL|SURGICAL|SOCIAL|SEXUAL|FAMILY)\s+HISTORY|REVIEW\s+OF\s+SYSTEMS|"
+    r"PHYSICAL\s+EXAM(?:INATION)?|ASSESSMENT|PLAN|HPI|CHIEF\s+COMPLAINT|ONCOLOGIC\s+HISTORY)\s*:")
+_MAX_GENETICS_ITEM_CHARS = 600
+
+
 def extract_genetics_family_history(clinical_document: str, note_date: str = "") -> Optional[str]:
     """Family-history and risk statements from a genetics evaluation (the
     numbered IMPRESSION lines 'Family history of ...', the germline result, and
     the NCCN-criteria statement). None when no genetics note is present. The
     IMPRESSION is looked up INSIDE the genetics note (after its title), never in
-    an unrelated note's impression."""
+    an unrelated note's impression. A bare mention of 'genetic testing' (e.g. a
+    molecular-pathway line 'Veteran DECLINED germline genetic testing') is NOT a
+    genetics note and yields nothing."""
     if not clinical_document:
         return None
     t = re.search(r"(?i)(?:LOCAL|STANDARD)\s+TITLE\s*:[^\n]*(?:GENETIC|GENOMIC)", clinical_document)
-    region = clinical_document[t.start():t.start() + 12000] if t else (
-        clinical_document if re.search(r"GENETIC|GENOMIC", clinical_document, re.I) else "")
-    if not region:
+    if not t:
+        t = _GENETICS_NOTE_HDR_RE.search(clinical_document)
+    if not t:
         return None
-    m = re.search(r"(?is)IMPRESSION\s*:\s*\n(.*?)(?=\n\s*RECOMMENDATIONS?\s*:|\n\s*/es/|\Z)", region)
+    region = clinical_document[t.start():t.start() + 12000]
+    # The impression HEADER starts its line; its body ends at RECOMMENDATIONS, a
+    # signature, the next blank-line-delimited ALL-CAPS section header, or a hard
+    # cap — never at some later note's text.
+    m = re.search(r"(?im)^[ \t]*IMPRESSION\s*:[ \t]*\n(.*?)(?=\n\s*RECOMMENDATIONS?\s*:|\n\s*/es/|"
+                  r"\n\s*\n[ \t]*[A-Z][A-Z /&()-]{3,}:[ \t]*\n|\Z)", region, re.S)
     if not m:
         return None
-    body = m.group(1)
+    body = m.group(1)[:4000]
     items = re.split(r"\n\s*(?=\d+[.)]\s)", "\n" + body)
     keep = []
     for it in items:
         s = re.sub(r"\s+", " ", it).strip()
         s = re.sub(r"^\d+[.)]\s*", "", s)
-        if not s:
+        hdr = _SECTION_HDR_IN_ITEM_RE.search(s)
+        if hdr:                       # ran into another section: keep only what precedes it
+            s = s[:hdr.start()].rstrip(" ,;:-")
+        if not s or len(s) > _MAX_GENETICS_ITEM_CHARS:
             continue
         if re.search(r"family history|genetic testing is|does not meet .* criteria|meets? .* criteria", s, re.I):
             keep.append(s)
