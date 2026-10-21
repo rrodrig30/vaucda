@@ -274,6 +274,9 @@ def _detect_treatment_history(
             preceding = clinical_document[window_start:m.start()]
             if _DISCUSSION_NEGATION_RE.search(preceding):
                 continue
+            from ..patient_status_facts import is_family_history_context
+            if is_family_history_context(clinical_document, m.start()):
+                continue      # a relative's treatment (family history)
             # Also reject when the match itself sits inside a "options
             # discussed including [X, Y, Z]" list. Look forward ~30
             # chars for comma-separated options. Skip if a comma-or-and

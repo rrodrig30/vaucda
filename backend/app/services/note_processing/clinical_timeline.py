@@ -412,6 +412,9 @@ def _find_treatment_events(
                     continue
             if not _in_prostate_context(text, m.start()):
                 continue
+            from .patient_status_facts import is_family_history_context
+            if is_family_history_context(text, m.start()):
+                continue      # a relative's treatment, not the patient's
             # Date association: a treatment's date is the one adjacent to the
             # treatment word — prefer a date immediately FOLLOWING it ("radiation
             # therapy 4/2022"), then the NEAREST date before it. The old centered

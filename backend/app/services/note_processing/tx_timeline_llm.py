@@ -112,6 +112,9 @@ def scan_treatment_mentions(raw_text: str) -> Dict[str, List[str]]:
         clause = raw_text[s0:m.start()]
         if _MENTION_NEG.search(clause[-60:]):
             continue
+        from .patient_status_facts import is_family_history_context
+        if is_family_history_context(raw_text, m.start()):
+            continue      # "brother ... completed XRT" is family history
         quote = re.sub(r"\s+", " ", raw_text[max(0, m.start() - 25):m.end() + 25]).strip()
         lst = out.setdefault(mod, [])
         if all(_norm(quote)[:40] != _norm(q)[:40] for q in lst):
@@ -231,6 +234,11 @@ def verify_events(raw_text: str, items: List[dict]) -> Tuple[list, List[str]]:
             rejected.append(f"{mod}/{status}: modality word not in quote")
             continue
         pos = text_n.find(qn)
+        from .patient_status_facts import is_family_history_context
+        _mw = _MODALITY_RE[mod].search(text_n, pos, pos + len(qn) + 1)
+        if is_family_history_context(text_n, _mw.start() if _mw else pos):
+            rejected.append(f"{mod}/{status}: quote is a relative's history: {quote[:80]!r}")
+            continue
         window = text_n[max(0, pos - 150): pos + len(qn) + 150]
         cue = {"completed": _COMPLETED_CUE, "discontinued": _COMPLETED_CUE, "started": _STARTED_CUE,
                "restarted": _STARTED_CUE, "declined": _DECLINED_CUE, "planned": _PLANNED_CUE}.get(status)

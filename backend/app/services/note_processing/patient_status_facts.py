@@ -115,6 +115,29 @@ _HEDGING_RE = re.compile(
 _TRAILING_SCREENING_RE = re.compile(r"\s*screening\b", re.IGNORECASE)
 
 
+_FAMILY_LABEL_RE = re.compile(r"(?im)^\s*(?:family\s+(?:hx|history)|fhx?|fam(?:ily)?\s+hx)\s*:")
+
+
+def is_family_history_context(text: str, pos: int, window: int = 160) -> bool:
+    """True when the mention at ``pos`` describes a RELATIVE, not the patient.
+
+    RIOJAS 10/21: "Other brother diagnosed at age 65, completed XRT, and is
+    doing well" was read as the patient's completed radiation, so a
+    treatment-naive man was framed as status post definitive XRT. The check
+    looks at the enclosing clause (back to the last sentence boundary or
+    semicolon, within ``window`` chars) for a relative word, and at the
+    enclosing paragraph for a 'Family hx:' / 'FH:' label."""
+    if not text or pos <= 0:
+        return False
+    pre = text[max(0, pos - window):pos]
+    clause = re.split(r"(?<=[.!?;])\s+", pre)[-1]
+    if _FAMILY_HISTORY_RE.search(clause):
+        return True
+    para_start = text.rfind("\n\n", 0, pos)
+    para = text[para_start + 2 if para_start >= 0 else 0:pos]
+    return len(para) <= 800 and bool(_FAMILY_LABEL_RE.search(para))
+
+
 def _is_family_history_or_hedged(text: str, match_start: int, window: int = 80) -> bool:
     """True if the span at ``match_start`` is a family-history mention or
     a hedged/suspected/comparison reference rather than a confirmed
@@ -322,6 +345,8 @@ def find_completed_treatments(text: str) -> List[str]:
                 continue
             if not _completion_verb_nearby(text, m.start()):
                 continue
+            if is_family_history_context(text, m.start()):
+                continue
             # Reject discussion / option / conditional-future ("salvage RT if PSA
             # rises") / declined mentions — a completion-like verb can sit near a
             # merely-planned treatment (parity with find_treatment_in_raw_...).
@@ -348,6 +373,8 @@ def find_completed_treatments(text: str) -> List[str]:
             if not qualifier_re.search(window_text):
                 continue
             if not _completion_verb_nearby(text, m.start()):
+                continue
+            if is_family_history_context(text, m.start()):
                 continue
             if _is_hypothetical_or_declined_treatment(text, m.start(), m.end()):
                 continue
@@ -516,6 +543,10 @@ def find_treatment_in_raw_clinical_text(text: str) -> List[str]:
                 continue
             # Require prostate-cancer context within ±300 chars.
             if not _in_prostate_context(text, m.start()):
+                continue
+            # A relative's treatment ("brother ... completed XRT") is not the
+            # patient's.
+            if is_family_history_context(text, m.start()):
                 continue
             # Capture a readable quote: from the completion verb to the
             # end of the treatment keyword.
