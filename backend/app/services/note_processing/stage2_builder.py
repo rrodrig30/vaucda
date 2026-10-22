@@ -17,6 +17,7 @@ Stage 2 leverages:
 
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 import logging
+import os
 import re
 from .agents.assessment_agent import synthesize_assessment
 from .agents.plan_agent import synthesize_plan
@@ -191,9 +192,12 @@ async def retrieve_active_rag_context(
     )
 
     all_context_parts = []
+    global_context_parts = []   # community-level map-reduce syntheses lead
     all_sources = []
     seen_doc_ids = set()
-    max_context_length = 4000
+    # The community map-reduce synthesis is the highest-value GraphRAG output;
+    # give the whole context a larger budget so it isn't crowded out by chunks.
+    max_context_length = 9000
 
     for query in queries:
         try:
@@ -211,13 +215,28 @@ async def retrieve_active_rag_context(
             )
 
             if rag_result.has_context:
-                # Add context, avoiding duplicates
+                # Add context, avoiding duplicates. The GraphRAG community-level
+                # synthesis (global map-reduce) and the local graph synthesis are
+                # the high-value outputs — give them a large per-doc budget and
+                # lead with them; chunks get a smaller slice. Surface community
+                # provenance so the community-level contribution is VISIBLE.
                 for doc in rag_result.documents:
-                    if doc.doc_id not in seen_doc_ids:
-                        seen_doc_ids.add(doc.doc_id)
-                        all_context_parts.append(
-                            f"[{doc.source}] {doc.title}\n{doc.content[:500]}"
-                        )
+                    if doc.doc_id in seen_doc_ids:
+                        continue
+                    seen_doc_ids.add(doc.doc_id)
+                    cat = getattr(doc, "category", "") or ""
+                    meta = getattr(doc, "metadata", {}) or {}
+                    if cat in ("graphrag_global", "graphrag_local"):
+                        budget, bucket = 3500, global_context_parts
+                    else:
+                        budget, bucket = 700, all_context_parts
+                    prov = ""
+                    if meta.get("communities_queried"):
+                        prov = (f" [communities queried={meta['communities_queried']}, "
+                                f"mapped answers={meta.get('intermediate_answers', '?')}]")
+                    bucket.append(
+                        f"[{doc.source}] {doc.title}{prov}\n{doc.content[:budget]}"
+                    )
 
                 # Add sources
                 for source in rag_result.sources:
@@ -228,14 +247,751 @@ async def retrieve_active_rag_context(
             logger.warning(f"RAG retrieval failed for query '{query}': {e}")
             continue
 
-    # Assemble context with length limit
-    context = "\n\n---\n\n".join(all_context_parts)
+    # Assemble context with length limit — community-level syntheses lead so they
+    # are never truncated out by lower-value chunk text.
+    context = "\n\n---\n\n".join(global_context_parts + all_context_parts)
     if len(context) > max_context_length:
         context = context[:max_context_length] + "\n[Context truncated for length]"
 
-    logger.info(f"Active RAG retrieval: {len(context)} chars from {len(all_sources)} sources")
+    logger.info(
+        "Active RAG retrieval: %d chars from %d sources "
+        "(%d community-synthesis part(s), %d chunk part(s))",
+        len(context), len(all_sources), len(global_context_parts), len(all_context_parts))
 
     return context, all_sources
+
+
+import re as _re_unprod
+
+# --- unproductive-recommendation scrubber -----------------------------------
+# Remove (a) hypothetical/contingency management of problems the patient does
+# NOT currently have, and (b) recommendations AGAINST an inapplicable test —
+# both of which the user flagged as space-wasting / patronizing. Conservative:
+# a segment is dropped only on a clear signal, guideline-grounded deferrals and
+# patient return-precautions are preserved.
+_UP_CONTINGENCY = _re_unprod.compile(
+    r'\b(?:should\s+(?:he|she|the\s+patient|his|her|symptoms|the\s+psa|urinary)|'
+    r'if\s+(?:he|she|the\s+patient|symptoms|his|her|the\s+psa|urinary|voiding)|'
+    r'in\s+the\s+event|were\s+(?:he|she|the\s+patient|it)\s+to|'
+    r'in\s+case\s+(?:of|he|she))\b', _re_unprod.IGNORECASE)
+_UP_FUTURE_MGMT = _re_unprod.compile(
+    r'\b(?:explore|consider|could|would|may\s+(?:proceed|offer|pursue|explore|consider)|'
+    r'option(?:s)?\s+(?:include|are|of|for)|we\s+c(?:an|ould)|surgical\s+option|'
+    r'proceed\s+with|pursue|offer|can\s+be\s+(?:explored|offered|considered))\b',
+    _re_unprod.IGNORECASE)
+# Patient-directed return precautions are legitimate — never drop these.
+_UP_PRECAUTION = _re_unprod.compile(
+    r'\b(?:return|call|seek|report|contact|come\s+back|present\s+to|'
+    r'go\s+to\s+the\s+(?:er|ed|emergency)|advise[ds]?\s+to)\b', _re_unprod.IGNORECASE)
+_UP_NEG_REC = _re_unprod.compile(
+    r'\b(?:no\s+(?:need|indication|role)\s+for|'
+    # "No additional/further/repeat/routine <test> ... is indicated/needed" — the
+    # qualifier is required so "No EVIDENCE of metastatic disease" is NOT matched.
+    r'no\s+(?:additional|further|repeat|routine|new)\b[^.]{0,70}?\b'
+    r'(?:indicated|necessary|needed|required|warranted)\b|'
+    r'not\s+(?:indicated|necessary|needed|required|warranted|recommended)|'
+    r'do(?:es)?\s+not\s+(?:need|require))\b',
+    _re_unprod.IGNORECASE)
+_UP_TEST_TOKEN = _re_unprod.compile(
+    r'\b(?:biopsy|psma|pet|mp?mri|\bct\b|cystoscop|imaging|scan|bone\s+scan|\bpsa\b|'
+    r'screening|ultrasound|turp|nephrectomy|prostatectomy|radiation|mri)\b',
+    _re_unprod.IGNORECASE)
+# Guideline-grounded deferral / real clinical rationale — a decision, keep it.
+_UP_JUSTIFIED = _re_unprod.compile(
+    r'\b(?:per\s+(?:aua|nccn|eau)|life\s+expectancy|guideline|limited\s+life|'
+    r'comorbid|frail|advanced\s+age)\b', _re_unprod.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Active-voice enforcement: recommendations must be affirmative ("recommend you
+# DO X"), never negative ("no need for biopsy", "DRE is not indicated"). Negative
+# recommendation CLAUSES are trimmed; a bullet's affirmative clauses are kept.
+# (Clinical FINDINGS like "no evidence of metastatic disease" are NOT touched —
+# they carry no negation-of-ACTION cue.)
+# ---------------------------------------------------------------------------
+_AFFIRM_LEAD = _re_unprod.compile(
+    r"^\s*[-*•]?\s*(?:continue|recommend|order|schedule|obtain|administer|refer|"
+    r"start|initiate|monitor|counsel|discuss|perform|reassess|return|follow|repeat|"
+    r"maintain|provide|ensure|arrange|place|renew|titrate|advise|educate|encourage|"
+    r"consider|plan|proceed|offer|pursue|check|draw|measure|assess|evaluate|treat|"
+    r"co-?manage|manage|coordinate|prescribe|hold|resume|increase|decrease|adjust)\b",
+    _re_unprod.IGNORECASE)
+_NEG_REC_CLAUSE = _re_unprod.compile(
+    r"\bno\s+(?:need|indication|role|recommendation|further|additional|repeat|routine|"
+    r"dedicated|new|change|immediate|current|ongoing|urologic)\b"
+    r"|\b(?:is|are|was|were)\s+not\s+(?:indicated|recommended|required|needed|necessary|"
+    r"warranted|performed|initiated|planned|pursued|offered|obtained|ordered)\b"
+    r"|\bnot\s+(?:indicated|recommended|necessary|needed|required|warranted)\b"
+    r"|\bdo(?:es)?\s+not\s+(?:recommend|require|need|warrant|indicate)\b"
+    r"|\bwill\s+not\s+(?:order|recommend|pursue|perform|obtain|proceed|initiate)\b"
+    r"|\bno\s+\w+(?:\s+\w+){0,4}?\s+(?:is\s+|are\s+|was\s+|were\s+)?(?:indicated|"
+    r"recommended|required|needed|performed|initiated|planned|ordered|warranted)\b",
+    _re_unprod.IGNORECASE)
+
+
+def _is_negative_rec_clause(clause: str) -> bool:
+    c = clause.strip()
+    return (len(c) >= 4 and not _AFFIRM_LEAD.match(c)
+            and bool(_NEG_REC_CLAUSE.search(c)))
+
+
+# Ungrounded if-then hypotheticals — a conditional projecting a FUTURE test /
+# procedure / workup that isn't grounded in THIS patient ("if PSA exceeds 4, then
+# perform a prostate-cancer workup with biopsy"). Patient RETURN-PRECAUTIONS
+# ("return/call if fever") are legitimate and preserved.
+_HYPO_LEAD = _re_unprod.compile(
+    r"^\s*(?:if\b|should\s+(?:he|she|his|her|the\s+patient|the\s+psa|psa|symptoms|"
+    r"there|any|these|results?)|in\s+the\s+event\b|were\s+\w+\s+to\b|in\s+case\b|"
+    r"in\s+the\s+future\b|down\s+the\s+(?:road|line)\b|at\s+(?:that|a\s+later)\s+"
+    r"(?:point|time)\b)", _re_unprod.IGNORECASE)
+_HYPO_ACTION = _re_unprod.compile(
+    r"\b(?:biops\w+|work[\s-]?up|\bMRI\b|mp?MRI|imaging|\bCT\b|\bPET\b|PSMA|scan|"
+    r"refer\w*|evaluat\w+|treat\w+|therap\w+|proceed|pursue|obtain|order|initiate|"
+    r"start|repeat|perform|surger\w+|resection|cystoscop\w+|urodynamic\w+|"
+    r"prostatectomy|radiation|ablation|biopsy)\b", _re_unprod.IGNORECASE)
+# A VAGUE guideline hand-wave clause — "(and then) follow/per/adhere to ...
+# guidelines" as a trailing INSTRUCTION (not a specific inline citation like
+# "per NCCN guidelines for low-risk prostate cancer", which continues past
+# 'guidelines' and is kept).
+_VAGUE_GUIDELINE = _re_unprod.compile(
+    r"^(?:and\s+)?(?:then\s+)?(?:follow|adhere\s+to|manage\s+per|per|according\s+to|"
+    r"in\s+accordance\s+with|consistent\s+with|as\s+per)\b[^.;]{0,40}?\bguidelines?\b\.?$",
+    _re_unprod.IGNORECASE)
+
+
+def _is_hypothetical_rec_clause(clause: str) -> bool:
+    c = clause.strip()
+    return bool(_HYPO_LEAD.match(c) and _HYPO_ACTION.search(c)
+                and not _UP_PRECAUTION.search(c))
+
+
+def _is_vague_guideline_clause(clause: str) -> bool:
+    return bool(_VAGUE_GUIDELINE.match(clause.strip()))
+
+
+# The note asserts the biochemical-recurrence threshold is NOT met (post-radiation
+# Phoenix nadir+2 not reached, or the PSA rise is explained by testosterone
+# recovery after ADT). When that is stated, ORDERING PSMA PET / salvage therapy /
+# a recurrence workup is self-contradictory and clinically wrong — a PSA below the
+# recurrence threshold does not warrant recurrence imaging. (VANBRUGGEN: post-IMRT,
+# nadir 0.10, PSA 0.53 during testosterone recovery — Phoenix 2.10 not met — the
+# LLM still ordered PSMA PET off the VA PSA>=0.5 *authorization floor*, which is a
+# necessary eligibility threshold, NOT an indication.)
+_RECURRENCE_NOT_MET = _re_unprod.compile(
+    r"(?i)(?:phoenix[^.]{0,45}?\b(?:not|has\s+not|hasn'?t)\s+(?:been\s+)?met"
+    r"|(?:threshold|criteri\w+)[^.]{0,45}?(?:biochemical\s+)?recurrenc\w*[^.]{0,25}?"
+    r"\b(?:not|has\s+not|hasn'?t)\s+(?:been\s+)?met"
+    r"|\b(?:has\s+)?not\s+(?:yet\s+)?met[^.]{0,30}?(?:criteri\w+|threshold)[^.]{0,25}?"
+    r"(?:recurrence|treatment\s+failure|relapse)"
+    r"|most\s+consistent\s+with\s+testosterone\s+recovery"
+    r"|attribut\w+\s+to\s+testosterone\s+recovery)")
+# An ORDER verb placed DIRECTLY on a recurrence-workup target (so "Order PSMA PET"
+# matches but "Schedule return visit ... to review PSMA results" does not).
+_ORDERS_RECURRENCE_WORKUP = _re_unprod.compile(
+    r"(?i)\b(?:order|obtain|arrange|schedule|proceed\s+with|perform|recommend|"
+    r"pursue|initiate)\s+(?:a\s+|an\s+|the\s+|early\s+|repeat\s+)?"
+    r"(?:PSMA(?:\s*[-/]?\s*PET(?:/CT)?)?|salvage\s+(?:therap\w+|radiation|RT|ADT|"
+    r"treatment|prostatectomy))\b")
+
+
+_RADIATION_TX = _re_unprod.compile(
+    r"\b(?:IMRT|EBRT|SBRT|IGRT|VMAT|brachytherap\w+|external\s+beam|radiotherapy|"
+    r"radiation\s+therapy|\bXRT\b|seed\s+implant|proton)\b", _re_unprod.IGNORECASE)
+_RADICAL_RP = _re_unprod.compile(
+    r"radical\s+prostatectomy|\bRRP\b|\bRALP\b|\bRARP\b|"
+    r"robot\w*[\s\w-]{0,25}prostatectomy", _re_unprod.IGNORECASE)
+_PHOENIX_MARGIN = 2.0
+
+
+def _phoenix_status(stage1_note: str):
+    """(is_post_radiation_no_rp, current_psa, nadir_psa) parsed from the PSA CURVE,
+    or None when not applicable / not enough data."""
+    src = stage1_note or ""
+    if not _RADIATION_TX.search(src) or _RADICAL_RP.search(src):
+        return None
+    m = _re_unprod.search(r"(?s)\nPSA CURVE:\s*\n(.*?)(?=\n[A-Z][A-Za-z ]{2,}:|\n=|\Z)", src)
+    if not m:
+        return None
+    vals = []
+    for line in m.group(1).splitlines():
+        fm = _re_unprod.findall(r"(\d+\.\d+)", line)
+        if fm:
+            vals.append(float(fm[-1]))
+    if len(vals) < 2:
+        return None
+    return (vals[0], min(vals))   # (current = most recent, nadir = series min)
+
+
+def _phoenix_directive(stage1_note: str) -> str:
+    """Authoritative-facts directive for a post-radiation patient whose PSA is
+    below the Phoenix recurrence threshold — steers the LLM to surveillance-only."""
+    st = _phoenix_status(stage1_note)
+    if not st:
+        return ""
+    current, nadir = st
+    thresh = nadir + _PHOENIX_MARGIN
+    if current >= thresh:
+        return ""   # recurrence met — let the plan pursue workup
+    return (
+        "BIOCHEMICAL RECURRENCE STATUS (deterministic — authoritative):\n"
+        f"- Patient had DEFINITIVE RADIATION (not prostatectomy). Recurrence is the "
+        f"PHOENIX criterion = nadir + 2.0 ng/mL.\n"
+        f"- PSA nadir {nadir:g} ng/mL; most recent PSA {current:g} ng/mL; Phoenix "
+        f"threshold {thresh:g} ng/mL.\n"
+        f"- Phoenix threshold NOT met -> this is NOT biochemical recurrence. A rise "
+        f"below {thresh:g} (esp. during testosterone recovery after ADT) is expected.\n"
+        f"- Therefore: do NOT order PSMA PET/CT, salvage therapy, or a metastatic "
+        f"workup, and do NOT frame the visit around recurrence. Recommend continued "
+        f"PSA surveillance only."
+    )
+
+
+def _below_phoenix_post_radiation(stage1_note: str) -> bool:
+    """DETERMINISTIC post-radiation recurrence check, independent of the note's
+    prose. True when the patient had definitive RADIATION (and NOT a radical
+    prostatectomy) and the most recent PSA is still BELOW the Phoenix threshold
+    (nadir + 2.0 ng/mL) — i.e. NOT biochemical recurrence, so PSMA PET / salvage
+    is not indicated (VANBRUGGEN: nadir 0.10, current 0.53, Phoenix 2.10)."""
+    src = stage1_note or ""
+    if not _RADIATION_TX.search(src) or _RADICAL_RP.search(src):
+        return False
+    m = _re_unprod.search(r"(?s)\nPSA CURVE:\s*\n(.*?)(?=\n[A-Z][A-Za-z ]{2,}:|\n=|\Z)", src)
+    if not m:
+        return False
+    vals = []
+    for line in m.group(1).splitlines():
+        fm = _re_unprod.findall(r"(\d+\.\d+)", line)
+        if fm:
+            vals.append(float(fm[-1]))   # trailing number on the line is the PSA
+    if len(vals) < 2:
+        return False
+    current, nadir = vals[0], min(vals)   # curve is reverse-chronological
+    return current < nadir + _PHOENIX_MARGIN
+
+
+def _strip_contradicted_recurrence_workup(plan: str, assessment: str,
+                                          stage1_note: str = "") -> str:
+    """Drop Plan bullets that ORDER a recurrence workup (PSMA PET / salvage) when
+    biochemical recurrence has NOT occurred — either the note states the threshold
+    isn't met, OR (deterministically) the patient is post-radiation with PSA below
+    the Phoenix nadir+2.0 threshold."""
+    if not plan:
+        return plan
+    triggered = (_RECURRENCE_NOT_MET.search(f"{assessment or ''}\n{plan}")
+                 or _below_phoenix_post_radiation(stage1_note))
+    if not triggered:
+        return plan
+    out = []
+    for line in plan.split("\n"):
+        body = line.lstrip()
+        if body[:1] in ("-", "*", "•") and _ORDERS_RECURRENCE_WORKUP.search(body):
+            logger.info("Dropped contradicted recurrence-workup Plan bullet "
+                        "(recurrence threshold stated NOT met)")
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _is_droppable_clause(clause: str) -> bool:
+    """A clause is dropped from the A/P when it is a negative recommendation, an
+    ungrounded if-then hypothetical, or a vague 'follow the guidelines' hand-wave."""
+    return (_is_negative_rec_clause(clause) or _is_hypothetical_rec_clause(clause)
+            or _is_vague_guideline_clause(clause))
+
+
+# Trailing "…and then follow/adhere to/according to … guidelines" hand-wave
+# appended to an otherwise-affirmative recommendation. Stripped from the END of a
+# clause. A SPECIFIC inline citation ("per NCCN guidelines for low-risk prostate
+# cancer") is NOT matched — 'guidelines' there is followed by a topic, and 'per'
+# is deliberately excluded from the verb list.
+_TRAIL_GUIDELINE = _re_unprod.compile(
+    r"\s*[,;]?\s*(?:and\s+)?(?:then\s+)?(?:follow\w*|adher\w+\s+to|manage\s+(?:per|"
+    r"according\s+to)|in\s+accordance\s+with|according\s+to|consistent\s+with)\s+"
+    r"(?:the\s+)?[^.;]{0,30}?\bguidelines?\b\.?\s*$", _re_unprod.IGNORECASE)
+
+
+def _strip_trailing_guideline(clause: str) -> str:
+    return _TRAIL_GUIDELINE.sub("", clause).rstrip(" ,;")
+
+
+def _strip_negative_recs(text: str, is_plan: bool) -> str:
+    """Remove negative-recommendation CLAUSES, keeping affirmative content.
+    Plan: per bullet, split on ';' and drop negative clauses (drop the bullet if
+    none remain). Assessment: per sentence, same, then drop empty sentences."""
+    if not text:
+        return text
+
+    def _trim(segment: str) -> str:
+        # Split on ';' AND sentence boundaries ('. ' before a capital / If / Should)
+        # so a trailing hypothetical sentence in the same bullet is isolated.
+        raw = _re_unprod.split(r";|(?<=[.!?])\s+(?=[A-Z])", segment)
+        kept = [_strip_trailing_guideline(p.strip().rstrip(".")) for p in raw
+                if p and p.strip() and not _is_droppable_clause(p)]
+        kept = [p for p in kept if p]
+        if not kept:
+            return ""
+        out = "; ".join(kept)
+        out = out[0].upper() + out[1:] if out and out[0].islower() else out
+        return out
+
+    if is_plan:
+        lines = []
+        for line in text.split("\n"):
+            body = line.lstrip()
+            prefix = line[:len(line) - len(body)]
+            if body[:1] in ("-", "*", "•"):
+                marker, rest = body[0], body[1:].strip()
+                trimmed = _trim(rest)
+                if trimmed:
+                    lines.append(f"{prefix}{marker} {trimmed}")
+                # else: whole bullet was a negative recommendation — drop it
+            else:
+                lines.append(line)
+        return "\n".join(lines)
+    # Assessment narrative: sentence-wise.
+    sents = _re_unprod.split(r"(?<=[.!?])\s+", text.strip())
+    kept = []
+    for s in sents:
+        t = _trim(s)
+        if t:
+            kept.append(t if t.endswith((".", "!", "?")) else t + ".")
+    return " ".join(kept).strip()
+
+
+def _is_unproductive_segment(seg: str) -> bool:
+    """True if a Plan bullet / Assessment sentence is a hypothetical-contingency
+    or a recommendation-against-an-inapplicable-test (and not a guideline
+    deferral or a patient return-precaution)."""
+    if not seg or not seg.strip():
+        return False
+    contingency = (_UP_CONTINGENCY.search(seg) and _UP_FUTURE_MGMT.search(seg)
+                   and not _UP_PRECAUTION.search(seg))
+    neg_rec = (_UP_NEG_REC.search(seg) and _UP_TEST_TOKEN.search(seg)
+               and not _UP_JUSTIFIED.search(seg))
+    return bool(contingency or neg_rec)
+
+
+# Bracket date/service placeholders the LLM leaves ("injection given on
+# [date of service]") -> "today" (the note is written at the visit).
+_AP_DATE_PLACEHOLDER = re.compile(
+    r"(?:\s+(?:on|by|as\s+of|dated))?\s*\[\s*(?:date\s+of\s+service|service\s+date|"
+    r"current\s+date|today'?s?\s+date|visit\s+date|date|dos)\s*\]", re.I)
+# Generic bracket placeholders ("[value]", "[insert ...]", "[XX]", "[TBD]").
+_AP_BRACKET_PLACEHOLDER = re.compile(
+    r"\s*\[\s*(?:insert|enter|specify|provide|tbd|x{2,}|placeholder|value|name|"
+    r"number|dose|age|result|time|to\s+be\s+[a-z]+)[^\]]*\]", re.I)
+# A sentence asserting a Charlson Comorbidity Index / 10-year-survival figure —
+# stripped when NO CCI calculator was actually run (the LLM otherwise fabricates
+# a score, e.g. "CCI 17 / 2% 10-year survival" in express mode).
+# Bounded to ONE sentence on ONE line: '[^.]*' spanned newlines, so in a bullet
+# list (few periods) it swallowed whole runs of Plan bullets around the match.
+_CCI_SENTENCE = re.compile(
+    r"[^.\n]*\b(?:charlson\s+comorbidity\s+index|comorbidity\s+index\s+score|\bCCI\b|"
+    r"estimated\s+\d+[\s-]year\s+survival)[^.\n]*(?:\.|$)[ \t]*", re.I | re.M)
+
+
+def _scrub_ap_artifacts(text: str, has_cci: bool) -> str:
+    """Deterministic Assessment/Plan cleanup: resolve date-placeholders to
+    'today', drop generic bracket placeholders, remove a FABRICATED Charlson
+    score when no CCI calculator was run, and strip a duplicated leading section
+    header."""
+    if not text:
+        return text
+    _orig = text
+    # Strip LLM meta-preamble the rewrite loops prepend, at the start OR mid-text
+    # after the first sentence ("Here is the rewritten treatment plan ...:",
+    # "Below is the updated assessment:", "Here is the comprehensive clinical
+    # assessment for the urology patient:").
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*(?:here\s+is|here'?s|below\s+is|"
+                  r"the\s+following\s+is|sure[,!]?\s+here)\b[^\n:]{0,90}:\s*",
+                  " ", text, flags=re.I)
+    # Trailing/inline self-referential editor notes ("Note that I corrected...",
+    # "I reported the highest-grade core...").
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*Note\s*(?:that|:)\s*I\b[^.!?]*[.!?]?", " ", text, flags=re.I)
+    # Trailing edit-log the model appends ("I made the following changes: * ...").
+    # Anchored to the START of a line and bounded to that paragraph (the old
+    # '(?is)...\b...:.*' matched 'Medication changes made today:' inside a Plan
+    # bullet and deleted everything after it — CARO 10/16 lost its whole Plan).
+    text = re.sub(
+        r"(?im)^[ \t]*(?:I\s+(?:have\s+)?(?:also\s+)?made\s+the\s+following|"
+        r"(?:the\s+)?following\s+(?:changes?|edits?)\s+(?:were|have\s+been|are)\s+made|"
+        r"Changes?\s+made|Edits?\s+(?:made|applied))\b[^:\n]{0,40}:[ \t]*"
+        r"(?:[-*][^\n]*)?(?:\n[ \t]*[-*][^\n]*)*",
+        "", text)
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*I\s+(?:corrected|revised|updated|added|removed|"
+                  r"changed|reported|inferred|noted|adjusted|rewrote)\b[^.!?]*[.!?]?",
+                  " ", text, flags=re.I)
+    text = _AP_DATE_PLACEHOLDER.sub(" today", text)
+    text = _AP_BRACKET_PLACEHOLDER.sub("", text)
+    # Angle-bracket placeholders opus-class models emit: "<date>", "<value>",
+    # "on <date>" -> drop the placeholder (and a leading 'on/by/as of').
+    text = re.sub(r"(?:\s+(?:on|by|as\s+of|dated))?\s*<\s*[^>]{0,40}?\s*>", "", text)
+    if not has_cci:
+        text = _CCI_SENTENCE.sub("", text)
+    # Strip sentences that narrate the INTERNAL PROMPT SCAFFOLDING (the model
+    # referencing its own instruction blocks) — never clinical content.
+    text = re.sub(
+        r"[^.!?\n]*\b(?:HPI\s+skeleton|AVAILABLE\s+INFORMATION|"
+        r"(?:AGE\s*/?\s*)?LIFE[\s-]?EXPECTANCY\s+GUARDRAIL|GUARDRAIL\s+block|"
+        r"Assessment\s+Narrative|ABSOLUTE\s+RULES|MUST[\s-]?INCLUDE|"
+        r"as\s+(?:per|instructed)\s+(?:the|in)\b[^.!?\n]*\b(?:block|section|above)|"
+        r"the\s+(?:above|provided)\s+(?:block|skeleton|context|information|narrative))"
+        r"\b[^.!?\n]*[.!?]", "", text, flags=re.I)
+    # Meta sentences about the assessment/plan itself.
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*(?:This|The\s+above)\s+"
+                  r"(?:assessment|plan|note)\b[^.!?\n]*"
+                  r"(?:align|address|incorporat|honor|reflect|summariz|is\s+based|"
+                  r"does\s+not\s+include)[^.!?\n]*[.!?]", " ", text, flags=re.I)
+    # Generic trailing meta "Note: ...".
+    text = re.sub(r"(?:^|(?<=[.!?]))\s*Note\s*:\s*(?:The|This|All|I)\b[^.!?\n]*[.!?]",
+                  " ", text, flags=re.I)
+    # Leading orphan name fragment before the first PROBLEM/bullet ("Murray.").
+    text = re.sub(r"^\s*[A-Z][a-zA-Z'-]{1,20}\.\s*(?=(?:PROBLEM|\*|-|Continue|Monitor))",
+                  "", text)
+    # tidy whitespace/punctuation left by removals
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\s+([.,;])", r"\1", text)
+    text = re.sub(r"([a-z])\.([A-Z])", r"\1. \2", text)   # restore lost sentence space
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    # Amputation guard: this function POLISHES — it must never remove most of the
+    # section. If it did (a pattern matched clinical prose), keep the original.
+    if len(_orig) > 400 and len(text) < 0.6 * len(_orig):
+        logger.warning("_scrub_ap_artifacts would cut %d -> %d chars; keeping original",
+                       len(_orig), len(text))
+        return _orig.strip()
+    return text
+
+
+# Filler words dropped when comparing PROBLEM titles for duplication, plus
+# abbreviation/synonym expansion so "BPH" == "benign prostatic hyperplasia".
+_PROBLEM_STOPWORDS = frozenset({
+    "chronic", "acute", "the", "of", "a", "an", "with", "and", "history", "hx",
+    "status", "post", "ongoing", "known", "stable", "new", "possible", "likely",
+    "management", "follow", "followup", "for", "on", "in", "to", "related",
+    "secondary", "surveillance", "active",
+})
+_PROBLEM_SYNONYMS = {
+    "bph": "benign prostatic hyperplasia",
+    "luts": "lower urinary tract symptoms",
+    "boo": "bladder outlet obstruction",
+    "ed": "erectile dysfunction",
+    "htn": "hypertension",
+    "hld": "hyperlipidemia",
+    "dm": "diabetes mellitus",
+    "pca": "prostate cancer",
+}
+
+
+def _problem_signature(title: str) -> frozenset:
+    t = (title or "").lower()
+    for abbr, full in _PROBLEM_SYNONYMS.items():
+        t = re.sub(rf"\b{abbr}\b", full, t)
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return frozenset(w for w in t.split()
+                     if len(w) > 2 and w not in _PROBLEM_STOPWORDS)
+
+
+def _problems_duplicate(a: frozenset, b: frozenset) -> bool:
+    """Two PROBLEM titles are the same clinical issue when their significant-word
+    signatures are equal, one is fully contained in the other (e.g. 'outlet
+    obstruction' ⊂ 'bladder outlet obstruction'), or they overlap heavily."""
+    if not a or not b:
+        return False
+    if a == b or a <= b or b <= a:
+        return True
+    inter = len(a & b)
+    union = len(a | b)
+    return union > 0 and inter / union >= 0.7
+
+
+def _bullet_units(body: str):
+    """Split a PROBLEM block body into individual bullet units (the plan mixes
+    ' * ' inline separators and newline bullets)."""
+    units = re.split(r"\s*\*\s+|\n[ \t]*[-•]\s*|\n{2,}", body)
+    return [u.strip() for u in units if u.strip()]
+
+
+def _dedupe_problems(plan: str) -> str:
+    """Merge near-duplicate PROBLEM blocks the LLM emitted (e.g. 'Chronic Outlet
+    Obstruction' and 'Chronic Bladder Outlet Obstruction'). Keeps the FIRST block
+    and folds in any genuinely novel bullets from the duplicate; drops the rest.
+    Renumbering is applied separately afterward."""
+    if not plan or "PROBLEM" not in plan.upper():
+        return plan
+    parts = re.split(r"(?i)(?=\bPROBLEM\s*#\s*\d+\s*:)", plan)
+    preamble, blocks = parts[0], parts[1:]
+    if len(blocks) < 2:
+        return plan
+    kept = []  # list of mutable [signature, block_text]
+    for block in blocks:
+        m = re.match(r"(?i)\s*PROBLEM\s*#\s*\d+\s*:\s*([^\n*]*)", block)
+        if not m:
+            kept.append([None, block])
+            continue
+        sig = _problem_signature(m.group(1))
+        dup = next((k for k in kept if k[0] is not None
+                    and _problems_duplicate(k[0], sig)), None)
+        if dup is None:
+            kept.append([sig, block])
+            continue
+        # Fold novel bullets from the duplicate into the kept block.
+        seen = {re.sub(r"[^a-z0-9]", "", u.lower()) for u in _bullet_units(dup[1])}
+        body = block[m.end():]
+        extra = [u for u in _bullet_units(body)
+                 if re.sub(r"[^a-z0-9]", "", u.lower()) not in seen]
+        if extra:
+            dup[1] = dup[1].rstrip() + "".join(f"\n- {u}" for u in extra) + "\n"
+    return preamble + "".join(b for _, b in kept)
+
+
+_PSA_PROBLEM_TITLE_RE = re.compile(
+    r"^\s*(?:(?:elevated|rising|raised|increasing|persistent(?:ly)?\s+elevated|abnormal|"
+    r"high)\s+(?:serum\s+)?PSA(?:\s+(?:level|value|elevation|monitoring|surveillance|trend|kinetics))?"
+    r"|PSA\s+(?:elevation|rise|increase|monitoring|surveillance|trend|kinetics)"
+    r"|(?:R97\.2\s*)?elevated\s+prostate[\s-]+specific\s+antigen(?:\s+\[?PSA\]?)?)"
+    r"\s*(?:\(.*?\))?\s*$", re.I)
+_PROSTATE_CANCER_TITLE_RE = re.compile(
+    r"\bprostat(?:e|ic)\b.*\b(?:cancer|adenocarcinoma|carcinoma|malignan)|"
+    r"\b(?:cancer|adenocarcinoma|carcinoma)\b.*\bprostat(?:e|ic)\b|\bCaP\b|\bmCRPC\b|\bCRPC\b|"
+    r"\bbiochemical\s+recurrence\b", re.I)
+
+
+_ADT_WORD_RE = re.compile(r"leuprolide|eligard|lupron|degarelix|firmagon|goserelin|zoladex|triptorelin|"
+                          r"relugolix|orgovyx|\bADT\b|androgen[\s-]+deprivation|depot", re.I)
+_NEXT_DUE_CLAUSE_RE = re.compile(
+    r"\s*[;,]?\s*(?:with\s+|and\s+)?(?:the\s+)?next\s+(?:depot\s+)?(?:injection\s+|dose\s+)?(?:is\s+|will\s+be\s+)?"
+    r"(?:due|scheduled|planned|anticipated|expected)\s+(?:for\s+|on\s+|in\s+|around\s+|approximately\s+)?"
+    r"(?:\d{1,2}/\d{1,2}/\d{2,4}|[A-Z][a-z]+\s+\d{4}|\d{1,2}/\d{4})", re.I)
+
+
+def _enforce_adt_in_assessment(assessment: str, st) -> str:
+    """Assessment counterpart: a DUE depot is 'due today', never 'scheduled for
+    <past month>'."""
+    if not assessment or st is None or getattr(st, "injection", "") != "DUE":
+        return assessment
+    return _NEXT_DUE_CLAUSE_RE.sub(", with the next depot injection due today", assessment)
+_ADMINISTER_TODAY_RE = re.compile(
+    r"administer\w*\s+[^.\n]{0,80}?\b(?:today|this\s+visit|at\s+today)|"
+    r"\b(?:today|this\s+visit)\b[^.\n]{0,50}\b(?:injection|depot|administer)", re.I)
+
+
+_POST_RT_FRAMING_RE = re.compile(
+    r"\b(?:per\s+NCCN[^;,.]{0,40}?\s+for\s+)?post[\s-]?radiation\s+(?:monitoring|surveillance|follow[\s-]?up)\b|"
+    r"\bs/p\s+(?:definitive\s+)?(?:radiation(?:\s+therapy)?|IMRT|XRT|EBRT)\b|"
+    r"\bstatus\s+post\s+(?:definitive\s+)?(?:radiation(?:\s+therapy)?|IMRT|XRT|EBRT)\b|"
+    r"\bcompleted\s+(?:definitive\s+)?(?:radiation(?:\s+therapy)?|IMRT|XRT|EBRT)\b", re.I)
+
+
+def _scrub_incomplete_radiation_framing(text: str, facts) -> str:
+    """After an INCOMPLETE (aborted) radiation course, 'post-radiation
+    surveillance' / 's/p radiation' / 'completed radiation' framing is false
+    (MARTINEZ: 'per NCCN ... for post-radiation monitoring' survived the prompt
+    rule). Replace with neutral surveillance wording."""
+    tas = getattr(facts, "treatment_active_status", {}) or {}
+    if not text:
+        return text
+    if tas.get("adt") == "ACTIVE":
+        # On ongoing ADT the patient is ON treatment, not in post-treatment surveillance.
+        text = re.sub(r"\b(?:now\s+)?in\s+post[\s-]?treatment\s+surveillance\b", "on ongoing androgen deprivation therapy", text, flags=re.I)
+        text = re.sub(r"\bpost[\s-]?treatment\s+surveillance\b", "ongoing androgen deprivation therapy", text, flags=re.I)
+        text = re.sub(r"\breturning\s+for\s+urology\s+surveillance\s+follow-up\s+after\s+prior\s+prostate[\s-]cancer\s+treatment\b",
+                      "returning for urology follow-up on androgen deprivation therapy for prostate cancer", text, flags=re.I)
+    if tas.get("radiation") != "INCOMPLETE":
+        return text
+    def _sub(m):
+        t = m.group(0).lower()
+        if "monitoring" in t or "surveillance" in t or "follow" in t:
+            return "surveillance"
+        return "after an incomplete radiation course"
+    text = _POST_RT_FRAMING_RE.sub(_sub, text)
+    # Phoenix / 'post-radiation patients' presume a delivered definitive course:
+    # drop the bullet (Plan) or the sentence (Assessment) that carries it.
+    if "\n- " in text or text.lstrip().startswith("- "):
+        text = "\n".join(l for l in text.split("\n")
+                         if not (l.lstrip().startswith("-") and re.search(r"phoenix|post[\s-]?radiation\s+patients", l, re.I)))
+    else:
+        text = " ".join(x for x in re.split(r"(?<=[.!?])\s+", text)
+                        if not re.search(r"phoenix|post[\s-]?radiation\s+patients", x, re.I))
+    return text
+
+
+_RISK_PHRASE_RE = re.compile(
+    r"\b(?:very[\s-]low|low|favou?rable[\s-]intermediate|unfavou?rable[\s-]intermediate|"
+    r"intermediate[\s-](?:un)?favou?rable|intermediate|high|very[\s-]high)[\s-]risk\b"
+    r"(?=[^.\n]{0,40}\b(?:prostate|disease|localized|cancer|adenocarcinoma))", re.I)
+
+
+def _enforce_risk_category(text: str, facts) -> str:
+    """The chart's NCCN risk category is authoritative (MARTINEZ: 'NCCN
+    intermediate unfavorable risk' became 'high-risk localized')."""
+    risk = (getattr(facts, "nccn_risk", "") or "").strip()
+    if not text or not risk:
+        return text
+    return _RISK_PHRASE_RE.sub(lambda m: m.group(0) if m.group(0).lower().replace("-", " ").startswith(risk.lower()) else f"{risk} risk", text)
+
+
+def _enforce_adt_directive(plan: str, st, directive: str) -> str:
+    """When the deterministic scheduler says the depot is DUE (administer today),
+    the Plan must say so and must not carry an invented 'next injection due
+    <date>' (MARTINEZ 10/21: the model copied a pharmacy refill date, 11/08/2026,
+    as the next dose while the depot was a month overdue)."""
+    if not plan or st is None or getattr(st, "injection", "") != "DUE" or not directive:
+        return plan
+    out = []
+    for line in plan.split("\n"):
+        if _ADT_WORD_RE.search(line):
+            line = _NEXT_DUE_CLAUSE_RE.sub("", line).rstrip(" ;,")
+        out.append(line)
+    plan = "\n".join(out)
+    if not _ADMINISTER_TODAY_RE.search(plan):
+        m = re.search(r"(?im)^[ \t]*PROBLEM\s*#\s*1\s*:[^\n]*\n", plan)
+        bullet = "- " + directive.strip() + "\n"
+        plan = (plan[:m.end()] + bullet + plan[m.end():]) if m else (plan.rstrip() + "\n" + bullet)
+    return plan
+
+
+def _fold_psa_into_cancer_problem(plan: str) -> str:
+    """With an ESTABLISHED prostate-cancer problem on the list, an 'Elevated /
+    Rising PSA' problem is a finding of that cancer, not a second problem
+    (RIOJAS 10/21: 'PROBLEM #2: Elevated PSA' beside 'PROBLEM #1: Treatment-naive
+    prostate adenocarcinoma'). Its bullets move under the cancer problem (novel
+    ones only) and the header is dropped; renumbering happens afterward."""
+    if not plan or "PROBLEM" not in plan.upper():
+        return plan
+    parts = re.split(r"(?i)(?=^[ \t]*PROBLEM\s*#\s*\d+\s*:)", plan, flags=re.M)
+    preamble, blocks = parts[0], parts[1:]
+    if len(blocks) < 2:
+        return plan
+    titled = []
+    for b in blocks:
+        m = re.match(r"(?i)\s*PROBLEM\s*#\s*\d+\s*:\s*([^\n]*)", b)
+        titled.append((m.group(1).strip() if m else "", b, m.end() if m else 0))
+    cancer_idx = next((i for i, (t, _, _) in enumerate(titled) if _PROSTATE_CANCER_TITLE_RE.search(t)), None)
+    if cancer_idx is None:
+        return plan
+    keep = []
+    for i, (t, b, body_at) in enumerate(titled):
+        if i != cancer_idx and _PSA_PROBLEM_TITLE_RE.match(t):
+            seen = {re.sub(r"[^a-z0-9]", "", u.lower()) for u in _bullet_units(titled[cancer_idx][1])}
+            extra = [u for u in _bullet_units(b[body_at:])
+                     if re.sub(r"[^a-z0-9]", "", u.lower()) not in seen]
+            if extra:
+                ct, cb, _ = titled[cancer_idx]
+                cb = cb.rstrip() + "".join(f"\n- {u}" for u in extra) + "\n\n"
+                titled[cancer_idx] = (ct, cb, _)
+            continue
+        keep.append(i)
+    return preamble + "".join(titled[i][1] for i in keep)
+
+
+_PROBLEM_REF_BEFORE = re.compile(r"(?:\bsee|\bunder|\bper|\bin|\bof|\bto|\bwith|\bfrom|\()\s*$", re.I)
+_PROBLEM_REF_AFTER = re.compile(r"^\s*(?:below|above|\)|,|;)", re.I)
+
+
+def _break_inline_problem_headers(text: str) -> str:
+    """Put every PROBLEM TITLE on its own line. A header is 'Problem #N:' (with
+    the colon) — at a line start, or run inline onto the end of a bullet by the
+    model ("... CT July 21, 2026 Problem #3: PSA elevation"). A CROSS-REFERENCE
+    ("(see PROBLEM #2 below)", "ordered under PROBLEM #1") is left inline."""
+    if not text:
+        return text
+    out, pos = [], 0
+    for m in re.finditer(r"(?i)[ \t]*Problem\s*#\s*(\d+)\s*:", text):
+        before = text[max(0, m.start() - 16):m.start()]
+        after = text[m.end():m.end() + 8]
+        if _PROBLEM_REF_BEFORE.search(before) or _PROBLEM_REF_AFTER.match(after):
+            continue
+        at_line_start = (m.start() == 0 or text[m.start() - 1] == "\n"
+                         or text[:m.start()].rstrip(" \t").endswith("\n"))
+        out.append(text[pos:m.start()].rstrip(" \t") if not at_line_start else text[pos:m.start()])
+        out.append(("\n\n" if not at_line_start or not text[:m.start()].endswith("\n\n") else "")
+                   + f"PROBLEM #{m.group(1)}:")
+        pos = m.end()
+    out.append(text[pos:])
+    return re.sub(r"\n{3,}", "\n\n", "".join(out))
+
+
+def _renumber_problems(plan: str) -> str:
+    """Renumber 'PROBLEM #N:' / 'Problem #N:' headers sequentially (1, 2, 3, ...).
+    The LLM sometimes skips or repeats a number (e.g. #1, #2, #4, #5 — #3 dropped
+    when it merged two problems); the displayed sequence must be contiguous."""
+    if not plan:
+        return plan
+    counter = [0]
+
+    def _sub(_m):
+        counter[0] += 1
+        return f"PROBLEM #{counter[0]}:"
+
+    # Only HEADER lines (a 'PROBLEM #N:' that starts its line). An in-sentence
+    # cross-reference ("(see PROBLEM #2 below)") is not a header.
+    return re.sub(r"(?im)^[ \t]*PROBLEM\s*#\s*\d+\s*:", _sub, plan)
+
+
+def _strip_leading_header(text: str, header: str) -> str:
+    """Remove duplicated leading 'ASSESSMENT:' / 'PLAN:' headers the LLM emitted
+    (the assembler adds its own). Loops so a doubled 'ASSESSMENT:\\nASSESSMENT:'
+    is fully removed — otherwise a residual header blocks the preamble scrub."""
+    if not text:
+        return text
+    prev = None
+    while prev != text:
+        prev = text
+        # Tolerate markdown bold around the header ('**ASSESSMENT:**') and an
+        # optional colon inside or outside the asterisks.
+        text = re.sub(rf"^\s*\*{{0,2}}\s*{header}\s*:?\s*\*{{0,2}}\s*:?\s*\n?",
+                      "", text, count=1, flags=re.IGNORECASE)
+    return text
+
+
+def _scrub_unproductive_plan(plan: str) -> str:
+    """Drop unproductive dash-bullets from the Plan (keeps PROBLEM headers and
+    every affirmative bullet)."""
+    if not plan:
+        return plan
+    out = []
+    for line in plan.split('\n'):
+        body = line.lstrip()
+        if body.startswith('-') and _is_unproductive_segment(body):
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
+def _scrub_unproductive_assessment(text: str) -> str:
+    """Drop whole unproductive sentences from the Assessment narrative; also trim
+    an unproductive trailing clause after ';' when the lead clause is good."""
+    if not text:
+        return text
+    sents = _re_unprod.split(r'(?<=[.!?])\s+', text.strip())
+    kept = []
+    for s in sents:
+        if _is_unproductive_segment(s):
+            # try to salvage a good lead clause before a ';'/' - ' offender
+            parts = _re_unprod.split(r'\s*[;—]\s*|\s+-\s+', s, maxsplit=1)
+            if len(parts) == 2 and not _is_unproductive_segment(parts[0]) and len(parts[0]) > 15:
+                lead = parts[0].rstrip(' ,;')
+                kept.append(lead + ('.' if not lead.endswith('.') else ''))
+            continue
+        kept.append(s)
+    return ' '.join(kept).strip()
+
+
+def _break_dash_bullets(text: str) -> str:
+    """Put each dash-delimited comment on its own line. The LLM often runs
+    Plan bullets together ("- Continue X. - Refer Y. - Order Z."); split before
+    a " - " that starts a new directive (preceded by end-of-clause, followed by
+    a capital) so it doesn't touch reference ranges (0.2 - 4.0), dosing (5-10 cc),
+    or mid-sentence dashes. Also strips stray markdown-bold leakage ("**")."""
+    import re as _re
+    if not text:
+        return text
+    text = _re.sub(r'(?<=[.\w)])[ \t]+-[ \t]+(?=[A-Z])', '\n- ', text)
+    text = text.replace('**', '')
+    text = _re.sub(r'[ \t]+\n', '\n', text)
+    return text.strip()
 
 
 def extract_prior_assessments_and_plans(
@@ -296,6 +1052,88 @@ def extract_prior_assessments_and_plans(
     return prior_assessments, prior_plans
 
 
+
+def _stage2_adt(stage1_note: str, gu_notes, non_gu_notes, raw_for_facts: str):
+    """(ADTStatus|None, directive|None, constraint|None) from the note bodies,
+    judged against the VISIT date (Stage 1 banner '| Visit:' / 'VISIT DATE:' /
+    extract banner / today)."""
+    from .adt_status import (build_adt_status, adt_plan_directive, adt_plan_constraint,
+                             adt_text_from_notes, _extract_header_visit_date as _hdr_vd)
+    raw = adt_text_from_notes((gu_notes or []) + list(non_gu_notes or []))
+    if not raw:
+        return None, None, None
+    vd = ""
+    vm = (re.search(r"\|\s*Visit:\s*(\d{1,2}/\d{1,2}/\d{4})", (stage1_note or "")[:600])
+          or re.search(r"VISIT\s+DATE:\s*(\d{1,2}/\d{1,2}/\d{4})", (stage1_note or "") + "\n" + (raw_for_facts or "")))
+    if vm:
+        vd = vm.group(1)
+    else:
+        hv = _hdr_vd(raw_for_facts or "")
+        if hv:
+            vd = f"{hv[1]:02d}/{hv[2]:02d}/{hv[0]}"
+    if not vd:
+        from datetime import datetime as _dt
+        vd = _dt.now().strftime("%m/%d/%Y")
+    st = build_adt_status(raw, visit_date=vd)
+    return st, adt_plan_directive(st), adt_plan_constraint(st)
+
+
+def _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_facts,
+                rag_content, task_config, note_type, patient_name, ssn_last4, has_cci):
+    """LLM-forward Assessment + Plan with deterministic verification. Returns the
+    assembled note, or None to fall back to the legacy agents."""
+    from .composition.context import build_chart_context
+    from .composition.ap_compose import compose_assessment_plan
+    from .composition.verify import verify_section, render_verification_notes
+    from .llm_helper import synthesize_with_llm as _synth
+
+    def _call(prompt: str) -> str:
+        return _synth(prompt=prompt, temperature=0.0, task_config=task_config, max_tokens=16000)
+
+    raw_for_facts = clinical_document or ""
+    st, directive, constraint = _stage2_adt(stage1_note, gu_notes, non_gu_notes, raw_for_facts)
+    ctx = build_chart_context(stage1_note, clinical_document or "", gu_notes, non_gu_notes,
+                              patient_facts, rag_content, directive, constraint)
+    print("\n[v3] Composing Assessment + Plan from the whole chart "
+          f"(chart {len(ctx.chart)} chars, prior notes {len(ctx.prior_clinician_notes)} chars, "
+          f"guidelines {len(ctx.guidelines)} chars)...")
+    composed = compose_assessment_plan(ctx, _call)
+    if not composed:
+        raise RuntimeError("composition v3: no usable JSON Assessment/Plan after retries "
+                           f"(prompt {len(ctx.chart)}-char chart; check the LLM response)")
+    assessment, plan, audit = composed
+    print(f"      [v3] Assessment {len(assessment)} chars; Plan {len(plan)} chars; "
+          f"attempts {audit.get('attempts')}")
+    # Deterministic VERIFICATION with quote-grounded adjudication (never silent edits).
+    va = verify_section(assessment, ctx, patient_facts, _call, is_plan=False, section="Assessment")
+    vp = verify_section(plan, ctx, patient_facts, _call, is_plan=True, section="Plan")
+    assessment, plan = va.text, vp.text
+    for a in va.applied + vp.applied:
+        print(f"      [v3] verified edit: {a[:160]}")
+    # Arithmetic authorities stay deterministic: the ADT scheduler and the data tables.
+    if st is not None and directive:
+        plan = _enforce_adt_directive(plan, st, directive)
+        assessment = _enforce_adt_in_assessment(assessment, st)
+    notes_block = render_verification_notes([va, vp], audit.get("open_questions"))
+    # Stage 1 may carry an HPI verification footer: lift it into the combined footer.
+    from .composition.hpi_compose import strip_hpi_footer, _HPI_FOOTER_RE
+    _hm = _HPI_FOOTER_RE.search(stage1_note or "")
+    if _hm:
+        _hpi_lines = [l for l in _hm.group(0).strip().split("\n")[1:] if l.strip()]
+        if _hpi_lines:
+            notes_block = (notes_block or "VERIFICATION NOTES (for the provider; not part of the note):") \
+                + "\n" + "\n".join(("- [HPI] " + l.lstrip("- ")) for l in _hpi_lines)
+        stage1_note = strip_hpi_footer(stage1_note)
+    if notes_block:
+        print("      " + notes_block.replace("\n", "\n      "))
+    final = assemble_complete_note(stage1_note=stage1_note, assessment=assessment, plan=plan,
+                                   note_type=note_type, patient_name=patient_name,
+                                   ssn_last4=ssn_last4, has_cci=has_cci)
+    if notes_block and os.environ.get("VAUCDA_COMPOSE_V3_NOTES", "1") == "1":
+        final = final.rstrip() + "\n\n" + notes_block + "\n"
+    return final
+
+
 def build_stage2_note(
     stage1_note: str,
     gu_notes: List[Dict[str, str]],
@@ -307,7 +1145,9 @@ def build_stage2_note(
     note_type: str = "clinic_note",
     patient_name: Optional[str] = None,
     ssn_last4: Optional[str] = None,
-    task_config: Optional["LLMTaskConfig"] = None
+    task_config: Optional["LLMTaskConfig"] = None,
+    patient_facts: Optional["PatientStatusFacts"] = None,
+    clinical_document: Optional[str] = None,
 ) -> str:
     """
     Complete the clinical note by adding Assessment and Plan (Stage 2).
@@ -333,6 +1173,16 @@ def build_stage2_note(
     """
     # Use task_config model if provided, otherwise use model parameter
     effective_model = task_config.model if task_config else model
+
+    # Cystoscopy notes are built complete in Stage 1 (see build_cystoscopy_note):
+    # the procedure narrative + anticipated Findings/Assessment/Plan/Disposition
+    # are already generated per-patient. Stage 2 has nothing to add — pass the
+    # note through unchanged.
+    if (note_type or "").lower().replace(" ", "_") in (
+            "cystoscopy", "cysto", "cystoscopy_note"):
+        print("\n[Stage 2] Cystoscopy note — already complete from Stage 1; passthrough.")
+        return stage1_note
+
     print("\n" + "="*80)
     print("STAGE 2: COMPLETING CLINICAL NOTE (POST-VISIT)")
     print("="*80)
@@ -359,9 +1209,9 @@ def build_stage2_note(
         prior_ap_context_for_assessment = format_prior_ap_for_assessment(prior_ap_context)
         prior_ap_context_for_plan = format_prior_ap_for_plan(prior_ap_context)
         print(f"      Prior A&P context synthesized:")
-        print(f"        - Key diagnoses: {prior_ap_context.get('key_diagnoses', [])}")
+        print(f"        - Key diagnoses: {len(prior_ap_context.get('key_diagnoses', []))} found")
         print(f"        - Prior interventions: {len(prior_ap_context.get('prior_interventions', []))} found")
-        print(f"        - Patient decisions: {prior_ap_context.get('patient_decisions', {})}")
+        print(f"        - Patient decisions: {len(prior_ap_context.get('patient_decisions', {}))} found")
         print(f"        - Resolved issues: {len(prior_ap_context.get('resolved_issues', []))}")
         print(f"        - Outstanding issues: {len(prior_ap_context.get('outstanding_issues', []))}")
     else:
@@ -435,11 +1285,29 @@ def build_stage2_note(
             if v:
                 _raw_for_facts_parts.append(v)
     _raw_for_facts = "\n\n".join(_raw_for_facts_parts)
-    patient_facts = extract_patient_status_facts(
-        stage1_note,
-        raw_clinical_text=_raw_for_facts or None,
-    )
+    # Phase 1: consume the SHARED authoritative facts from Stage 1 when
+    # provided. Re-deriving here from the rendered stage1_note (LLM output)
+    # let the Assessment ground on Stage-1 hallucinations and invent a
+    # divergent timeline/status — the dominant Stage-2 hallucination +
+    # contradiction source. Fall back to local derivation only when called
+    # standalone (no shared facts passed).
+    if patient_facts is not None:
+        print("      Using SHARED authoritative facts from Stage 1")
+    else:
+        patient_facts = extract_patient_status_facts(
+            stage1_note,
+            raw_clinical_text=_raw_for_facts or None,
+        )
     authoritative_facts = format_facts_for_prompt(patient_facts)
+
+    # Deterministic biochemical-recurrence status for post-RADIATION patients —
+    # injected so the Assessment AND Plan agents never frame a sub-Phoenix PSA as
+    # recurrence and never order PSMA PET / salvage / metastatic workup.
+    # No Phoenix framing when the facts say the course was not definitive
+    # (INCOMPLETE radiation -> phoenix_applicable False).
+    _phoenix = _phoenix_directive(stage1_note) if getattr(patient_facts, "phoenix_applicable", True) else ""
+    if _phoenix:
+        authoritative_facts = (authoritative_facts or "") + "\n\n" + _phoenix
 
     # PHASE 2.1: rebuild the HPI skeleton at Stage 2 so the Assessment
     # agent sees the same structured story the HPI was rendered from.
@@ -479,7 +1347,7 @@ def build_stage2_note(
         print(f"      Confirmed Tx:     "
               f"{patient_facts.confirmed_urologic_treatments[:3]}")
     if patient_facts.cancer_evidence:
-        print(f"      Cancer evidence: {patient_facts.cancer_evidence[:3]}")
+        print(f"      Cancer evidence: {len(patient_facts.cancer_evidence)} item(s)")
     if patient_facts.inconsistencies:
         for inc in patient_facts.inconsistencies:
             print(f"      ⚠ INCONSISTENCY: {inc}")
@@ -512,22 +1380,99 @@ def build_stage2_note(
     )
 
     # Step 2: Synthesize Assessment
+    # ---- LLM-forward composition (VAUCDA_COMPOSE_V3) ---------------------
+    # NO FALLBACK by design (user 10/21: "I want a failure so I can fix it. A
+    # fallback may pass as an OK note and mask an underlying problem."). Any
+    # composer failure propagates and the note generation fails visibly.
+    from .composition import compose_v3_enabled
+    if compose_v3_enabled():
+        if not clinical_document:
+            raise RuntimeError("composition v3: Stage 2 was called without the raw clinical document")
+        _v3 = _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_facts,
+                          rag_content, task_config, note_type, patient_name, ssn_last4,
+                          bool(calculator_results and any("charlson" in str(k).lower() or "cci" in str(k).lower()
+                                                           for k in (calculator_results or {}).keys())))
+        if not _v3:
+            raise RuntimeError("composition v3: the composer produced no usable Assessment/Plan")
+        from .text_normalizer import to_vista_ascii as _tva_v3
+        return _tva_v3(_v3)
+
     print("\n[2/6] Synthesizing Assessment (clinical impression)...")
-    assessment = synthesize_assessment(
-        stage1_note=stage1_note,
-        prior_assessments=prior_assessments,
-        ambient_transcript=ambient_transcript,
-        calculator_results=calculator_results,
-        rag_content=rag_content,
-        model=effective_model,
-        task_config=task_config,  # Pass full task_config for multi-provider LLM support
-        visit_progression=visit_progression,
-        cross_specialty_context=cross_specialty_context,
-        prior_ap_context=prior_ap_context_for_assessment,
-        authoritative_facts=authoritative_facts,
-        hpi_skeleton=_stage2_skeleton_text,
-    )
+
+    def _do_synthesize_assessment():
+        return synthesize_assessment(
+            stage1_note=stage1_note,
+            prior_assessments=prior_assessments,
+            ambient_transcript=ambient_transcript,
+            calculator_results=calculator_results,
+            rag_content=rag_content,
+            model=effective_model,
+            task_config=task_config,  # full task_config for multi-provider LLM support
+            visit_progression=visit_progression,
+            cross_specialty_context=cross_specialty_context,
+            prior_ap_context=prior_ap_context_for_assessment,
+            authoritative_facts=authoritative_facts,
+            hpi_skeleton=_stage2_skeleton_text,
+        )
+
+    assessment = _do_synthesize_assessment()
+    # Retry on a transient empty/failed Assessment (LLM timeout / API error) so a
+    # note never ships without an Assessment.
+    _asmt_attempts = 0
+    while (not assessment or not assessment.strip()) and _asmt_attempts < 2:
+        _asmt_attempts += 1
+        logger.warning("Assessment synthesis returned empty — retrying (%d/2)", _asmt_attempts)
+        print(f"      ⚠ Assessment empty — retrying ({_asmt_attempts}/2)...")
+        assessment = _do_synthesize_assessment()
     print(f"      Assessment: {len(assessment) if assessment else 0} chars")
+
+    # Deterministic fact guard on the GENERATED assessment. The sanitizer runs
+    # on the input CONTEXT above, but the LLM can still emit a contradicting
+    # sentence (a prostate-cancer diagnosis for an ABSENT / female patient, a
+    # treatment assertion for a treatment-naive patient). Strip those here;
+    # negated ("no evidence of prostate cancer") and workup ("mpMRI to evaluate")
+    # mentions are preserved by the sanitizer's negation guard. Runs BEFORE the
+    # Plan so the Plan is generated congruent with the cleaned Assessment.
+    if patient_facts is not None and assessment:
+        assessment, _asmt_dropped = sanitize_context_against_facts(assessment, patient_facts)
+        if _asmt_dropped:
+            logger.info("Assessment fact-guard dropped %d sentence(s)", len(_asmt_dropped))
+            print(f"      Fact-guard: dropped {len(_asmt_dropped)} contradicting sentence(s) from Assessment")
+
+    # Finalize: strip hallucinated scanner/metadata garbage + completeness-repair
+    # so every documented cancer the patient has is addressed (compose -> ledger
+    # -> repair). Safe no-op without facts / on error.
+    if assessment:
+        try:
+            from .agents.assessment_composer import finalize_assessment
+            from .llm_helper import synthesize_with_llm
+
+            def _asmt_repair_call(_p: str) -> str:
+                return synthesize_with_llm(prompt=_p, temperature=0.0,
+                                           task_config=task_config, max_tokens=900)
+
+            assessment = finalize_assessment(
+                assessment, stage1_note, patient_facts, _asmt_repair_call)
+            # Temporal-validity pass: no vague recency, volatile statuses dated,
+            # latest-observation-wins. (VAUCDA_TEMPORAL_AP)
+            from .temporal_checks import finalize_temporal, psa_section
+            assessment = finalize_temporal(
+                assessment, patient_facts, psa_section(stage1_note),
+                _asmt_repair_call, "Assessment", ref_note=stage1_note,
+                raw_text=_raw_for_facts or "")
+            # Liver-directed-therapy guard: strip TACE/Y90/(chemo|radio)-
+            # embolization from GU-cancer sentences that carry no hepatic
+            # referent (the hepatic plan belongs to a concurrent HCC, not the
+            # renal/urothelial/prostate primary).
+            from .cc_checks import scrub_liver_therapy_prose
+            assessment = scrub_liver_therapy_prose(assessment)
+            assessment = _break_dash_bullets(assessment)
+            assessment = _scrub_unproductive_assessment(assessment)
+            assessment = _strip_negative_recs(assessment, is_plan=False)
+            assessment = _scrub_incomplete_radiation_framing(assessment, patient_facts)
+            assessment = _enforce_risk_category(assessment, patient_facts)
+        except Exception as _ae:  # noqa: BLE001
+            logger.warning(f"Assessment finalize skipped: {_ae}")
 
     # Step 3: Verify Assessment
     # CRITICAL: Use session-isolated verifier to prevent cross-patient data contamination
@@ -559,27 +1504,155 @@ def build_stage2_note(
     else:
         print(f"      ✓ Assessment verified (confidence: {assessment_verification['confidence_score']}%)")
 
+    # Wire the deterministic ADT determination into the Plan (VAUCDA_ADT_PLAN).
+    # Parse the already-correct ADT section from the Stage 1 note, map it to an
+    # actionable directive, and feed it to the Plan LLM as authoritative context
+    # (a deterministic backstop below guarantees it lands even if the LLM omits it).
+    import os as _os_adt
+    _adt_directive = None
+    _plan_facts = authoritative_facts
+    _adt_st = None
+    if _os_adt.environ.get("VAUCDA_ADT_PLAN", "1") == "1":
+        try:
+            # Recompute the ADT status from the RAW notes (gu + non-gu content) —
+            # NOT the rendered section (now the clean Status/Started/Completed
+            # format) and NOT the rendered prose (which misfires the extractor).
+            # This preserves the full dosing directive (DUE/ordered/lapsed) for
+            # the Plan even though the visible ADT section is minimal.
+            from .adt_status import (build_adt_status, adt_plan_directive,
+                                     adt_plan_constraint, adt_text_from_notes)
+            # Each body is re-dated with its note's date so the nursing
+            # "Administered Eligard ..." record keeps the date the splitter
+            # stripped (the "Local Title" header line).
+            _adt_raw = adt_text_from_notes((gu_notes or []) + (non_gu_notes or []))
+            # The scheduler must judge DUE/NOT_DUE against TODAY's visit, not the
+            # newest note date (MARTINEZ: last depot 03/18, visit 10/21 -> DUE,
+            # but without the visit date it read 'up to date, due 09/18').
+            from .adt_status import _extract_header_visit_date as _hdr_vd
+            _vd = ""
+            _vm = (re.search(r"\|\s*Visit:\s*(\d{1,2}/\d{1,2}/\d{4})", (stage1_note or "")[:600])
+                   or re.search(r"VISIT\s+DATE:\s*(\d{1,2}/\d{1,2}/\d{4})",
+                                (stage1_note or "") + "\n" + (_raw_for_facts or "")))
+            if _vm:
+                _vd = _vm.group(1)
+            else:
+                _hv = _hdr_vd(_raw_for_facts or "")
+                if _hv:
+                    _vd = f"{_hv[1]:02d}/{_hv[2]:02d}/{_hv[0]}"
+            if not _vd:
+                from datetime import datetime as _dt_now
+                _vd = _dt_now.now().strftime("%m/%d/%Y")   # Stage 2 runs at/after the visit
+            _adt_st = build_adt_status(_adt_raw, visit_date=_vd) if _adt_raw else None
+            _adt_directive = adt_plan_directive(_adt_st) if _adt_st else None
+            if _adt_directive:
+                _plan_facts = ((authoritative_facts or "")
+                               + "\n\nADT — PLAN DIRECTIVE (deterministic ADT scheduler; "
+                               "reflect this action in the Plan and do not contradict it):\n- "
+                               + _adt_directive + "\n")
+            else:
+                # Historical course: no Plan item at all, only a prompt-side
+                # guard so the LLM does not copy an injection forward.
+                _adt_guard = adt_plan_constraint(_adt_st) if _adt_st else None
+                if _adt_guard:
+                    _plan_facts = ((authoritative_facts or "")
+                                   + "\n\nADT — HISTORICAL (deterministic ADT scheduler; "
+                                   "this is a constraint, not note text):\n- "
+                                   + _adt_guard + "\n")
+        except Exception as _ade:  # noqa: BLE001
+            logger.warning(f"ADT plan directive skipped: {_ade}")
+
     # Step 4: Synthesize Plan
     print("\n[4/6] Synthesizing Plan (treatment plan)...")
-    plan = synthesize_plan(
-        stage1_note=stage1_note,
-        prior_plans=prior_plans,
-        ambient_transcript=ambient_transcript,
-        calculator_results=calculator_results,
-        rag_content=rag_content,
-        model=effective_model,
-        task_config=task_config,  # Pass full task_config for multi-provider LLM support
-        visit_progression=visit_progression,
-        cross_specialty_context=cross_specialty_context,
-        prior_ap_context=prior_ap_context_for_plan,
-        authoritative_facts=authoritative_facts,
-        # Pass the just-generated Assessment so the Plan can be congruent
-        # with the recommendations the Assessment narrative makes. Without
-        # this the two sections drift (e.g. Assessment says "MRI 6-12
-        # months", Plan says "MRI + biopsy").
-        assessment_text=assessment,
-    )
+
+    def _do_synthesize_plan():
+        return synthesize_plan(
+            stage1_note=stage1_note,
+            prior_plans=prior_plans,
+            ambient_transcript=ambient_transcript,
+            calculator_results=calculator_results,
+            rag_content=rag_content,
+            model=effective_model,
+            task_config=task_config,  # full task_config for multi-provider LLM support
+            visit_progression=visit_progression,
+            cross_specialty_context=cross_specialty_context,
+            prior_ap_context=prior_ap_context_for_plan,
+            authoritative_facts=_plan_facts,
+            # Pass the just-generated Assessment so the Plan can be congruent
+            # with the recommendations the Assessment narrative makes.
+            assessment_text=assessment,
+        )
+
+    plan = _do_synthesize_plan()
+    # Retry on a transient empty/failed Plan synthesis — a note must NEVER ship
+    # without a Plan. An LLM timeout (e.g. 60s on a large chart with many injected
+    # rules) or a transient API error otherwise silently drops the whole Plan.
+    _plan_attempts = 0
+    while (not plan or not plan.strip()) and _plan_attempts < 2:
+        _plan_attempts += 1
+        logger.warning("Plan synthesis returned empty — retrying (%d/2)", _plan_attempts)
+        print(f"      ⚠ Plan empty — retrying ({_plan_attempts}/2)...")
+        plan = _do_synthesize_plan()
     print(f"      Plan: {len(plan) if plan else 0} chars")
+
+    # Same deterministic fact guard on the generated Plan.
+    if patient_facts is not None and plan:
+        plan, _plan_dropped = sanitize_context_against_facts(plan, patient_facts)
+        if _plan_dropped:
+            logger.info("Plan fact-guard dropped %d sentence(s)", len(_plan_dropped))
+            print(f"      Fact-guard: dropped {len(_plan_dropped)} contradicting sentence(s) from Plan")
+
+    # Strip hallucinated scanner/CPT-metadata plan bullets (congruent with the
+    # Assessment garbage strip).
+    if plan:
+        try:
+            from .agents.assessment_composer import strip_garbage_lines
+            plan = strip_garbage_lines(plan)
+            # Temporal-validity pass on the Plan: no vague recency ("repeat
+            # recent MRI" -> the date), volatile statuses dated, latest-wins.
+            from .temporal_checks import finalize_temporal, psa_section
+            from .llm_helper import synthesize_with_llm as _synth_plan
+
+            def _plan_temporal_call(_p: str) -> str:
+                return _synth_plan(prompt=_p, temperature=0.0,
+                                   task_config=task_config, max_tokens=1200)
+
+            _pl = len(plan)
+            plan = finalize_temporal(plan, patient_facts, psa_section(stage1_note),
+                                     _plan_temporal_call, "Plan", ref_note=stage1_note,
+                                     raw_text=_raw_for_facts or "")
+            logger.info("Plan post: finalize_temporal %d -> %d chars", _pl, len(plan or ""))
+            plan = _break_dash_bullets(plan)
+            # Headers on their own lines BEFORE the bullet-level scrubs, so a
+            # 'Problem #N:' the model (or a rewrite) ran inline onto a bullet is
+            # never trimmed away as if it were a clause of that bullet.
+            plan = _break_inline_problem_headers(plan)
+            logger.info("Plan post: break_dash_bullets -> %d chars", len(plan or ""))
+            plan = _scrub_unproductive_plan(plan)
+            logger.info("Plan post: scrub_unproductive -> %d chars", len(plan or ""))
+            plan = _strip_negative_recs(plan, is_plan=True)
+            logger.info("Plan post: strip_negative_recs -> %d chars", len(plan or ""))
+            plan = _strip_contradicted_recurrence_workup(plan, assessment, stage1_note)
+            logger.info("Plan post: strip_contradicted_recurrence -> %d chars", len(plan or ""))
+            plan = _scrub_incomplete_radiation_framing(plan, patient_facts)
+            plan = _enforce_risk_category(plan, patient_facts)
+        except Exception as _ppe:  # noqa: BLE001
+            logger.warning("Plan post-processing step failed (keeping last good text): %s", _ppe)
+
+    # Deterministic ADT backstop: guarantee the ADT action lands in the Plan. If
+    # the LLM plan doesn't already address ADT / the depot agent, append the
+    # deterministic directive as its own bullet so the injection decision is never
+    # silently dropped (mirrors the pathology / weight-anchor pattern).
+    if _adt_directive and plan and not re.search(
+            r"\b(?:ADT|androgen\s+deprivation|eligard|lupron|leuprolide|degarelix|"
+            r"goserelin|firmagon|orgovyx|relugolix|depot\s+injection)\b", plan, re.I):
+        plan = plan.rstrip() + "\n- " + _adt_directive
+    try:
+        if plan and _adt_directive:
+            plan = _enforce_adt_directive(plan, _adt_st, _adt_directive)
+        if assessment and _adt_st is not None:
+            assessment = _enforce_adt_in_assessment(assessment, _adt_st)
+    except Exception as _ade2:  # noqa: BLE001
+        logger.warning("ADT directive enforcement skipped: %s", _ade2)
 
     # Step 5: Verify Plan
     print("\n[5/6] Verifying Plan against source data...")
@@ -598,13 +1671,17 @@ def build_stage2_note(
 
     # Step 6: Assemble complete note
     print("\n[6/6] Assembling complete clinical note (with temporal awareness and cross-specialty integration)...")
+    _has_cci = bool(calculator_results) and any(
+        ('cci' in str(k).lower() or 'charlson' in str(k).lower())
+        for k in (calculator_results or {}).keys())
     complete_note = assemble_complete_note(
         stage1_note=stage1_note,
         assessment=assessment,
         plan=plan,
         note_type=note_type,
         patient_name=patient_name,
-        ssn_last4=ssn_last4
+        ssn_last4=ssn_last4,
+        has_cci=_has_cci
     )
 
     print(f"      Complete note: {len(complete_note)} characters")
@@ -623,7 +1700,8 @@ def assemble_complete_note(
     plan: str,
     note_type: str = "clinic_note",
     patient_name: Optional[str] = None,
-    ssn_last4: Optional[str] = None
+    ssn_last4: Optional[str] = None,
+    has_cci: bool = False
 ) -> str:
     """
     Combine Stage 1 note with Assessment and Plan sections.
@@ -651,6 +1729,28 @@ def assemble_complete_note(
     # Add Stage 1 note
     note_parts.append(stage1_note)
 
+    # Deterministic A&P finishing: resolve "[date of service]" placeholders,
+    # drop a fabricated Charlson score when no CCI calculator was run, and remove
+    # any duplicated leading section header the LLM emitted. (has_cci is passed in
+    # from build_stage2_note, which holds calculator_results.)
+    if assessment:
+        assessment = _scrub_ap_artifacts(_strip_leading_header(assessment, "ASSESSMENT"),
+                                         has_cci)
+    logger.info("assemble: assessment=%d chars, plan=%d chars",
+                len(assessment or ""), len(plan or ""))
+    if plan:
+        plan = _scrub_ap_artifacts(_strip_leading_header(plan, "PLAN"), has_cci)
+        logger.info("assemble: plan after scrub_ap_artifacts=%d", len(plan or ""))
+        # Inline headers onto their own lines FIRST: dedupe and renumber only
+        # see a header at a line start, so an inline 'Problem #4:' used to skip
+        # renumbering and ship as '#1, #2, #4'.
+        plan = _break_inline_problem_headers(plan)
+        plan = _fold_psa_into_cancer_problem(plan)
+        plan = _dedupe_problems(plan)
+        logger.info("assemble: plan after dedupe_problems=%d", len(plan or ""))
+        plan = _renumber_problems(plan)
+        logger.info("assemble: plan after renumber_problems=%d", len(plan or ""))
+
     # Add Assessment
     if assessment and assessment.strip():
         note_parts.append(f"\nASSESSMENT:\n{assessment}\n")
@@ -668,7 +1768,10 @@ def assemble_complete_note(
 
     # Post-processing: Format "Problem #N" as "\nPROBLEM #N" for visual separation
     import re
-    final = re.sub(r'\n?Problem\s*#', '\n\nPROBLEM #', final, flags=re.IGNORECASE)
+    # Only a header — 'PROBLEM #N:' at the start of a line. The old pattern
+    # matched EVERY 'Problem #', so a bullet's cross-reference "(see PROBLEM #2
+    # below)" was torn in two and rendered as a bogus header (CARO 10/16).
+    final = _break_inline_problem_headers(final)
     # Clean up any triple+ newlines created above
     final = re.sub(r'\n{3,}', '\n\n', final)
 

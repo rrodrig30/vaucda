@@ -178,6 +178,10 @@ class UserPreferences(Base):
     stage2_use_graphrag = Column(Boolean, nullable=True)  # Default from env: STAGE2_USE_GRAPHRAG
     stage2_rag_top_k = Column(Integer, nullable=True)  # Default from env: STAGE2_RAG_TOP_K
 
+    # GraphRAG knowledge-graph BUILD/retrieval model (entity extraction,
+    # community summarization, map-reduce). NULL -> env GRAPHRAG_LLM_MODEL.
+    graphrag_llm_model = Column(String(100), nullable=True)
+
     # Template preferences
     default_template = Column(String(100), nullable=False, default="urology_clinic")
 

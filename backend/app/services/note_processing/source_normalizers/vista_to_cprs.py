@@ -62,6 +62,17 @@ _KNOWN_CODES = (
     "SLT", "CH", "MIC", "AR", "SPN", "CT",
 )
 
+# Sentinel line prepended to the RXOP-derived medication block. The VistA
+# RXOP "OUTPT RX-ACTIVE ONLY" list is the AUTHORITATIVE current-medication
+# list as of collection; embedded note med-reconciliation blocks share the
+# "Active Outpatient Medications" header but are stale. Downstream current-med
+# extraction keys on this sentinel to read only the authoritative list.
+RXOP_AUTHORITATIVE_SENTINEL = (
+    "=== CURRENT OUTPATIENT MEDICATIONS — VistA RXOP active prescriptions as "
+    "of collection (AUTHORITATIVE; supersedes any med list embedded in older "
+    "notes) ==="
+)
+
 # Real-world VistA headers are surrounded by dash padding so they look
 # like ASCII separator bars:
 #
@@ -171,11 +182,22 @@ _UROLOGIC_BY_MODALITY_ALONE_RE = re.compile(
     r"\b(?:"
     r"bone\s+scan|"
     r"nuclear\s+med(?:icine)?\s+bone|"
+    r"NM\s+bone|"
     r"PSMA(?:[\s\-]?PET(?:/CT)?)?|"
+    # VistA titles a PSMA study by field of view, not tracer: "PET/CT SKULL BASE
+    # TO MID-THIGH", "PET/CT WHOLE BODY" — no anatomy word, so the anatomy gate
+    # dropped every PSMA PET from the IMAGING section (GORDEN 11/15/2024). In a
+    # urology note a PET/CT is kept by modality alone.
+    r"PET(?:[\s/]?CT)?|"
     r"MR\s*UROGRAM"
     r")\b",
     re.IGNORECASE,
 )
+# Radiology report boilerplate that follows the impression in VistA II bodies.
+_II_BOILERPLATE_CUT_RE = re.compile(
+    r"EANM\s+STANDARDIZED\s+REPORTING|PSMA[\s-]?RADS\s+(?:VERSION|V\d|SCORING)|"
+    r"I,\s+the\s+attending\s+physician|SCORE\s+DEFINITION\s+1\.|"
+    r"This\s+report\s+was\s+(?:dictated|generated)|Dictated\s+by|Transcribed\s+by", re.IGNORECASE)
 
 
 def _is_urologic_imaging_study(study_block: str) -> bool:
@@ -452,12 +474,24 @@ def _render_medications_from_rxop(rxop_body: str) -> str:
     if cur_name:
         _flush()
 
+    # Sentinel marking THIS block as the authoritative current-meds list
+    # (VistA RXOP active outpatient Rx as of collection). Embedded
+    # med-reconciliation blocks inside old notes carry the same
+    # "Active Outpatient Medications" header but are STALE snapshots; the
+    # current-meds extractor keys on this sentinel to read only the
+    # authoritative list. See RXOP_AUTHORITATIVE_SENTINEL.
     if not blocks:
-        return ("Active Outpatient Medications (including Supplies):\n"
-                + rxop_body.strip() + "\n")
+        # "No data available" / unparseable: authoritative source says the
+        # patient has no active outpatient prescriptions.
+        return (
+            RXOP_AUTHORITATIVE_SENTINEL + "\n"
+            + "Active Outpatient Medications (including Supplies):\n"
+            + rxop_body.strip() + "\n"
+        )
 
     return (
-        "Active Outpatient Medications (including Supplies):\n"
+        RXOP_AUTHORITATIVE_SENTINEL + "\n"
+        + "Active Outpatient Medications (including Supplies):\n"
         + "\n".join(blocks)
         + "\n"
         + "=" * 79
@@ -518,6 +552,10 @@ def _render_imaging_from_ii(ii_body: str) -> str:
     for chunk in study_blocks:
         # First line: "MM/DD/YYYY  PROCEDURE NAME  CPT  Status  Case#"
         first_line, _, rest = chunk.partition("\n")
+        # Status column: "Verified" (VA read) vs "Electronica[lly filed]" (an
+        # outside study whose report text is usually NOT in the VA record).
+        _st = re.search(r"\s\d{3,5}\s+(Verified|Electronica\w*|Pending|Cancelled)\b", first_line, re.I)
+        is_efiled = bool(_st and _st.group(1).lower().startswith("electronica"))
         m = re.match(
             r"^(\d{1,2})/(\d{1,2})/(\d{4})\s+(.+?)\s+\d{3,5}\s+\w+\s+\d+\s*$",
             first_line,
@@ -626,6 +664,14 @@ def _render_imaging_from_ii(ii_body: str) -> str:
                 continue
             impression_lines.append(ln)
         impression = " ".join(impression_lines).strip()
+        # Cut trailing reporting-standard boilerplate / attestation.
+        impression = _II_BOILERPLATE_CUT_RE.split(impression, maxsplit=1)[0].strip()
+        if not impression and is_efiled:
+            # Electronically filed outside study with no report text in the VA
+            # record (ALEJANDRO: PSMA PET/CT 08/24/2025 at Baptist, CT urogram
+            # 08/06/2025). State that fact — it is not a finding — so the study
+            # is not silently absent from the note.
+            is_outside_study = True
         if not impression and not is_outside_study:
             # No usable body content for this study AND not flagged as
             # an outside study. Per provider direction, do NOT emit a
@@ -641,7 +687,10 @@ def _render_imaging_from_ii(ii_body: str) -> str:
         # existence of an unread outside study than to drop the row.
         if is_outside_study:
             disclaimer = ("This study originated from outside the VA and "
-                          "has not been read by VA radiology.")
+                          "has not been read by VA radiology."
+                          + (" No report text is filed in the VA record; see the "
+                             "clinic-note narrative for the outside read."
+                             if (is_efiled and not impression) else ""))
             impression = (
                 f"{disclaimer} {impression}".strip()
                 if impression else disclaimer
@@ -811,6 +860,16 @@ def _render_pathology_from_sp(sp_body: str) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+# Qualitative results on VistA lab rows (urinalysis, microbiology, POC):
+# "URINE PROTEIN    Negative    mg/dL    Ref: Negative", "APPEARANCE  Clear",
+# "URINE COLOR  Dark Yellow". A numeric-only result pattern silently dropped
+# every one of these from the six-month Chem & Hematology block.
+_QUALITATIVE_RESULT = (
+    r"(?:Negative|Positive|Trace|Normal|Abnormal|Clear|Cloudy|Turbid|Hazy|Dark\s+Yellow|"
+    r"Light\s+Yellow|Yellow|Amber|Straw|Orange|Red|Brown|Colorless|Small|Moderate|Large|"
+    r"Rare|Few|Many|Occasional|Detected|Not\s+Detected|Reactive|Non-?reactive|"
+    r"Present|Absent|Intact|Adequate|Inadequate)(?![A-Za-z])"
+)
 _VISTA_LAB_ROW_RE = re.compile(
     # CRITICAL: every inter-field separator uses [ \t]+ rather than \s+
     # so a missing trailing field (e.g. "STRUVITE (442)  0.04" with no
@@ -821,9 +880,9 @@ _VISTA_LAB_ROW_RE = re.compile(
     r"^(\d{1,2})/(\d{1,2})/(\d{4})[ \t]+(\d{1,2}:\d{2})[ \t]+"
     r"(\S+)[ \t]+"             # specimen (SERUM / URINE / FECES / BLOOD)
     r"(.+?)[ \t]{2,}"          # test name (ends at >=2-space gap)
-    r"([<>]?\d+\.?\d*)"        # numeric result
+    r"([<>]?\d+\.?\d*|" + _QUALITATIVE_RESULT + r")"   # numeric OR qualitative result
     r"[ \t]*([HL]?)[ \t]*"     # H / L flag
-    r"([A-Za-z%/0-9.]*)"       # units
+    r"((?!Ref\b)[A-Za-z%/0-9.]*)"   # units (never the 'Ref:' label of a qualitative row)
     r"[ \t]*([^\n]*)$",        # ref range — explicit non-newline
     re.MULTILINE,
 )
@@ -833,8 +892,8 @@ _VISTA_LAB_ROW_RE = re.compile(
 _VISTA_LAB_DITTO_RE = re.compile(
     r'^\s*"\s+"\s+"?\s*'
     r"(.+?)\s{2,}"
-    r"([<>]?\d+\.?\d*)\s*([HL]?)\s*"
-    r"([A-Za-z%/0-9.]*)\s*(.*)$",
+    r"([<>]?\d+\.?\d*|" + _QUALITATIVE_RESULT + r")\s*([HL]?)\s*"
+    r"((?!Ref\b)[A-Za-z%/0-9.]*)\s*(.*)$",
     re.MULTILINE,
 )
 

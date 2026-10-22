@@ -1,0 +1,27 @@
+{
+  "patient_id": "ASHFORD",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/ashford_verify/in/ASHFORD.txt",
+  "primary_diagnosis": {
+    "organ": "renal",
+    "malignancy": "indeterminate"
+  },
+  "cancer_organs": [],
+  "forbidden_diagnoses": [
+    "metastatic prostate cancer",
+    "prostate cancer"
+  ],
+  "forbidden_psa": [
+    4.6,
+    4.8,
+    4.9,
+    5.1,
+    4.7,
+    4.3
+  ],
+  "notes": "9mm right renal mass, unbiopsied -> indeterminate; PSA truly <1.0 (lab), 4.x curve is spurious"
+}

@@ -46,34 +46,8 @@ def extract_psh(note_content: str) -> str:
 
     if match:
         raw_psh = match.group(1)
-
-        # Post-process: stop at MEDICATIONS, FAMILY HISTORY, or blank line
-        lines = raw_psh.split('\n')
-        psh_lines = []
-        for line in lines:
-            # Stop if we hit a section header or blank line
-            if any(header in line.upper() for header in ['MEDICATIONS:', 'FAMILY HISTORY:', 'ALL NO KNOWN']):
-                break
-            if not line.strip():  # Blank line
-                break
-            if line.strip():
-                psh_lines.append(line.strip())
-
-        psh_text = '\n'.join(psh_lines)
-
-        # Parse numbered list format
-        # Example: "1. Surgery\n2. Another surgery"
-        lines = psh_text.split('\n')
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            # Remove leading numbers and periods
-            clean_line = re.sub(r'^\d+\.\s*', '', line)
-            if clean_line:
-                all_surgeries.add(clean_line)
+        for entry in _parse_psh_block(raw_psh):
+            all_surgeries.add(entry)
 
     # ======================================================================
     # PHASE 2: Extract surgeries from HPI/narrative text
@@ -87,6 +61,63 @@ def extract_psh(note_content: str) -> str:
     if all_surgeries:
         return '\n'.join(sorted(all_surgeries))
     return ""
+
+
+# CPRS "Surgical History" table row: "MM/DD/YYYY   Procedure name   (COMPLETED)".
+# A long name WRAPS onto indented continuation lines ("Partial removal and
+# revision of" / "penile prosthesis"); ancillary CPT rows (CONSCIOUS SEDATION,
+# SONOGRAPHY GUIDE FOR SURGERY) ride under the procedure of the same date.
+_PSH_TABLE_ROW_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\s{2,}(\S.*?)\s*$")
+_PSH_STATUS_RE = re.compile(
+    r"\s*\((?:COMPLETED|SCHEDULED|CANCELL?ED|PENDING|NOT\s+COMPLETED|IN\s+PROGRESS|"
+    r"REQUESTED|ABORTED|DONE)\)\s*", re.I)
+_PSH_ANCILLARY_RE = re.compile(
+    r"^(?:CONSCIOUS\s+SEDATION|MODERATE\s+SEDATION|(?:GENERAL|LOCAL|REGIONAL|SPINAL|MAC)\s+ANESTHESIA|"
+    r"ANESTHESIA(?:\s+SERVICES?)?|SONOGRAPHY\s+GUIDE(?:\s+FOR\s+SURGERY)?|ULTRASOUND\s+GUID\w+|"
+    r"FLUOROSCOP\w*(?:\s+GUID\w+)?|(?:NERVE|PENILE|CAUDAL)\s+BLOCK|INTRAOP\w*\s+MONITORING)\s*$", re.I)
+_PSH_SECTION_STOP = ('MEDICATIONS:', 'FAMILY HISTORY:', 'ALL NO KNOWN')
+
+
+def _parse_psh_block(raw_psh: str) -> List[str]:
+    """Turn the text under a PSH header into surgery entries. Plain lines keep
+    their text (leading list numbers removed). CPRS table rows become
+    'Procedure name (MM/DD/YYYY)' with wrapped continuation lines joined, the
+    STATUS parenthetical dropped, and ancillary anesthesia/guidance rows
+    skipped (TAYLOR 10/21: '/13/2021 Partial removal and revision of
+    (COMPLETED)' plus stray 'CONSCIOUS SEDATION' entries)."""
+    entries: List[str] = []
+    cur = None          # [name, date] of the table row being assembled
+
+    def _flush():
+        nonlocal cur
+        if cur:
+            name = re.sub(r"\s+", " ", _PSH_STATUS_RE.sub(" ", cur[0])).strip(" ,;-")
+            if name and not _PSH_ANCILLARY_RE.match(name):
+                entries.append(f"{name} ({cur[1]})")
+        cur = None
+
+    for line in raw_psh.split("\n"):
+        if any(h in line.upper() for h in _PSH_SECTION_STOP) or not line.strip():
+            break
+        row = _PSH_TABLE_ROW_RE.match(line)
+        if row:
+            _flush()
+            cur = [row.group(2), row.group(1)]
+            continue
+        text = line.strip()
+        indented = line[:1].isspace() and not re.match(r"^\d+[.)]\s", text)
+        if cur is not None and indented:
+            if _PSH_ANCILLARY_RE.match(_PSH_STATUS_RE.sub(" ", text).strip()):
+                continue                      # ancillary CPT row under the same date
+            cur[0] += " " + text              # wrapped procedure name
+            continue
+        _flush()
+        clean = _PSH_STATUS_RE.sub(" ", re.sub(r"^\d+\.\s*", "", text)).strip()
+        clean = re.sub(r"\s+", " ", clean)
+        if clean and not _PSH_ANCILLARY_RE.match(clean):
+            entries.append(clean)
+    _flush()
+    return entries
 
 
 def extract_narrative_surgeries(text: str) -> List[str]:

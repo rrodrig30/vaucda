@@ -83,7 +83,7 @@ export interface User {
 // Note Generation Types
 export interface NoteGenerationRequest {
   clinical_input: string
-  note_type: 'clinic_note' | 'consult' | 'preop' | 'postop'
+  note_type: 'clinic_note' | 'consult' | 'preop' | 'postop' | 'cystoscopy'
   template_id?: string
   selected_modules?: string[]
   llm_config: LLMConfig
@@ -229,8 +229,16 @@ export interface UserSettings {
   ocr_llm?: TaskLLMConfig
   stage1_llm?: TaskLLMConfig
   stage2_llm?: Stage2LLMConfig
+  // GraphRAG knowledge-graph build/retrieval model (blank -> server default).
+  graphrag_llm_model?: string
   // Source EHR format of pasted/uploaded charts: 'cprs' (default) or 'vista'.
   source_format?: 'cprs' | 'vista'
+  // LLM provider API keys — server never returns the key itself, only whether
+  // one is configured plus a masked last-4 hint.
+  anthropic_configured?: boolean
+  openai_configured?: boolean
+  anthropic_key_hint?: string | null
+  openai_key_hint?: string | null
 }
 
 export interface ModuleDefaults {
@@ -285,7 +293,11 @@ export interface UpdateSettingsRequest {
   stage2_use_rag?: boolean
   stage2_use_graphrag?: boolean
   stage2_rag_top_k?: number
+  graphrag_llm_model?: string
   source_format?: 'cprs' | 'vista'
+  // LLM provider API keys: send a value to set, '' to clear, omit to leave as-is.
+  anthropic_api_key?: string
+  openai_api_key?: string
 }
 
 // Task-Specific LLM Configuration
@@ -513,7 +525,7 @@ export interface CalculatorSuggestion {
 // Stage 1: Initial Note Request
 export interface InitialNoteRequest {
   clinical_input: string
-  note_type?: 'urology_clinic' | 'urology_consult'
+  note_type?: 'urology_clinic' | 'urology_consult' | 'cystoscopy'
   patient_name?: string
   ssn_last4?: string
   visit_date?: string  // MM/DD/YYYY - used for IPSS date and accurate age calculation

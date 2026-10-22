@@ -20,11 +20,23 @@ GENERAL_LABS_WINDOW_MONTHS = 6
 # Lab filtering configuration
 # Define which labs to keep for each category
 CBC_KEEP = {'WBC', 'HEMOGLOBIN', 'HGB', 'HEMATOCRIT', 'HCT', 'PLT', 'PLATELET', 'PLATELETS'}
-BMP_KEEP = {'BUN', 'CREATININE', 'CREAT', 'EGFR', 'GFR'}
-UA_KEEP = {'SG', 'SPECIFIC GRAVITY', 'PH', 'GLU', 'GLUCOSE', 'PRO', 'PROTEIN', 'URINALYSIS'}
+BMP_KEEP = {'EGFRCKDEPI',  'BUN', 'CREATININE', 'CREAT', 'EGFR', 'GFR'}
+# Liver enzymes (user 10/21: keep routinely — ARPI/abiraterone monitoring, pre-op).
+HEPATIC_KEEP = {'AST', 'ALT', 'SGOT', 'SGPT', 'SGOT(AST)', 'SGPT(ALT)', 'AST(SGOT)', 'ALT(SGPT)',
+                'ALKALINE PHOSPHATASE', 'ALK PHOS', 'ALKP', 'BILIRUBIN', 'BILIRUBIN,TOTAL',
+                'TOTAL BILIRUBIN', 'GGT', 'GAMMA GT'}
+UA_KEEP = {'SG', 'SPECIFIC GRAVITY', 'PH', 'GLU', 'GLUCOSE', 'PRO', 'PROTEIN', 'URINALYSIS',
+           # urologically decision-driving UA components (hematuria / UTI)
+           'BLOOD', 'RBC', 'NITRITE', 'LEU', 'LEUKOCYTE', 'BACTERIA'}
+# A qualitative ABNORMAL result ("Positive", "Trace", "Large") is kept like an H/L flag.
+_QUAL_ABNORMAL_RE = re.compile(
+    r'\b(?:Positive|Trace|Small|Moderate|Large|Many|Abnormal|Cloudy|Turbid|Hazy|Detected|Reactive)\b')
 
 # Always report these regardless of filtering
 ALWAYS_REPORT = {
+    # Bone-metastasis marker in prostate cancer (was only ever kept by the old
+    # 'PH' substring accident — keep it on purpose).
+    'ALKALINE PHOSPHATASE', 'ALK PHOS', 'ALKP',
     'TESTOSTERONE', 'TOTAL TESTOSTERONE', 'FREE TESTOSTERONE',
     'ESTROGEN', 'ESTROGENS', 'TOTAL ESTROGENS',
     'LH', 'FSH',
@@ -34,6 +46,22 @@ ALWAYS_REPORT = {
     'LDH', 'LACTATE DEHYDROGENASE',
     'URORISK'  # Report all Urorisk components
 }
+
+
+def _name_has_token(test_name: str, token: str) -> bool:
+    """Keep-list membership by WHOLE token (an optional plural S allowed:
+    PLT/PLTS), never by substring — 'PH' used to match DERMATOPHYTOSIS and
+    'PRO' matched 'R PROSTATE BIOPSY', so a service-connected disability
+    rating and a pathology header rendered as labs (TAYLOR 10/21)."""
+    return bool(re.search(r"(?<![A-Z0-9])" + re.escape(token) + r"S?(?![A-Z0-9])", test_name.upper()))
+
+
+# Qualitative result words — a line with no number may still be a lab.
+_QUAL_RESULT_RE = re.compile(
+    r"\b(?:Negative|Positive|Trace|Normal|Abnormal|Clear|Cloudy|Turbid|Hazy|Yellow|Amber|"
+    r"Straw|Small|Moderate|Large|Reactive|Non-?reactive|Detected|Not\s+detected|Few|Many|"
+    r"Rare|Occasional|Present|Absent)\b", re.I)
+_DATE_TOKEN_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b[A-Za-z]{3}\s+\d{1,2},\s*\d{4}\b|\b\d{1,2}:\d{2}\b")
 
 
 def should_keep_lab(test_name: str, lab_line: str) -> bool:
@@ -51,25 +79,31 @@ def should_keep_lab(test_name: str, lab_line: str) -> bool:
     if not _is_reasonable_lab_value(test_name, lab_line):
         return False
 
-    # Always keep abnormal results (marked with H or L)
+    # Always keep abnormal results (marked with H or L, or a qualitative abnormal)
     if re.search(r'\d+\.?\d*\s*[HL]\b', lab_line):
+        return True
+    if _QUAL_ABNORMAL_RE.search(lab_line.split('Ref')[0]):
         return True
 
     # Always keep special hormones and tumor markers
     for always_test in ALWAYS_REPORT:
-        if always_test in test_name:
+        if _name_has_token(test_name, always_test):
             return True
 
     # Check if it's a CBC component
-    if any(cbc_test in test_name for cbc_test in CBC_KEEP):
+    if any(_name_has_token(test_name, cbc_test) for cbc_test in CBC_KEEP):
         return True
 
     # Check if it's a BMP component
-    if any(bmp_test in test_name for bmp_test in BMP_KEEP):
+    if any(_name_has_token(test_name, bmp_test) for bmp_test in BMP_KEEP):
         return True
 
     # Check if it's a UA component
-    if any(ua_test in test_name for ua_test in UA_KEEP):
+    if any(_name_has_token(test_name, ua_test) for ua_test in UA_KEEP):
+        return True
+
+    # Liver enzymes
+    if any(_name_has_token(test_name, h) for h in HEPATIC_KEEP):
         return True
 
     # Default: don't keep (will be filtered out)
@@ -129,6 +163,39 @@ def _is_reasonable_lab_value(test_name: str, lab_line: str) -> bool:
     return True  # Value is reasonable or test not in sanity check list
 
 
+# VistA lab tables ("CH - Chem & Hematology (max 20 occurrences or 6 months)",
+# "SLT - Lab Tests Selected") repeat the collection date/time and specimen of
+# a panel as DITTO MARKS on every row after the first:
+#   07/21/2026 09:45  URINE      URINE PH              5.5               5.0 - 8.0
+#      "        "       "        URINE PROTEIN    Negative    mg/dL    Ref: Negative
+# No row parser recognises a leading ditto, so every analyte after the first
+# in the six-month block was dropped. Expand the dittos to the last dated row's
+# date/time + specimen before any extractor runs.
+_DITTO_ROW_RE = re.compile(r'^(\s*)"\s+"\s+"\s+(\S.*)$')
+_DATED_ROW_RE = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2})\s+([A-Z][A-Z/ .-]{1,14}?)\s{2,}(\S)')
+
+
+def expand_ditto_rows(text: str) -> str:
+    if not text or '"' not in text:
+        return text
+    out = []
+    last_dt = last_spec = None
+    for line in text.split('\n'):
+        m = _DATED_ROW_RE.match(line)
+        if m:
+            last_dt, last_spec = m.group(1), m.group(2).strip()
+            out.append(line)
+            continue
+        d = _DITTO_ROW_RE.match(line)
+        if d and last_dt:
+            out.append(f"{last_dt}  {last_spec:<10} {d.group(2)}")
+            continue
+        if line.startswith('-----') or line.strip().startswith('Collection DT'):
+            last_dt = last_spec = None   # a new table: dittos cannot refer across it
+        out.append(line)
+    return '\n'.join(out)
+
+
 def extract_labs(clinical_document: str, visit_date: str = "") -> str:
     """
     Extract general lab results from clinical documents.
@@ -150,6 +217,7 @@ def extract_labs(clinical_document: str, visit_date: str = "") -> str:
         Clean lab results with dates, or "" if not found
     """
     lab_lines = []
+    clinical_document = expand_ditto_rows(clinical_document)
 
     # First, try to extract human-readable format (priority)
     # Pattern 1: "DATE: LAB VALUES" format
@@ -162,6 +230,9 @@ def extract_labs(clinical_document: str, visit_date: str = "") -> str:
     va_format_labs = extract_va_format_labs(clinical_document)
     if va_format_labs:
         lab_lines.extend(va_format_labs)
+
+    # Third, generic dated "TEST RESULT UNITS RANGE SPECIMEN" table rows.
+    lab_lines.extend(extract_specimen_rows(clinical_document))
 
     if not lab_lines:
         return ""
@@ -313,6 +384,58 @@ def _is_valid_lab_line(line: str) -> bool:
         if pattern in line_upper:
             return False
 
+    # Filter out IV-infusion / medication-administration and appointment / plan
+    # lines that carry numbers but are NOT labs ("OVER 30 Minutes IVPB Q8H",
+    # "ALM GU PRO ADVANCED, 3 MONTHS to assess PSA response and symptom check").
+    admin_noise_patterns = [
+        'IVPB', 'IV PIGGYBACK', 'IV PUSH', 'INFUSE', 'INFUSION', 'BOLUS',
+        'OVER 30 MINUTES', 'OVER 60 MINUTES', 'OVER 15 MINUTES',
+        'GU PRO ADVANCED', 'ALM GU', 'ALM PHONE', 'GU STAFF', 'PRO GEN', 'RTC ', 'RETURN TO CLINIC',
+        'FOLLOW UP', 'FOLLOW-UP', 'TO ASSESS', 'SYMPTOM CHECK',
+        'APPOINTMENT', 'CLINIC VISIT', 'MONTHS TO', 'WEEKS TO',
+    ]
+    for pattern in admin_noise_patterns:
+        if pattern in line_upper:
+            return False
+    # A follow-up interval ("in 4-6 weeks", "3 months") is scheduling, not a result.
+    if re.search(r'\bIN\s+\d+\s*(?:-\s*\d+\s*)?(?:WEEKS?|MONTHS?|DAYS?)\b|\b\d+\s*(?:-\s*\d+\s*)?(?:WEEKS|MONTHS)\b',
+                 line_upper):
+        return False
+    # Dosing-frequency tokens mark a medication/administration order, not a lab.
+    if re.search(r'\bQ\d{1,2}H\b|\bQ(?:AM|PM|HS|D|OD)\b|\b(?:BID|TID|QID|QHS|QAM|PRN)\b',
+                 line_upper):
+        return False
+    # Medication-SIG / bowel-prep instruction fragments (wrapped continuation
+    # lines of a med order: "BEFORE PROCEDURE AT 2PM MIX WITH WATER AS DIRECTED ON
+    # LABEL", "MOUTH AS DIRECTED ON DAY BEFORE PROCEDURE AT 1PM,"). They carry
+    # no medication word, only a clock time — which is not a lab value.
+    sig_patterns = [
+        'AS DIRECTED', 'BEFORE PROCEDURE', 'BOWEL PREP', 'BY MOUTH', 'MOUTH ',
+        'MIX WITH', 'ON LABEL', 'PREP INSTRUCTION', 'REFRIGERATE', 'AS INSTRUCTED',
+        'CONTAINERFUL', 'AT BEDTIME', 'WITH FOOD', 'WITH MEALS', 'AS NEEDED',
+    ]
+    for pattern in sig_patterns:
+        if pattern in line_upper:
+            return False
+    # A line whose ONLY numbers are clock times ("AT 1PM, 2PM AND 11PM") is an
+    # instruction, not a result.
+    if re.search(r'\b\d{1,2}\s?(?:AM|PM)\b', line_upper) and \
+            not re.search(r'\d+\.?\d*(?!\s?(?:AM|PM)\b)(?![\d.])', re.sub(r'\b\d{1,2}\s?(?:AM|PM)\b', '', line_upper)):
+        return False
+
+    # Multi-column lab-table rows ("PH 5.5 6.0 6.0 5 - 8" from a 3-date
+    # URINALYSIS grid; "PROTEIN Negative Negative Negative") mangle into one
+    # garbled value — skip. The dated single-column labs elsewhere in the chart
+    # capture the same data cleanly. Signature: 3+ repeated result tokens.
+    if len(re.findall(r'(?i)\bNegative\b', line)) >= 3:
+        return False
+    # 3+ CONSECUTIVE whitespace-separated numbers = the same result flattened
+    # across date-columns ("PH  5.5  6.0  6.0  5 - 8"). A real single lab always
+    # has a unit or a dash between the value and its reference range, so its
+    # numbers are never 3-in-a-row separated only by spaces.
+    if re.search(r'\d+\.?\d*(?:\s+\d+\.?\d*){2,}', line):
+        return False
+
     # Filter out ENDOCRINE LABS - these should appear in ENDOCRINE LABS section, not general LABS
     # This prevents duplication with endocrine_extractor.py
     endocrine_markers = [
@@ -327,11 +450,16 @@ def _is_valid_lab_line(line: str) -> bool:
         if marker in line_upper:
             return False
 
-    # Valid lab lines typically contain numbers and units
-    has_number = re.search(r'\d+\.?\d*', line)
+    # A service-connected disability rating ("DERMATOPHYTOSIS  30% SC") from
+    # the demographics block is not a lab.
+    if re.search(r'\d+\s*%\s*SC\b', line_upper):
+        return False
 
-    # If no number, it's probably not a lab result
-    if not has_number:
+    # Valid lab lines carry a numeric value or a qualitative result. A line
+    # whose only digits are a DATE/time ("R PROSTATE BIOPSY  1/20/2015") is a
+    # header or procedure entry, not a result.
+    sans_dates = _DATE_TOKEN_RE.sub(' ', line)
+    if not re.search(r'\d+\.?\d*', sans_dates) and not _QUAL_RESULT_RE.search(sans_dates):
         return False
 
     return True
@@ -648,6 +776,34 @@ def extract_human_readable_labs(clinical_document: str) -> list:
     return lab_results
 
 
+# Generic inpatient lab table row — "DATE  TEST  RESULT  UNITS  RANGE  SPECIMEN"
+# with no CHAM header and no clock time (BRIDGWATERS 10/21: his freshest CBC/CMP,
+# "10/05/2026  WBC  21.3 H  10.e3/uL4.0 - 10.0  BLOOD", was never extracted).
+# The trailing SPECIMEN word is mandatory: radiology order lines share the
+# date-first shape ("01/02/2024  CHEST SINGLE VW  71045  Verified  266").
+_SPECIMEN_ROW_RE = re.compile(
+    r'^\s*(\d{1,2}/\d{1,2}/\d{2,4})(?:\s+\d{1,2}:\d{2})?\s+'
+    r'([A-Z][A-Z0-9 ,./()\-]{1,30}?)\s{2,}'
+    r'([<>]?\d+\.?\d*(?:\s*[HL]\b)?|Negative|Positive|Trace|Normal|Abnormal)\s*'
+    r'(.*?)\s+(BLOOD|WHOLE BLOOD|PLASMA|SERUM|URINE|UR|PLEURAL|CSF|FLUID|STOOL|SWAB)\s*$')
+
+
+def extract_specimen_rows(clinical_document: str) -> list:
+    out = []
+    for line in clinical_document.split('\n'):
+        m = _SPECIMEN_ROW_RE.match(line)
+        if not m:
+            continue
+        d = parse_lab_date(m.group(1))
+        if not d:
+            continue
+        name, value, rest = m.group(2).strip(), m.group(3).strip(), re.sub(r'\s+', ' ', m.group(4)).strip()
+        row = f"{name}  {value}" + (f"  {rest}" if rest else "")
+        if should_keep_lab(name.upper(), row):
+            out.append(f"{row}  ({d.strftime('%b %d, %Y')})")
+    return out
+
+
 def extract_va_format_labs(clinical_document: str) -> list:
     """
     Extract VA-formatted lab results (traditional format).
@@ -711,6 +867,30 @@ def extract_va_format_labs(clinical_document: str) -> list:
             current_collection_date = date_match.group(1)
             continue
 
+        # Pattern 3: the copied-forward panel header "CBCCBC Coll. date 6/18/25 04:00"
+        # / "CHEM 20CHEM 20 Coll. date 6/18/25 04:00" (TAYLOR 10/21: its rows
+        # rendered undated and therefore 'assumed recent' 16 months later).
+        date_match = re.search(r'\bColl\.?\s*date\s*:?\s*(\d{1,2}/\d{1,2}/\d{2,4})', line, re.IGNORECASE)
+        if date_match:
+            _d = parse_lab_date(date_match.group(1))
+            if _d:
+                current_collection_date = _d.strftime("%b %d, %Y")
+            continue
+
+        # A new NOTE starts: a collection date never carries across notes. Rows
+        # in this note that have no collection line of their own are dated by
+        # the NOTE date (an upper bound — a lab quoted in a note was drawn on or
+        # before the note's date), so the recency window still applies to
+        # copied-forward panels.
+        _hdr = (re.match(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}\s+Local Title:', line)
+                or re.search(r'DATE OF NOTE:\s*([A-Za-z]{3}\s+\d{1,2},\s*\d{4})', line))
+        if _hdr:
+            _d = parse_lab_date(_hdr.group(1))
+            current_collection_date = _d.strftime("%b %d, %Y") if _d else None
+            continue
+        if re.search(r'STANDARD TITLE:', line):
+            continue
+
         # Check if line is VA metadata
         is_metadata = False
         for pattern in va_metadata_patterns:
@@ -745,8 +925,10 @@ def extract_va_format_labs(clinical_document: str) -> list:
 
             # Only keep if we extracted a test name AND it passes filtering
             if test_name and should_keep_lab(test_name, cleaned):
-                # Append collection date if available
-                if current_collection_date:
+                # Append the collection date only when the row has none of its
+                # own (a dated CH row must not get a second, note-level date).
+                if current_collection_date and not re.search(
+                        r'\([A-Za-z]{3}\s+\d{1,2},\s*\d{4}\)|\b\d{1,2}/\d{1,2}/\d{2,4}\b', cleaned):
                     lab_with_date = f"{cleaned} ({current_collection_date})"
                     lab_lines.append(lab_with_date)
                 else:

@@ -22,6 +22,25 @@ _NON_PSA_TOTAL_MARKERS = (
 )
 
 
+def _normalize_psa_date(date_str: str) -> str:
+    """Normalize a PSA entry date to canonical 'Mon DD, YYYY'.
+
+    The extractor and every downstream consumer (dedup, sort key, HPI v2
+    PSA parser) understand only 'MMM DD, YYYY'. Convert the CPRS 'MM/DD/YYYY'
+    form so a mixed-format record yields ONE uniform, correctly-ordered
+    curve. Non-MM/DD/YYYY input is returned unchanged.
+    """
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', date_str.strip())
+    if not m:
+        return date_str
+    from datetime import datetime
+    try:
+        return datetime(int(m.group(3)), int(m.group(1)),
+                        int(m.group(2))).strftime('%b %d, %Y')
+    except ValueError:
+        return date_str
+
+
 def _is_plausible_psa_value(value_str: str) -> bool:
     """Numeric range guard: reject values that cannot be PSA Total."""
     try:
@@ -96,7 +115,8 @@ def extract_psa(note_content: str) -> str:
     Returns:
         Extracted PSA data, or "" if not found
     """
-    psa_entries = []
+    psa_entries = []        # Pattern 1: "PSA Curve:" header / narrative curve
+    labreport_entries = []  # Pattern 2: VA structured lab reports (PSA TOTAL …)
 
     # Normalize: ensure content ends with newline for consistent pattern matching.
     # Without this, Pattern 1's content capture ((?:.*\n)*?) fails when the PSA
@@ -147,7 +167,11 @@ def extract_psa(note_content: str) -> str:
     # `[,\s]+` after the time fixes the parse.
     date_value_pattern = (
         r'(?:\[r\]|\[c\])?\s*'                       # [r]/[c] prefix or none
-        r'([A-Za-z]{3}\s+\d{1,2},\s+\d{4})'          # Date: MMM DD, YYYY
+        # Date: 'MMM DD, YYYY'  OR  'MM/DD/YYYY'. The MM/DD/YYYY form is the
+        # canonical CPRS "PSA Curve:" layout ("[r]  01/21/2026  4.6 H"); it was
+        # previously unmatched, so a patient's CURRENT elevated curve was
+        # dropped and only an older 'MMM DD, YYYY' table survived (ASHFORD).
+        r'((?:[A-Za-z]{3}\s+\d{1,2},\s+\d{4})|(?:\d{1,2}/\d{1,2}/\d{4}))'
         r'[\s@]+'                                    # date/time separator
         r'(?:(\d{4}|\d{1,2}:\d{2})[,\s]+)?'           # Optional time (HHMM or HH:MM), allow ',' after
         r'(<?\d+\.?\d*)'                             # PSA value (optional < prefix)
@@ -163,7 +187,7 @@ def extract_psa(note_content: str) -> str:
             continue
 
         for m in re.finditer(date_value_pattern, psa_section, re.IGNORECASE):
-            date = m.group(1).strip()
+            date = _normalize_psa_date(m.group(1).strip())
             time = m.group(2).strip() if m.group(2) else None
             value = m.group(3).strip()
 
@@ -221,8 +245,8 @@ def extract_psa(note_content: str) -> str:
         if not _is_plausible_psa_value(value):
             continue
         entry = f"{date} {time}: {value}"
-        if entry not in psa_entries:
-            psa_entries.append(entry)
+        if entry not in labreport_entries:
+            labreport_entries.append(entry)
 
     # Pattern 2b: Direct PSA TOTAL line extraction with date context
     # Look for PSA TOTAL lines and find the nearest preceding specimen date
@@ -239,11 +263,20 @@ def extract_psa(note_content: str) -> str:
         date_matches = list(re.finditer(date_pattern, text_before, re.IGNORECASE))
         if date_matches:
             last_date_match = date_matches[-1]
+            # PROXIMITY GUARD: only trust "nearest preceding specimen date" when
+            # the header is actually close to this PSA line. VA charts dump dozens
+            # of date-first PSA lines ("12/09/2024 13:55 ... PSA TOTAL 0.05") that
+            # carry their OWN date (Pattern 2d handles those); without this guard,
+            # each of those grabs a far, unrelated specimen header and a real value
+            # is stamped with the WRONG date — the false-PSA signature the user saw
+            # (multiple values collapsed onto one specimen timestamp).
+            if psa_match.start() - last_date_match.end() > 400:
+                continue
             date = last_date_match.group(1).strip()
             time = last_date_match.group(2).strip()
             entry = f"{date} {time}: {psa_value}"
-            if entry not in psa_entries:
-                psa_entries.append(entry)
+            if entry not in labreport_entries:
+                labreport_entries.append(entry)
 
     # Pattern 2c: Inline lab result format from letters/summaries
     # PSA TOTAL     5.66 H            ng/mL          0.2 - 4.0
@@ -263,8 +296,40 @@ def extract_psa(note_content: str) -> str:
         if date_in_context:
             date = date_in_context.group(1).strip()
             entry = f"{date}: {psa_value}"
-            if entry not in psa_entries:
-                psa_entries.append(entry)
+            if entry not in labreport_entries:
+                labreport_entries.append(entry)
+
+    # Pattern 2d: date-first inline lab line (CPRS lab dump), e.g.
+    #   "04/29/2026 09:26  SERUM  PSA TOTAL   0.90   ng/mL   0.2 - 4.0"
+    # The date leads the line and there is no "Specimen Collection Date:"
+    # header, so Patterns 2a-2c miss it. This is the VA lab system of record.
+    labline_pattern = (
+        r'(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2})?\s*'    # capture time when present
+        r'(?:SERUM|PLASMA|BLOOD|WHOLE\s+BLOOD)?\s*'
+        r'PSA\s+TOTAL\s+(<?\d+\.?\d*)\s*[LHlh]?\s*n[gG]/mL'
+    )
+    for m in re.finditer(labline_pattern, note_content, re.IGNORECASE):
+        d = _normalize_psa_date(m.group(1).strip())
+        t = m.group(2).strip() if m.group(2) else None
+        v = m.group(3).strip()
+        if not _is_plausible_psa_value(v):
+            continue
+        # Keep the collection time when the source has it (issue: date-first lab
+        # lines were dropping their HH:MM, so the curve showed a time on some
+        # values but not others).
+        entry = f"{d} {t}: {v}" if t else f"{d}: {v}"
+        if entry not in labreport_entries:
+            labreport_entries.append(entry)
+
+    # PRECEDENCE (clinical review decision): the VA structured lab reports
+    # ("PSA TOTAL <value> ng/mL <ref-range>") are the lab system of record.
+    # When present they are AUTHORITATIVE and override a prep-summary
+    # "PSA Curve:" block, which can carry stale or spurious values not backed
+    # by any actual lab result (ASHFORD: a "PSA Curve" of 4.3-5.1 that matches
+    # none of 22 lab results all <1.0 ng/mL). Fall back to the header/curve
+    # entries only when no structured lab reports exist.
+    if labreport_entries:
+        psa_entries = labreport_entries
 
     # Pattern 3: Narrative mentions
     # "PSA was 4.2 on 01/15/2024"

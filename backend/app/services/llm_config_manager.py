@@ -302,18 +302,21 @@ class LLMConfigManager:
                 logger.info(f"Loaded LLM configs for user {self.user_id}")
 
             # Load active user rules and attach to the Stage 2 config so the
-            # Assessment & Plan agents see them via task_config.user_rules.
+            # Assessment & Plan agents see them via task_config.user_rules. Rules
+            # are SHARED across all accounts (a single clinic rule set), so this is
+            # NOT scoped to self.user_id — every note gets the full active rule set
+            # regardless of which account generated it.
             try:
                 rules_stmt = (
                     select(UserRule)
-                    .where(UserRule.user_id == self.user_id, UserRule.is_active == True)  # noqa: E712
+                    .where(UserRule.is_active == True)  # noqa: E712
                     .order_by(UserRule.sort_order.asc(), UserRule.id.asc())
                 )
                 rules_result = await db.execute(rules_stmt)
                 rule_texts = [r.rule_text.strip() for r in rules_result.scalars().all() if r.rule_text and r.rule_text.strip()]
                 if rule_texts and LLMTaskType.STAGE2 in self._configs:
                     self._configs[LLMTaskType.STAGE2].user_rules = rule_texts
-                    logger.info(f"Loaded {len(rule_texts)} active user rules for Stage 2 A&P")
+                    logger.info(f"Loaded {len(rule_texts)} active shared user rules for Stage 2 A&P")
             except Exception as rules_err:
                 # Don't fail config load if the rules table is missing or query errors.
                 logger.warning(f"Failed to load user rules for {self.user_id}: {rules_err}")

@@ -1,0 +1,17 @@
+{
+  "patient_id": "08_TAFOLLA_5999",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/Monday_7_6_2026/input/08_TAFOLLA_5999.txt",
+  "primary_diagnosis": {
+    "organ": "prostate",
+    "malignancy": "cancer"
+  },
+  "cancer_organs": [
+    "prostate"
+  ],
+  "notes": "prostate cancer post-radiation surveillance"
+}

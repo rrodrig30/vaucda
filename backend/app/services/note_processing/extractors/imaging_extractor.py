@@ -117,6 +117,43 @@ def _strip_dexa_boilerplate(report: str) -> str:
     return f'{head.rstrip()}{sep}{body}' if sep else head.rstrip()
 
 
+# Non-clinical boilerplate VA radiology reports append to impressions:
+# attending/resident attestations, CT dose-metric footers, and journal
+# citation footnotes. Stripped from EVERY report so the IMAGING section carries
+# the clinical impression only.
+_REPORT_BOILERPLATE = [
+    re.compile(r"\s*I,?\s+the\s+attending\s+(?:physician|radiologist)?,?\s*"
+               r"have\s+personally\s+reviewed[^\n]*", re.I),
+    re.compile(r"\s*(?:I|We)\s+have\s+personally\s+reviewed\s+(?:the\s+)?image[^\n]*", re.I),
+    re.compile(r"\s*(?:This\s+study\s+was|Images?\s+were)\s+(?:personally\s+)?"
+               r"reviewed\s+by\s+the\s+attending[^\n]*", re.I),
+    re.compile(r"\s*Approval\s+of\s+this\s+report\s+by\s+the\s+teaching\s+physician[^\n]*", re.I),
+    re.compile(r"\s*Up-to-date\s+CT\s+equipment[^\n]*", re.I),
+    re.compile(r"\s*CTDIvol:[^\n]*", re.I),
+    re.compile(r"\s*DLP:\s*[\d.]+\s*mGy[- ]?cm\.?", re.I),
+    re.compile(r"\s*(?:NOTE\s+)?The\s+total\s+dose[- ]length\s+product[^\n]*", re.I),
+    re.compile(r"\s*This\s+(?:CT\s+)?exam\s+was\s+performed\s+using[^\n]*", re.I),
+    re.compile(r"\s*(?:Radiation\s+)?dose\s+reduction\s+techniques[^\n]*", re.I),
+    # journal citation footnote: "* Silverman, S. et al. ... Radiology 2019; 292:475-488."
+    re.compile(r"\s*\*?\s*[A-Z][A-Za-z]+,\s+[A-Z]\.[^\n]*?"
+               r"(?:Radiology|Radiographics|J\s*Urol|AJR|Eur\s*Urol|Urology)\s+\d{4}[^\n]*",
+               re.I),
+]
+
+
+def _strip_report_boilerplate(report: str) -> str:
+    """Remove non-clinical attestation / dose-metric / citation boilerplate from
+    a single imaging report, keeping the clinical impression."""
+    if not report:
+        return report
+    for pat in _REPORT_BOILERPLATE:
+        report = pat.sub("", report)
+    report = re.sub(r"[ \t]{2,}", " ", report)
+    report = re.sub(r"[ \t]+\n", "\n", report)
+    report = re.sub(r"\s+([.,;])", r"\1", report)
+    return report.rstrip()
+
+
 def extract_imaging(clinical_document: str) -> str:
     """
     Extract imaging reports from clinical documents.
@@ -163,6 +200,31 @@ def extract_imaging(clinical_document: str) -> str:
     cprs_imaging = extract_cprs_format_imaging(clinical_document)
     if cprs_imaging:
         imaging_reports.extend(cprs_imaging)
+
+    # Sixth, extract the narrative "dash-date header + Impression:" format that
+    # radiology reports pasted into provider notes use, e.g.
+    #   PET/CT SKULL BASE TO MID-THIGH - 7/17/2025
+    #   Impression:
+    #     1. Intense PSMA activity ...
+    # None of the prior five extractors match this: there's no "===== IMAGING ====="
+    # section marker, no "Detailed Report" / "Procedure Name" bareword header, no
+    # "---- RADIOLOGY ----" divider, and the date is dash-separated (not the
+    # parenthesized "(date):" the human-readable extractor requires). This is the
+    # canonical form for PSMA PET / bone scan reports, which is why they were only
+    # surfacing in the PSMA-PET trajectory (a loose full-text scan) and never in
+    # the IMAGING section itself.
+    dash_date_imaging = extract_dash_date_imaging(clinical_document)
+    if dash_date_imaging:
+        imaging_reports.extend(dash_date_imaging)
+
+    # Seventh, outside studies summarized in a clinic note's "IMAGING:" block
+    # without an Impression label — "NM bone scan (UT) 1/2026:" + dash bullets,
+    # or "8/24/2025 PET/CT at Baptist M&S imaging reveals ..." prose. These are
+    # often the ONLY record of a community PSMA PET / bone scan (the VistA II
+    # row is an empty electronically-filed stub).
+    note_narrative_imaging = extract_note_narrative_imaging(clinical_document)
+    if note_narrative_imaging:
+        imaging_reports.extend(note_narrative_imaging)
 
     if not imaging_reports:
         return ""
@@ -238,12 +300,14 @@ def extract_imaging(clinical_document: str) -> str:
 
     # Add all unique studies
     unique_reports.extend(seen_study_dates.values())
+    unique_reports = _collapse_same_modality_same_date(unique_reports)
 
     # Strip non-actionable boilerplate from DXA / bone-density studies.
     # VA DXA impressions always tail with the same FRAX/WHO/NOF
     # paragraphs and a generic RECOMMENDATIONS list — text that clutters
     # the rendered note without changing clinical decision making.
-    unique_reports = [_strip_dexa_boilerplate(r) for r in unique_reports]
+    unique_reports = [_strip_report_boilerplate(_strip_dexa_boilerplate(r))
+                      for r in unique_reports]
 
     # Sort reverse chronologically — most recent study at the top of the
     # IMAGING section. Reports with an unparseable / missing date sort
@@ -251,6 +315,120 @@ def extract_imaging(clinical_document: str) -> str:
     unique_reports.sort(key=_imaging_report_sort_key, reverse=True)
 
     return '\n\n'.join(unique_reports)
+
+
+_PET_BONE_MODALITY_RE = re.compile(r"PSMA|\bPET\b|bone\s+scan|\bNM\b", re.IGNORECASE)
+
+
+def _collapse_same_modality_same_date(reports: list) -> list:
+    """A PSMA PET / bone scan recorded twice for the same date under different
+    titles (VistA II stub "PET/CT WHOLE BODY" + the clinic-note narrative
+    "PET/CT at Baptist M&S imaging") is one study: keep the version with report
+    text, else the longer one."""
+    best = {}
+    order = []
+    for r in reports:
+        hm = re.match(r'^(.+?)\s*\(([^()]+)\)\s*:', r)
+        if not hm or not _PET_BONE_MODALITY_RE.search(hm.group(1)):
+            order.append((None, r))
+            continue
+        mod = "PET" if re.search(r"PSMA|\bPET\b", hm.group(1), re.I) else "BONE"
+        key = (mod, _normalize_date_for_comparison(hm.group(2).strip()))
+        if key in best:
+            cur = best[key]
+            cur_stub = "No report text is filed" in cur
+            if cur_stub or (len(r) > len(cur) and "No report text is filed" not in r):
+                best[key] = r
+            continue
+        best[key] = r
+        order.append((key, None))
+    return [best[k] if k is not None else r for k, r in order]
+
+
+_NOTE_IMG_HEADER_RE = re.compile(
+    r'^[ \t]*(?P<name>[A-Za-z][^\n:]{1,70}?)[ \t]*\(?(?P<date>' + r'(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}/\d{4}|'
+    r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?:\d{1,2},?\s+)?\d{4})'
+    r')\)?[ \t]*:[ \t]*$', re.IGNORECASE | re.MULTILINE)
+_NOTE_IMG_PROSE_RE = re.compile(
+    r'^[ \t]*(?P<date>\d{1,2}/\d{1,2}/\d{2,4})(?:\s*-\s*\d{1,2}/\d{1,2}/\d{2,4})?[ \t]+'
+    r'(?P<name>[^\n]{0,80}?(?:PET(?:/CT)?|PSMA|bone\s+scan|\bCT\b|\bMRI\b|ultrasound|\bUS\b)[^\n]{0,60}?)'
+    r'\s+(?:reveals?|revealed|shows?|showed|showing|demonstrat(?:es|ed|ing)|notable\s+for|'
+    r'significant\s+for|with\s+(?:no|findings))\s+(?P<body>[^\n]+)', re.IGNORECASE | re.MULTILINE)
+_NOTE_IMG_MODALITY_RE = re.compile(
+    r'PET|PSMA|bone\s+scan|\bNM\b|\bCT\b|\bCTU\b|\bMRI?\b|ultrasound|\bUS\b|urogram|DEXA|DXA|renal\s+scan',
+    re.IGNORECASE)
+
+
+def extract_note_narrative_imaging(clinical_document: str) -> list:
+    """Imaging summarized inside a clinic note's IMAGING: block without an
+    Impression label. Two shapes:
+        NM bone scan (UT) 1/2026:
+        -Widespread abnormal foci ...
+    and
+        8/24/2025-8/24/2025 PET/CT at Baptist M&S imaging reveals heterogeneous ...
+    Body runs to the next blank line, next header, or section stop."""
+    out = []
+    if not clinical_document:
+        return out
+    for sec in re.finditer(r'(?im)^[ \t]*IMAGING\s*:[ \t]*\n(.*?)(?=\n[ \t]*\n[ \t]*[A-Z][A-Z /&-]{2,30}:|' + _IMAGING_BODY_STOP + r'|\Z)',
+                           clinical_document, re.S):
+        block = sec.group(1)
+        lines = block.split('\n')
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            hm = _NOTE_IMG_HEADER_RE.match(ln)
+            pm = None if hm else _NOTE_IMG_PROSE_RE.match(ln)
+            if hm and _NOTE_IMG_MODALITY_RE.search(hm.group('name')):
+                name, date = hm.group('name').strip(), hm.group('date').strip()
+                body = []
+                i += 1
+                while i < len(lines) and lines[i].strip() and not _NOTE_IMG_HEADER_RE.match(lines[i]) \
+                        and not _NOTE_IMG_PROSE_RE.match(lines[i]):
+                    body.append(re.sub(r'^\s*[-*•]\s*', '', lines[i]).strip())
+                    i += 1
+                impression = re.sub(r'\s+', ' ', ' '.join(body)).strip()
+                if len(impression) >= 10:
+                    out.append(f"{name} ({date}):\n{impression}")
+                continue
+            if pm:
+                name, date = pm.group('name').strip(), pm.group('date').strip()
+                body = [pm.group('body').strip()]
+                i += 1
+                while i < len(lines) and lines[i].strip() and not _NOTE_IMG_HEADER_RE.match(lines[i]) \
+                        and not _NOTE_IMG_PROSE_RE.match(lines[i]):
+                    body.append(lines[i].strip())
+                    i += 1
+                impression = re.sub(r'\s+', ' ', ' '.join(body)).strip()
+                if len(impression) >= 10:
+                    out.append(f"{name} ({date}):\n{impression}")
+                continue
+            i += 1
+    # The dated-prose shape also appears inside HPI narrative ("8/24/2025-8/24/2025
+    # PET/CT at Baptist M&S imaging reveals ...") — scan the whole document for
+    # it; the pattern needs a leading date, a modality word, and a reporting
+    # verb, so ordinary prose cannot match.
+    seen = {re.sub(r'\s+', ' ', r.split('\n', 1)[0]).lower() for r in out}
+    lines = clinical_document.split('\n')
+    i = 0
+    while i < len(lines):
+        pm = _NOTE_IMG_PROSE_RE.match(lines[i])
+        if not pm:
+            i += 1
+            continue
+        name, date = pm.group('name').strip(), pm.group('date').strip()
+        body = [pm.group('body').strip()]
+        i += 1
+        while i < len(lines) and lines[i].strip() and not _NOTE_IMG_PROSE_RE.match(lines[i]) \
+                and not re.match(r'^[ \t]*[A-Z][A-Za-z /&-]{2,30}:', lines[i]):
+            body.append(lines[i].strip())
+            i += 1
+        impression = re.sub(r'\s+', ' ', ' '.join(body)).strip()
+        hdr = re.sub(r'\s+', ' ', f"{name} ({date}):").lower()
+        if len(impression) >= 10 and hdr not in seen:
+            seen.add(hdr)
+            out.append(f"{name} ({date}):\n{impression[:900]}")
+    return out
 
 
 def _normalize_date_for_comparison(date_str: str) -> str:
@@ -526,6 +704,22 @@ def extract_detailed_report_imaging(clinical_document: str) -> list:
     return imaging_reports
 
 
+# Non-imaging section markers that must TERMINATE an imaging report body. Without
+# these, a report whose next sibling study header is far away captures every
+# intervening non-imaging line (PMH problem list, med list, ROS, a whole prior
+# clinic note, a PSA table, raw pathology). Used in the impression-capture
+# lookahead alongside "next study header" / "===" / end-of-string.
+_IMAGING_BODY_STOP = (
+    r"\n[ \t]*(?:PMH|PAST\s+MEDICAL|PAST\s+SURGICAL|MEDICATIONS?|MEDS|ALLERGIES|"
+    r"Active\s+(?:problems|Outpatient|Non-VA)|Pending\s+Outpatient|"
+    r"Computerized\s+Problem|TUMOR\s+SCREENS|SERUM\s+PSA|-{2,}\s*TUMOR|"
+    r"Local\s+Title|Standard\s+Title|CHIEF\s+COMPLAINT|HISTORY\s+OF\s+PRESENT|"
+    r"GENERAL\s+ROS|(?:GU\s+)?REVIEW\s+OF\s+SYSTEMS|A/P\s*:|ASSESSMENT|PLAN\s*:|"
+    r"PHYSICAL\s+EXAM|SOCIAL\s+HISTORY|FAMILY\s+HISTORY|VITAL\s+SIGNS|"
+    r"Total\s+Medications|Signed\s+by|Path\s+[A-Z]{2,3}\s+\d)"
+)
+
+
 def extract_human_readable_imaging(clinical_document: str) -> list:
     """
     Extract human-readable imaging format.
@@ -571,7 +765,15 @@ def extract_human_readable_imaging(clinical_document: str) -> list:
     #   US RENAL BILATERAL (3/15/25):
     # Study names can contain: letters, digits, spaces, /, &, -, W/O, W/
     # The date is always in parentheses: (M/D/YY) or (MM/DD/YYYY)
-    study_pattern = r'([A-Za-z][A-Za-z0-9\s/&\-,.\(\)]+?\(\d{1,2}/\d{1,2}/\d{2,4}\)):?\s*\n(?:IMPRESSION:?\s*)?(.*?)(?=\n[A-Za-z][A-Za-z0-9\s/&\-,.]+?\(\d{1,2}/\d{1,2}/\d{2,4}\):?|={30,}|$)'
+    # The next-study-header lookahead must allow the SAME name characters as the
+    # main capture (including parentheses) — otherwise a study whose name carries
+    # an embedded '(' (e.g. a VistA-mangled 'CT RENAL STONE (ABD/PEL WO (6/15/2022):')
+    # isn't recognized as a boundary and the PRIOR report's impression swallows it.
+    study_pattern = (
+        r'([A-Za-z][A-Za-z0-9\s/&\-,.\(\)]+?\(\d{1,2}/\d{1,2}/\d{2,4}\)):?\s*\n'
+        r'(?:IMPRESSION:?\s*)?(.*?)'
+        r'(?=\n[A-Za-z][A-Za-z0-9\s/&\-,.\(\)]+?\(\d{1,2}/\d{1,2}/\d{2,4}\):?|'
+        + _IMAGING_BODY_STOP + r'|={30,}|$)')
 
     for match in re.finditer(study_pattern, imaging_content, re.DOTALL):
         study_line = match.group(1).strip()
@@ -865,11 +1067,22 @@ def extract_cprs_format_imaging(clinical_document: str) -> list:
         re.MULTILINE | re.DOTALL,
     )
 
+    # The impression body must also terminate at a NON-imaging section header —
+    # otherwise a report whose 'Report'/'Signed by' terminator is far away (or
+    # absent) swallows the PMH problem list, med list, ROS, a whole prior clinic
+    # note, a PSA table, and raw pathology that follow it in a VistA export.
     impression_pat = re.compile(
         r'^Impression\s*\n'
         r'(?P<imp>.*?)'
-        r'(?=^Report\s*$|^Signed by |^Facility:|^Printed at:|^={30,}\s*$|\Z)',
-        re.MULTILINE | re.DOTALL,
+        r'(?=^Report\s*$|^Signed by |^Facility:|^Printed at:|^={30,}\s*$|'
+        r'^[ \t]*(?:PMH|PAST\s+MEDICAL|PAST\s+SURGICAL|MEDICATIONS?|MEDS|ALLERGIES|'
+        r'Active\s+(?:problems|Outpatient|Non-VA)|Pending\s+Outpatient|'
+        r'Computerized\s+Problem|-{2,}\s*TUMOR|TUMOR\s+SCREENS|SERUM\s+PSA|'
+        r'Local\s+Title|Standard\s+Title|CHIEF\s+COMPLAINT|HISTORY\s+OF\s+PRESENT|'
+        r'GENERAL\s+ROS|(?:GU\s+)?REVIEW\s+OF\s+SYSTEMS|A/P\s*:|ASSESSMENT|PLAN\s*:|'
+        r'PHYSICAL\s+EXAM|SOCIAL\s+HISTORY|FAMILY\s+HISTORY|VITAL\s+SIGNS|'
+        r'Total\s+Medications|Path\s+[A-Z]{2,3}\s+\d)\b|\Z)',
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
 
     # Walk the document looking for blocks. For each block we also
@@ -973,6 +1186,144 @@ def extract_cprs_format_imaging(clinical_document: str) -> list:
             report = f"{study_name}:\nIMPRESSION: {impression}"
 
         imaging_reports.append(report)
+
+    return imaging_reports
+
+
+# A date token in the header of a narrative study line: M/D/YYYY, M/D/YY,
+# M/YYYY, "DD Month YYYY" (day-first), or "Mon DD, YYYY" / "Month YYYY".
+_NARR_DATE_TOKEN = (
+    r'(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}/\d{4}|'
+    r'\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{4}|'
+    r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+'
+    r'(?:\d{1,2},?\s+)?\d{4})'
+)
+_NARR_DATE_RE = re.compile(_NARR_DATE_TOKEN, re.IGNORECASE)
+
+# Body terminators specific to the narrative extractor. A pasted report's
+# impression/findings body must stop when the next report or a non-radiology
+# block begins. Beyond the shared _IMAGING_BODY_STOP, these catch: a following
+# VA "Exm Date:" study, a lab result table ("Date Test Result Units"), bracketed
+# lab/PSA rows ("[n]  Jan 19, 2022"), a bare "PSA" table header, a problem-list
+# item ("#Prostate Cancer"), an Assessment/Plan header (tolerating the common
+# "Assesment" misspelling), and bacteriology / order-tracking metadata.
+_NARR_BODY_STOP = (
+    _IMAGING_BODY_STOP +
+    r"|\n[ \t]*Exm\s+Date:"
+    r"|\n[ \t]*Date[ \t]+Test[ \t]+Result"
+    r"|\n[ \t]*\[[A-Za-z]{1,3}\][ \t]+[A-Z][a-z]{2}\b"
+    r"|\n[ \t]*PSA[ \t]*\n[ \t]*\["
+    r"|\n[ \t]*#[ \t]*[A-Za-z]"
+    r"|\n[ \t]*Assess?ment\s*/?\s*Plan"
+    r"|\bBACTERIOLOGY\s+FINAL\s+REPORT\b"
+    r"|\n[ \t]*(?:Test\(s\)\s+ordered:|Specimen\(s\):)"
+    r"|\bColl(?:ection)?\.?\s+(?:date|DT)\b"
+    r"|\n[ \t]*\d{1,2}/\d{1,2}/\d{2,4}[ \t]+\d{1,2}:\d{2}[ \t]+"
+    r"(?:SERUM|PLASMA|BLOOD|URINE|WHOLE\s+BLOOD)\b"
+    # Pathology report following the imaging impression.
+    r"|\n[ \t]*Path\s+Report:"
+    r"|\n[ \t]*Pathology\b"
+    r"|\n[ \t]*(?:[A-Z]\.\s+)?(?:PROSTATE|BLADDER|KIDNEY|RENAL|URETER|TESTI[CS]|"
+    r"LYMPH\s+NODE)[, ][^\n]{0,45}BIOPSY"
+)
+
+# Anchor: a single header line that ends in a date (dash-, space-, or
+# paren-separated) followed within 0-2 blank lines by an IMPRESSION/FINDINGS
+# label. The header keyword check is done in code (reusing IMAGING_KEYWORDS).
+#   PET/CT SKULL BASE TO MID-THIGH - 7/17/2025   |   PET PSMA 5/2024
+#   Impression:                                  |   Impression:
+_NARR_ANCHOR_RE = re.compile(
+    r'^(?P<header>[ \t]*[A-Za-z][^\n]*?' + _NARR_DATE_TOKEN + r'[):]*)[ \t\r]*\n'
+    r'(?:[ \t\r]*\n){0,2}'
+    r'[ \t]*(?:IMPRESSION|FINDINGS)[ \t]*:?[ \t\r]*\n',
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# A header line that opens with one of these tokens is a report-INTERNAL field
+# (or a section label), not a study title. "COMPARISON: prior MRI 5/30/2025"
+# followed by "FINDINGS:" is a comparison line inside the real report — matching
+# it would emit a bogus study whose body is the real study's findings. Likewise
+# a leading "IMAGING:" is the section label, whose studies are handled by the
+# section-anchored extractor. Reject these.
+_REPORT_FIELD_PREFIX = re.compile(
+    r'^\s*(?:IMAGING|COMPARISON|TECHNIQUE|CLINICAL\s+HISTORY|HISTORY|INDICATION|'
+    r'REASON|EXAM|PROTOCOL|DOSE|CONTRAST|PROCEDURE|REPORT|NARRATIVE|ACCESSION|'
+    r'ORDERING|IMPRESSION|FINDINGS|ADDENDUM|SIGNED|REFERENCE|CORRELATION)\b\s*:',
+    re.IGNORECASE,
+)
+
+
+def extract_dash_date_imaging(clinical_document: str) -> list:
+    """Extract radiology reports pasted into a provider narrative as a header
+    line ending in a date, followed by an ``Impression:`` (or ``Findings:``)
+    label.
+
+    Pattern::
+
+        PET/CT SKULL BASE TO MID-THIGH - 7/17/2025
+        Impression:
+            1. Intense PSMA activity ...
+
+    Handles dash- (``- 7/17/2025``), space- (``PET PSMA 5/2024``), and
+    parenthesized- (``(Nov 2025)``) date headers, and consecutive reports that
+    mix those styles. The header must carry an imaging keyword (so a plain
+    "Follow up 9/2025" line doesn't match) and be immediately followed by an
+    Impression/Findings label. This is the format PSMA PET, bone scan, and
+    outside-facility reports most commonly take when copied into a narrative,
+    and is not caught by any of the section-anchored extractors.
+
+    Anchor-based: each report body runs from its Impression label to the NEXT
+    anchor or a hard section stop, so a report can't swallow the report that
+    follows it regardless of that report's date style.
+
+    Returns a list of canonical "STUDY (DATE):\\nIMPRESSION: ..." report strings
+    (deduped downstream against the other extractors).
+    """
+    # Normalize CRLF so `[ \t]`-anchored patterns aren't defeated by a stray \r.
+    doc = clinical_document.replace('\r\n', '\n').replace('\r', '\n')
+
+    anchors = [m for m in _NARR_ANCHOR_RE.finditer(doc)
+               if re.search(IMAGING_KEYWORDS, m.group('header'), re.IGNORECASE)
+               and not _REPORT_FIELD_PREFIX.match(m.group('header'))]
+    if not anchors:
+        return []
+
+    # A hard stop the body must not cross even before the next anchor.
+    hard_stop = re.compile(_NARR_BODY_STOP + r'|\n={4,}|\n-{4,}', re.IGNORECASE)
+
+    imaging_reports: list = []
+    for i, m in enumerate(anchors):
+        header = m.group('header').strip()
+        # Study name = header with its trailing date (and any dash/parens) removed.
+        date_match = None
+        for date_match in _NARR_DATE_RE.finditer(header):
+            pass  # keep the LAST date on the header line
+        if not date_match:
+            continue
+        date_str = date_match.group(0).strip().strip('()')
+        study_name = header[:date_match.start()].strip(' -–—(\t')
+        study_name = re.sub(r'\s+', ' ', study_name).strip()
+        if not study_name:
+            continue
+
+        body_start = m.end()
+        body_end = anchors[i + 1].start() if i + 1 < len(anchors) else len(doc)
+        body = doc[body_start:body_end]
+        stop = hard_stop.search(body)
+        if stop:
+            body = body[:stop.start()]
+
+        impression = re.sub(r'\s+', ' ', body).strip()
+        # Drop a trailing standardized-reporting-guideline footer that adds no
+        # clinical value (e.g. "EANM STANDARDIZED REPORTING GUIDELINES V1.0").
+        impression = re.sub(
+            r'\s*[A-Z][A-Z ]*STANDARDIZED REPORTING GUIDELINES[^\n]*$', '',
+            impression, flags=re.IGNORECASE).strip()
+
+        if len(impression) < 10:
+            continue
+
+        imaging_reports.append(f"{study_name} ({date_str}):\nIMPRESSION: {impression}")
 
     return imaging_reports
 
