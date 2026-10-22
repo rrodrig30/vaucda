@@ -57,7 +57,9 @@ HOW TO READ THE CHART
   verbatim. Never invent, round, or infer a value or a date.
 - "VERIFIED FACTS" is a deterministic ledger with ABSOLUTE RULES. Obey its rules. If it
   conflicts with the chart narrative on a point of fact, prefer the chart passage you can
-  quote, and list the conflict under "open_questions".
+  quote — silently. Open questions are ONLY things the clinician must confirm at the visit
+  (a missing result, an undocumented decision, an unclear dose date); a disagreement with
+  the ledger is never an open question.
 - The ADT SCHEDULER VERDICT is arithmetic on documented injection dates and is
   authoritative for depot timing: reflect its action in Problem #1 exactly.
 - The LIFE EXPECTANCY / FUNCTIONAL STATUS block is deterministic: use its figures as given
@@ -209,8 +211,8 @@ def compose_assessment_plan(ctx: ChartContext, llm_call: LLMCallable, max_retry:
     _oq = [_clean(q) for q in (obj.get("open_questions") or [])]
     # A question about continuing bicalutamide after LHRH induction is a non-question
     # (flare prophylaxis, ~30 days) — drop it rather than surface it to the clinician.
-    _oq = [q for q in _oq if not re.search(r"(?i)bicalutamide|casodex|anti-?androgen", q)
-           or re.search(r"(?i)flare", q)]
+    _oq = [q for q in _oq if (not re.search(r"(?i)bicalutamide|casodex|anti-?androgen", q) or re.search(r"(?i)flare", q))
+           and not re.search(r"(?i)extracted facts|verified facts|facts? (?:ledger|list|block)|deterministic|phase label", q)]
     audit["open_questions"] = _oq[:6]
     audit["guideline_basis"] = {
         _clean(p.get("title"))[:60]: [_clean(g) for g in (p.get("guideline_basis") or [])]

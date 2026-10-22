@@ -91,7 +91,9 @@ HOW TO READ THE CHART
 - The EXTRACTED FACTS block is advisory data from automated extraction. It is often
   useful (treatment constraints, risk category, secondary findings) and sometimes wrong
   (status labels, phase). Where it conflicts with a chart passage you can quote, the
-  chart wins; list the conflict under "open_questions".
+  chart wins — silently. Open questions are ONLY things the clinician must confirm at
+  the visit (a missing result, an undocumented decision, an unclear dose date); a
+  disagreement with the extracted facts is never an open question.
 - The ADT SCHEDULER VERDICT is arithmetic on documented injection dates and is
   authoritative for depot dates and whether the course is ongoing.
 
@@ -179,7 +181,8 @@ def compose_cc_hpi_v3(ctx: ChartContext, llm_call: LLMCallable, name: str = "", 
     if not cc:
         raise RuntimeError("composition v3: the CC/HPI composer returned no chief complaint")
     oq = [_clean(q) for q in (obj.get("open_questions") or [])]
-    oq = [q for q in oq if q and not (re.search(r"(?i)bicalutamide|casodex|anti-?androgen", q) and not re.search(r"(?i)flare", q))]
+    oq = [q for q in oq if q and not (re.search(r"(?i)bicalutamide|casodex|anti-?androgen", q) and not re.search(r"(?i)flare", q))
+          and not re.search(r"(?i)extracted facts|verified facts|facts? (?:ledger|list|block)|deterministic|phase label", q)]
     audit["open_questions"] = oq[:6]
     return cc, hpi, audit
 
