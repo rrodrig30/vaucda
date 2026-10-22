@@ -1099,8 +1099,8 @@ def _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_
           f"guidelines {len(ctx.guidelines)} chars)...")
     composed = compose_assessment_plan(ctx, _call)
     if not composed:
-        print("      [v3] composer gave nothing usable — falling back to legacy agents")
-        return None
+        raise RuntimeError("composition v3: no usable JSON Assessment/Plan after retries "
+                           f"(prompt {len(ctx.chart)}-char chart; check the LLM response)")
     assessment, plan, audit = composed
     print(f"      [v3] Assessment {len(assessment)} chars; Plan {len(plan)} chars; "
           f"attempts {audit.get('attempts')}")
@@ -1111,12 +1111,9 @@ def _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_
     for a in va.applied + vp.applied:
         print(f"      [v3] verified edit: {a[:160]}")
     # Arithmetic authorities stay deterministic: the ADT scheduler and the data tables.
-    try:
-        if st is not None and directive:
-            plan = _enforce_adt_directive(plan, st, directive)
-            assessment = _enforce_adt_in_assessment(assessment, st)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[v3] ADT enforcement skipped: %s", e)
+    if st is not None and directive:
+        plan = _enforce_adt_directive(plan, st, directive)
+        assessment = _enforce_adt_in_assessment(assessment, st)
     notes_block = render_verification_notes([va, vp], audit.get("open_questions"))
     if notes_block:
         print("      " + notes_block.replace("\n", "\n      "))
@@ -1375,18 +1372,21 @@ def build_stage2_note(
 
     # Step 2: Synthesize Assessment
     # ---- LLM-forward composition (VAUCDA_COMPOSE_V3) ---------------------
-    try:
-        from .composition import compose_v3_enabled
-        if compose_v3_enabled():
-            _v3 = _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_facts,
-                              rag_content, task_config, note_type, patient_name, ssn_last4,
-                              bool(calculator_results and any("charlson" in str(k).lower() or "cci" in str(k).lower()
-                                                               for k in (calculator_results or {}).keys())))
-            if _v3:
-                from .text_normalizer import to_vista_ascii as _tva_v3
-                return _tva_v3(_v3)
-    except Exception as _v3e:  # noqa: BLE001
-        logger.warning("[v3] composition failed, using legacy agents: %s", _v3e)
+    # NO FALLBACK by design (user 10/21: "I want a failure so I can fix it. A
+    # fallback may pass as an OK note and mask an underlying problem."). Any
+    # composer failure propagates and the note generation fails visibly.
+    from .composition import compose_v3_enabled
+    if compose_v3_enabled():
+        if not clinical_document:
+            raise RuntimeError("composition v3: Stage 2 was called without the raw clinical document")
+        _v3 = _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_facts,
+                          rag_content, task_config, note_type, patient_name, ssn_last4,
+                          bool(calculator_results and any("charlson" in str(k).lower() or "cci" in str(k).lower()
+                                                           for k in (calculator_results or {}).keys())))
+        if not _v3:
+            raise RuntimeError("composition v3: the composer produced no usable Assessment/Plan")
+        from .text_normalizer import to_vista_ascii as _tva_v3
+        return _tva_v3(_v3)
 
     print("\n[2/6] Synthesizing Assessment (clinical impression)...")
 

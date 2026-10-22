@@ -205,10 +205,7 @@ def build_chart_context(
         # Stage 2 called without the chart: reconstruct from the note bodies.
         raw = "\n\n".join((n.get("content") or "") for n in (gu_notes or []) + list(non_gu_notes or [])
                           if isinstance(n, dict))
-    try:
-        norm = normalize_to_cprs(raw, "vista") or raw
-    except Exception:  # noqa: BLE001
-        norm = raw
+    norm = normalize_to_cprs(raw, "vista") or raw
     ctx.chart = norm[:_CHART_CAP]
     first = (stage1_note or "").splitlines()[0] if stage1_note else ""
     ctx.patient_banner = first if first.startswith("Patient:") else ""
@@ -217,17 +214,11 @@ def build_chart_context(
     ctx.visit_date = vm.group(1) if vm else datetime.now().strftime("%m/%d/%Y")
     ctx.prior_clinician_notes = recent_clinician_notes(gu_notes or [])
     ctx.tables = split_stage1_sections(stage1_note or "")
-    try:
-        ctx.facts_block = format_facts_for_prompt(facts) if facts is not None else ""
-    except Exception as e:  # noqa: BLE001
-        logger.warning("facts block unavailable: %s", e)
+    ctx.facts_block = format_facts_for_prompt(facts) if facts is not None else ""
     ctx.adt_directive = (adt_directive or "").strip()
     ctx.adt_constraint = (adt_constraint or "").strip()
-    try:
-        from ..agents.age_guardrail import build_age_guardrail_block
-        ctx.life_expectancy_block = build_age_guardrail_block(stage1_note or "") or ""
-    except Exception as e:  # noqa: BLE001
-        logger.warning("life-expectancy block unavailable: %s", e)
+    from ..agents.age_guardrail import build_age_guardrail_block
+    ctx.life_expectancy_block = build_age_guardrail_block(stage1_note or "") or ""
     ctx.guidelines = (rag_content or "").strip()
     ctx.psa_values = psa_values_from_curve(ctx.tables.get("PSA CURVE", ""))
     ctx.chart_dates = date_tuples(ctx.chart) | date_tuples(ctx.tables_text(cap=200_000)) | \

@@ -98,6 +98,10 @@ PLAN (problems in order of clinical importance; {_MAX_PROBLEMS} max, {_MAX_BULLE
   radical prostatectomy the recurrence definition is PSA-based, not Phoenix.
 - Do not restate laboratory tables; cite only the values that drive a decision.
 - Do not create a separate "elevated PSA" problem when prostate cancer is established.
+- Bicalutamide (or another first-generation antiandrogen) started with the first LHRH-agonist
+  dose is FLARE PROPHYLAXIS for about 30 days, not ongoing therapy. Its absence from the active
+  medication list afterwards is expected: never call it discontinued, never ask whether it
+  should continue, never list it as current therapy.
 - Use dates as MM/DD/YYYY; write values exactly as the tables show them.
 
 {_schema()}"""
@@ -202,7 +206,12 @@ def compose_assessment_plan(ctx: ChartContext, llm_call: LLMCallable, max_retry:
     plan = render_plan(obj.get("problems") or [])
     if len(assessment) < 200 or not plan:
         return None
-    audit["open_questions"] = [_clean(q) for q in (obj.get("open_questions") or [])][:6]
+    _oq = [_clean(q) for q in (obj.get("open_questions") or [])]
+    # A question about continuing bicalutamide after LHRH induction is a non-question
+    # (flare prophylaxis, ~30 days) — drop it rather than surface it to the clinician.
+    _oq = [q for q in _oq if not re.search(r"(?i)bicalutamide|casodex|anti-?androgen", q)
+           or re.search(r"(?i)flare", q)]
+    audit["open_questions"] = _oq[:6]
     audit["guideline_basis"] = {
         _clean(p.get("title"))[:60]: [_clean(g) for g in (p.get("guideline_basis") or [])]
         for p in obj.get("problems") or [] if isinstance(p, dict)}
