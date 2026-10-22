@@ -908,8 +908,42 @@ def build_urology_note(
     # to its existing path when the holistic pass returns None. Skipped for
     # consults (they have their own CC/HPI extraction).
     _holistic_cc_hpi = None
+    _hpi_v3_active = False
+    _hpi_v3_footer = ""
     import os as _os_h
-    if (_os_h.environ.get("VAUCDA_CC_HPI_HOLISTIC", "1") == "1"
+    from .composition import compose_v3_enabled as _v3_on
+    if _v3_on() and not _is_consult_val:
+        # ---- composition v3: CC + HPI from the whole chart, ledger as data,
+        # quote-grounded verification, NO fallback (any failure raises). ----
+        from .composition.hpi_compose import build_stage1_context, compose_cc_hpi_v3
+        from .composition.verify import verify_section, render_verification_notes
+        from .llm_helper import synthesize_with_llm as _synth_v3
+
+        def _v3_call(p: str) -> str:
+            return _synth_v3(prompt=p, temperature=0.0, task_config=task_config, max_tokens=16000)
+
+        _ctx1 = build_stage1_context(
+            clinical_document or "", _raw_clinical_text or "", notes_dict.get("gu_notes") or [],
+            _hpi_pf, psa_data=_doc_psa or "", pathology_data=_doc_path or "", psh_data=document_psh or "",
+            medications_data=document_medications or "", imaging_data=document_imaging or "",
+            patient_name=_patient_name_val or "", patient_age=_patient_age_val or "",
+            patient_sex=_patient_sex_val or "", visit_date=_visit_date or "")
+        print("\n[v3] Composing CC + HPI from the whole chart "
+              f"(chart {len(_ctx1.chart)} chars, prior notes {len(_ctx1.prior_clinician_notes)} chars)...")
+        _cc3, _hpi3, _audit3 = compose_cc_hpi_v3(_ctx1, _v3_call, name=_patient_name_val, age=_patient_age_val,
+                                                 sex=_patient_sex_val)
+        _vh = verify_section(_hpi3, _ctx1, _hpi_pf, _v3_call, is_plan=False, section="HPI")
+        for _a in _vh.applied:
+            print(f"      [v3] verified edit (HPI): {_a[:160]}")
+        _hpi_v3_footer = render_verification_notes([_vh], _audit3.get("open_questions"))
+        if _hpi_v3_footer:
+            _hpi_v3_footer = _hpi_v3_footer.replace("VERIFICATION NOTES (for the provider; not part of the note):",
+                                                    "VERIFICATION NOTES (HPI) (for the provider; not part of the note):", 1)
+            print("      " + _hpi_v3_footer.replace("\n", "\n      "))
+        print(f"      [v3] CC {len(_cc3)} chars; HPI {len(_vh.text)} chars; attempts {_audit3.get('attempts')}")
+        _holistic_cc_hpi = {"cc": _cc3, "hpi": _vh.text}
+        _hpi_v3_active = True
+    elif (_os_h.environ.get("VAUCDA_CC_HPI_HOLISTIC", "1") == "1"
             and not _is_consult_val):
         try:
             from .agents.holistic_cc_hpi import compose_cc_hpi
@@ -1429,7 +1463,7 @@ def build_urology_note(
     # assertions that contradict the ground truth for an ABSENT / female /
     # treatment-naive patient. Negated ("no prostate cancer") and workup
     # ("mpMRI to evaluate rising PSA") mentions are preserved.
-    if hpi and _hpi_pf is not None:
+    if hpi and _hpi_pf is not None and not _hpi_v3_active:
         hpi, _hpi_dropped = sanitize_context_against_facts(hpi, _hpi_pf)
         if _hpi_dropped:
             print(f"      ✂ HPI fact-guard dropped {len(_hpi_dropped)} contradicting sentence(s)")
@@ -1438,7 +1472,7 @@ def build_urology_note(
     # current recurrence/rising-PSA claim contradicted by an undetectable PSA
     # (MORENO: "second biochemical recurrence in 2026" while PSA <0.01), so the
     # HPI can't disagree with the Assessment. Safe-degrade when disabled/on error.
-    if hpi and _hpi_pf is not None:
+    if hpi and _hpi_pf is not None and not _hpi_v3_active:
         try:
             from .temporal_checks import finalize_temporal as _finalize_temporal_hpi
             from .llm_helper import synthesize_with_llm as _synth_hpi_temporal
@@ -1555,6 +1589,8 @@ def build_urology_note(
         patient_race=patient_race
         # Note: Assessment and Plan are NOT included in Stage 1 preliminary note
     )
+    if _hpi_v3_footer:
+        final_note = final_note.rstrip() + "\n\n" + _hpi_v3_footer + "\n"
 
     print(f"      Final note: {len(final_note)} characters")
 

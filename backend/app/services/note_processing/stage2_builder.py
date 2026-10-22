@@ -1115,6 +1115,15 @@ def _compose_v3(stage1_note, gu_notes, non_gu_notes, clinical_document, patient_
         plan = _enforce_adt_directive(plan, st, directive)
         assessment = _enforce_adt_in_assessment(assessment, st)
     notes_block = render_verification_notes([va, vp], audit.get("open_questions"))
+    # Stage 1 may carry an HPI verification footer: lift it into the combined footer.
+    from .composition.hpi_compose import strip_hpi_footer, _HPI_FOOTER_RE
+    _hm = _HPI_FOOTER_RE.search(stage1_note or "")
+    if _hm:
+        _hpi_lines = [l for l in _hm.group(0).strip().split("\n")[1:] if l.strip()]
+        if _hpi_lines:
+            notes_block = (notes_block or "VERIFICATION NOTES (for the provider; not part of the note):") \
+                + "\n" + "\n".join(("- [HPI] " + l.lstrip("- ")) for l in _hpi_lines)
+        stage1_note = strip_hpi_footer(stage1_note)
     if notes_block:
         print("      " + notes_block.replace("\n", "\n      "))
     final = assemble_complete_note(stage1_note=stage1_note, assessment=assessment, plan=plan,
