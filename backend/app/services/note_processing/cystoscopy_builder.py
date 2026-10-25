@@ -562,10 +562,12 @@ def build_cystoscopy_note(
             "\t\t\tCYSTOSCOPY NOTE", "",
             f"INDICATION: {fields['indication']}", "",
             f"HPI: {vh.text}", "",
-            "IMAGING:", (imaging or fields.get("imaging_pertinence") or ""), "",
+            "IMAGING:", (imaging or fields.get("imaging_pertinence")
+                         or "None pertinent to the current GU complaint on review (no GU imaging in the last 2 years)."), "",
             "LABS (only last 6 months or less):", (labs or ""), "",
             "UA WITH CULTURES IF AVAILABLE:", (fields.get("culture") or culture or ""), "",
-            "PATHOLOGY:", (pathology or fields.get("pathology_pertinence") or ""), "",
+            "PATHOLOGY:", (pathology or fields.get("pathology_pertinence")
+                           or "None pertinent to the current GU complaint on file."), "",
             "CONSENT: Obtained via Web IMED", "",
             f"OPERATOR: {_OPERATOR}", "",
             f"NARRATIVE:  {narrative}", "",
