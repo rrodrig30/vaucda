@@ -12,6 +12,7 @@ from app.core.security import get_optional_user, get_current_user
 from app.database.sqlite_models import User, UserPreferences, UserRule
 from app.database.sqlite_session import get_db
 from app.config import settings
+from app.core.api_key_store import key_hint, set_key
 from cryptography.fernet import Fernet
 from datetime import datetime
 import logging
@@ -57,9 +58,23 @@ class UserSettingsResponse(BaseModel):
     stage1_llm: TaskLLMConfig = Field(..., description="Stage 1 note generation LLM configuration")
     stage2_llm: Stage2LLMConfig = Field(..., description="Stage 2 Assessment & Plan LLM configuration")
 
+    graphrag_llm_model: str = Field(
+        "",
+        description="Model used to BUILD/query the GraphRAG knowledge graph "
+                    "(entity extraction, community summarization, map-reduce). "
+                    "Empty falls back to the GRAPHRAG_LLM_MODEL env default.",
+    )
+
     module_defaults: Optional[Dict[str, Any]] = Field(None, description="Default modules configuration")
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
     openevidence_configured: bool = Field(False, description="Whether OpenEvidence is configured")
+
+    # LLM provider API keys — never return the key itself, only whether one is
+    # configured plus a masked last-4 hint for display.
+    anthropic_configured: bool = Field(False, description="Whether an Anthropic API key is set")
+    openai_configured: bool = Field(False, description="Whether an OpenAI API key is set")
+    anthropic_key_hint: Optional[str] = Field(None, description="Masked hint (last 4) for the Anthropic key")
+    openai_key_hint: Optional[str] = Field(None, description="Masked hint (last 4) for the OpenAI key")
 
     source_format: str = Field(
         "cprs",
@@ -111,10 +126,18 @@ class UserSettingsUpdate(BaseModel):
     stage2_use_graphrag: Optional[bool] = Field(None, description="Enable GraphRAG for Stage 2")
     stage2_rag_top_k: Optional[int] = Field(None, description="RAG top-k retrieval")
 
+    # GraphRAG knowledge-graph build/retrieval model. Empty string clears the
+    # override (falls back to GRAPHRAG_LLM_MODEL env default).
+    graphrag_llm_model: Optional[str] = Field(None, description="GraphRAG build/retrieval model")
+
     module_defaults: Optional[Dict[str, Any]] = Field(None, description="Default modules configuration")
     display_preferences: Optional[Dict[str, Any]] = Field(None, description="Display preferences")
     openevidence_username: Optional[str] = Field(None, description="OpenEvidence username")
     openevidence_password: Optional[str] = Field(None, description="OpenEvidence password")
+    # LLM provider API keys (system-wide). Send a value to set, "" to clear,
+    # omit/None to leave unchanged.
+    anthropic_api_key: Optional[str] = Field(None, description="Anthropic API key")
+    openai_api_key: Optional[str] = Field(None, description="OpenAI API key")
     source_format: Optional[str] = Field(
         None, description="Source EHR format: 'cprs' or 'vista'",
     )
@@ -187,7 +210,12 @@ async def get_settings(
                 module_defaults={},
                 display_preferences={},
                 openevidence_configured=False,
+                anthropic_configured=bool(settings.ANTHROPIC_API_KEY),
+                openai_configured=bool(settings.OPENAI_API_KEY),
+                anthropic_key_hint=key_hint("anthropic"),
+                openai_key_hint=key_hint("openai"),
                 source_format="cprs",
+                graphrag_llm_model=settings.GRAPHRAG_LLM_MODEL,
             )
 
         # Query user preferences
@@ -257,7 +285,12 @@ async def get_settings(
             module_defaults=prefs.module_defaults,
             display_preferences=prefs.display_preferences,
             openevidence_configured=bool(current_user.openevidence_username),
+            anthropic_configured=bool(settings.ANTHROPIC_API_KEY),
+            openai_configured=bool(settings.OPENAI_API_KEY),
+            anthropic_key_hint=key_hint("anthropic"),
+            openai_key_hint=key_hint("openai"),
             source_format=(prefs.source_format or "cprs"),
+            graphrag_llm_model=(getattr(prefs, "graphrag_llm_model", None) or settings.GRAPHRAG_LLM_MODEL),
         )
 
     except Exception as e:
@@ -375,6 +408,9 @@ async def update_settings(
             prefs.stage2_use_graphrag = settings_update.stage2_use_graphrag
         if settings_update.stage2_rag_top_k is not None:
             prefs.stage2_rag_top_k = settings_update.stage2_rag_top_k
+        if settings_update.graphrag_llm_model is not None:
+            # Empty string clears the override -> fall back to env GRAPHRAG_LLM_MODEL.
+            prefs.graphrag_llm_model = settings_update.graphrag_llm_model.strip() or None
 
         if settings_update.module_defaults is not None:
             prefs.module_defaults = settings_update.module_defaults
@@ -398,6 +434,13 @@ async def update_settings(
             fernet = Fernet(settings.OPENEVIDENCE_ENCRYPTION_KEY.encode())
             encrypted = fernet.encrypt(settings_update.openevidence_password.encode())
             current_user.openevidence_password_encrypted = encrypted.decode()
+
+        # Update LLM provider API keys (system-wide, encrypted at rest, applied
+        # to the live settings object immediately). "" clears; None leaves as-is.
+        if settings_update.anthropic_api_key is not None:
+            set_key("anthropic", settings_update.anthropic_api_key)
+        if settings_update.openai_api_key is not None:
+            set_key("openai", settings_update.openai_api_key)
 
         # Commit changes
         await db.commit()
@@ -452,7 +495,12 @@ async def update_settings(
             module_defaults=prefs.module_defaults,
             display_preferences=prefs.display_preferences,
             openevidence_configured=bool(current_user.openevidence_username),
+            anthropic_configured=bool(settings.ANTHROPIC_API_KEY),
+            openai_configured=bool(settings.OPENAI_API_KEY),
+            anthropic_key_hint=key_hint("anthropic"),
+            openai_key_hint=key_hint("openai"),
             source_format=(prefs.source_format or "cprs"),
+            graphrag_llm_model=(getattr(prefs, "graphrag_llm_model", None) or settings.GRAPHRAG_LLM_MODEL),
         )
 
     except Exception as e:
@@ -498,12 +546,12 @@ async def list_user_rules(
     current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List the authenticated user's Assessment & Plan rules (active + inactive)."""
+    """List the Assessment & Plan rules (active + inactive). Rules are SHARED
+    across all accounts — every authenticated user sees the same clinic rule set."""
     if not current_user:
         return []
     stmt = (
         select(UserRule)
-        .where(UserRule.user_id == current_user.user_id)
         .order_by(UserRule.sort_order.asc(), UserRule.id.asc())
     )
     result = await db.execute(stmt)
@@ -516,17 +564,19 @@ async def create_user_rule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new Assessment & Plan rule for the authenticated user."""
-    # Compute default sort_order = (max + 10) for stable append-at-end semantics.
+    """Create a new SHARED Assessment & Plan rule (visible to all accounts).
+    user_id records the creator for audit only — it does not scope visibility."""
+    # Compute default sort_order = (max + 10) for stable append-at-end semantics,
+    # across the GLOBAL rule set.
     if payload.sort_order is None:
-        max_stmt = select(UserRule).where(UserRule.user_id == current_user.user_id).order_by(UserRule.sort_order.desc()).limit(1)
+        max_stmt = select(UserRule).order_by(UserRule.sort_order.desc()).limit(1)
         existing = (await db.execute(max_stmt)).scalars().first()
         next_order = (existing.sort_order + 10) if existing else 0
     else:
         next_order = payload.sort_order
 
     rule = UserRule(
-        user_id=current_user.user_id,
+        user_id=current_user.user_id,  # creator audit only; rules are shared
         rule_text=payload.rule_text.strip(),
         is_active=payload.is_active,
         sort_order=next_order,
@@ -534,7 +584,7 @@ async def create_user_rule(
     db.add(rule)
     await db.commit()
     await db.refresh(rule)
-    logger.info(f"Created user rule {rule.id} for user {current_user.user_id}")
+    logger.info(f"Created shared user rule {rule.id} (by {current_user.user_id})")
     return rule
 
 
@@ -545,11 +595,9 @@ async def update_user_rule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update fields on a single user rule. 404 if it does not belong to the caller."""
-    stmt = select(UserRule).where(
-        UserRule.id == rule_id,
-        UserRule.user_id == current_user.user_id,
-    )
+    """Update fields on a single SHARED rule. Any authenticated user may edit any
+    rule (rules are a shared clinic set). 404 only if the id does not exist."""
+    stmt = select(UserRule).where(UserRule.id == rule_id)
     rule = (await db.execute(stmt)).scalars().first()
     if not rule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
@@ -572,11 +620,9 @@ async def delete_user_rule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a single user rule. 404 if it does not belong to the caller."""
-    stmt = select(UserRule).where(
-        UserRule.id == rule_id,
-        UserRule.user_id == current_user.user_id,
-    )
+    """Delete a single SHARED rule (any authenticated user may delete any rule).
+    404 only if the id does not exist."""
+    stmt = select(UserRule).where(UserRule.id == rule_id)
     rule = (await db.execute(stmt)).scalars().first()
     if not rule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")

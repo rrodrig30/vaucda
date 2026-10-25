@@ -23,6 +23,98 @@ from ..extractors.pathology_fact_verifier import (
 logger = logging.getLogger(__name__)
 
 
+# Critical, high-value pathology findings an LLM composer sometimes drops when
+# reformatting the section. Each entry: (label, SOURCE capture pattern, SECTION
+# presence pattern). The source pattern captures the finding verbatim from the
+# DETERMINISTIC regex extraction; the (looser) presence pattern decides whether
+# the rendered section already covers the concept. A finding documented in the
+# deterministic extraction but absent from the section is restored — so the
+# PATHOLOGY section can never silently lose documented staging / margin /
+# invasion detail regardless of LLM behavior. Grade-agnostic (works for prostate
+# pT/margin/PNI, renal pT, urothelial invasion, etc.).
+_PATH_CRITICAL = [
+    ("stage",
+     re.compile(r"\bp?T\d[a-d]?(?:\s*,?\s*p?N\d[a-c]?)?(?:\s*,?\s*p?M\d)?", re.I),
+     re.compile(r"\bp?T\d", re.I)),
+    ("surgical margin",
+     re.compile(r"(?:positive|negative|involved|close|uninvolved)\s+(?:surgical\s+)?"
+                r"margins?[^.\n;,]{0,45}|margins?\s+(?:are\s+|were\s+)?"
+                r"(?:positive|negative|involved|free|uninvolved)[^.\n;,]{0,30}", re.I),
+     re.compile(r"margins?\b", re.I)),
+    ("perineural invasion",
+     re.compile(r"perineural\s+invasion(?:\s+(?:present|identified))?", re.I),
+     re.compile(r"perineural|\bPNI\b", re.I)),
+    ("lymphovascular invasion",
+     re.compile(r"lymphovascular\s+invasion(?:\s+(?:present|identified))?", re.I),
+     re.compile(r"lymphovascular|\bLVI\b", re.I)),
+]
+
+
+def _gleason_to_grade_group(primary: int, secondary: int) -> Optional[int]:
+    """ISUP Grade Group from a Gleason primary+secondary pattern."""
+    total = primary + secondary
+    if total <= 6:
+        return 1
+    if primary == 3 and secondary == 4:
+        return 2
+    if primary == 4 and secondary == 3:
+        return 3
+    if total == 8:
+        return 4
+    if total >= 9:
+        return 5
+    return None
+
+
+_GLEASON_GG_RE = re.compile(
+    r"Gleason\s*(?:score\s*)?(\d)\s*\+\s*(\d)(?:\s*=\s*\d+)?"
+    r"([^.\n]{0,40}?Grade\s+Group\s+)([1-5]|[NXnx?]|\bN/?A\b)",
+    re.IGNORECASE,
+)
+
+
+def _fix_grade_group(section: str) -> str:
+    """Correct a placeholder/echoed 'Grade Group N' (or a wrong digit) to the
+    value computed from the adjacent Gleason score — opus-class models sometimes
+    copy the template letter 'N' literally (Gleason 3+3 -> Grade Group 1)."""
+    def _sub(m):
+        gg = _gleason_to_grade_group(int(m.group(1)), int(m.group(2)))
+        if gg is None:
+            return m.group(0)
+        return f"{m.group(0)[:m.start(4) - m.start(0)]}{gg}"
+    return _GLEASON_GG_RE.sub(_sub, section)
+
+
+def ensure_pathology_completeness(section: str, deterministic_pathology: str) -> str:
+    """Deterministic backstop: guarantee the rendered PATHOLOGY section retains the
+    critical documented findings (stage / margin / perineural + lymphovascular
+    invasion) an LLM composer sometimes drops. Compares against the DETERMINISTIC
+    regex extraction and appends any dropped finding verbatim. Also corrects an
+    echoed 'Grade Group N' placeholder to the value implied by the Gleason score.
+    Never removes content; a no-op when the section already covers every finding."""
+    if not section:
+        return section
+    section = _fix_grade_group(section)
+    if not deterministic_pathology:
+        return section
+    missing = []
+    for _label, source_pat, present_pat in _PATH_CRITICAL:
+        m = source_pat.search(deterministic_pathology)
+        if m and not present_pat.search(section):
+            missing.append(re.sub(r"\s+", " ", m.group(0)).strip(" ;,."))
+    if not missing:
+        return section
+    seen, uniq = set(), []
+    for s in missing:
+        if s.lower() not in seen:
+            seen.add(s.lower())
+            uniq.append(s)
+    logger.info(f"[PATHOLOGY] deterministic backstop restored dropped finding(s): {uniq}")
+    return (section.rstrip()
+            + "\n\nAdditional documented pathology (retained from source): "
+            + "; ".join(uniq) + ".")
+
+
 # Markers that distinguish a real pathology REPORT (with specimen-level
 # findings) from a narrative MENTION of cancer ("history of prostate
 # cancer per outside biopsy"). Per-note Pathology extractions only

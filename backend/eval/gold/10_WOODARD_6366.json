@@ -1,0 +1,17 @@
+{
+  "patient_id": "10_WOODARD_6366",
+  "required_sections": [
+    "HPI",
+    "ASSESSMENT",
+    "PLAN"
+  ],
+  "source_file": "tests/Monday_7_6_2026/input/10_WOODARD_6366.txt",
+  "primary_diagnosis": {
+    "organ": "prostate",
+    "malignancy": "cancer"
+  },
+  "cancer_organs": [
+    "prostate"
+  ],
+  "notes": "GG2 prostate adenocarcinoma post-radiation surveillance"
+}

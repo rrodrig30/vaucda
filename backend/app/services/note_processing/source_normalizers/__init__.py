@@ -25,6 +25,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Literal
 
 from .vista_to_cprs import normalize_vista_to_cprs
@@ -32,6 +33,20 @@ from .vista_to_cprs import normalize_vista_to_cprs
 logger = logging.getLogger(__name__)
 
 SourceFormat = Literal["cprs", "vista"]
+
+
+_VISTA_BAR_RE = re.compile(r"^-{5,}\s*[A-Z]{2,5}\s+-\s+[A-Za-z][^\n]{2,60}-{5,}\s*$", re.M)
+_VISTA_BANNER_RE = re.compile(r"^\s*(?:CLINIC\s*:[^\n]*\bDATE:|EXTRACTED:\s*\d{4}-\d{2}-\d{2})", re.M)
+
+
+def looks_like_vista(raw_text: str) -> bool:
+    """True when the text carries the VistA prep-extract signature: at least two
+    '---- XX - Section ----' bars, or one bar plus the CLINIC/EXTRACTED banner."""
+    if not raw_text:
+        return False
+    head = raw_text[:200000]
+    bars = len(_VISTA_BAR_RE.findall(head))
+    return bars >= 2 or (bars >= 1 and bool(_VISTA_BANNER_RE.search(head[:3000])))
 
 
 def normalize_to_cprs(raw_text: str, source_format: str) -> str:
@@ -49,6 +64,16 @@ def normalize_to_cprs(raw_text: str, source_format: str) -> str:
     if not raw_text:
         return raw_text or ""
     fmt = (source_format or "cprs").strip().lower()
+    # The source format is a per-user PREFERENCE, and it was silently flipped to
+    # 'cprs' by a settings save on 2026-10-07 while every chart was still a VistA
+    # prep extract. With the normalizer skipped, every document-level extractor
+    # (PMH / PSH / meds / labs / imaging / pathology) returned empty and the notes
+    # lost those sections. The CONTENT decides: a VistA extract is unmistakable
+    # (the 'CLINIC : ... DATE:' / 'EXTRACTED:' banner and the '---- DEM -
+    # Demographics ----' section bars), so normalize it whatever the preference.
+    if fmt != "vista" and looks_like_vista(raw_text):
+        logger.info("source_format=%r but the text is a VistA extract — normalizing", fmt)
+        fmt = "vista"
     if fmt == "cprs":
         return raw_text
     if fmt == "vista":

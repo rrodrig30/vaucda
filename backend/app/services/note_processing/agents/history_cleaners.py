@@ -126,6 +126,21 @@ _SENTENCE_DROP_PATTERNS = (
     re.compile(r'\bNote\s*:\s*(?:The|This)\s+(?:rewritten|synthesized|'
                r'combined|generated)\s+(?:HPI|narrative|note|entry)[^.]*\.',
                re.IGNORECASE),
+    # opus-class models insert a mid-text meta-preamble after the first
+    # sentence: "...presents for follow-up. Here is the rewritten HISTORY OF
+    # PRESENT ILLNESS (HPI): The patient has...". Strip the "Here is the
+    # <adj> <SECTION>:" clause wherever it appears (start OR mid-paragraph).
+    re.compile(r'(?:^|(?<=[.!?]))\s*Here\s+(?:is|are)\s+(?:the\s+|my\s+|a\s+)?'
+               r'(?:rewritten|revised|updated|corrected|comprehensive|complete|'
+               r'following|new|reformatted|final)\b[^:.!?]{0,80}?:\s*',
+               re.IGNORECASE),
+    # Trailing self-referential editor notes: "Note that I corrected the first
+    # sentence...", "I reported the highest-grade core...", "I inferred...".
+    re.compile(r'(?:^|(?<=[.!?]))\s*Note\s*(?:that|:)\s*I\b[^.!?]*[.!?]?',
+               re.IGNORECASE),
+    re.compile(r"(?:^|(?<=[.!?]))\s*I\s+(?:corrected|revised|updated|added|removed|"
+               r"changed|reported|inferred|noted|adjusted|reformatted|rewrote)\b"
+               r"[^.!?]*[.!?]?", re.IGNORECASE),
     # LLM editorializing about clinical relevance — strip these as
     # they're meta-commentary, not clinical content.
     re.compile(r'\bHowever,?\s+this\s+(?:is|was)\s+not\s+(?:directly\s+)?'
@@ -356,6 +371,18 @@ _INLINE_PLACEHOLDER_RE = re.compile(
 )
 
 
+# Bare single-token template placeholders the LLM leaves when it lacks a value,
+# e.g. "His most recent PSA, on [date], is undetectable" -> the "[date]" (and the
+# orphaned connective/comma) must go. Consumes a leading connective ("on"/"in"/
+# "dated") and flanking commas so the sentence reads cleanly after removal.
+_BARE_PLACEHOLDER_RE = re.compile(
+    r'\s*,?\s*(?:\b(?:on|in|at|dated|of|as\s+of)\s+)?'
+    r'\[(?:dates?|age|values?|results?|time|year|month|day|number|dose|dosage|'
+    r'name|sex|gender|X|\?|TBD)\]\s*,?',
+    re.IGNORECASE,
+)
+
+
 # Stripped legacy patterns retained for backward compat with callers
 # that haven't switched yet.
 _LEGACY_INLINE_PATTERNS = (
@@ -403,6 +430,23 @@ def clean_llm_commentary(text: str) -> str:
     """
     if not text:
         return text
+
+    # Pass -1: high-value meta strips that MUST run before the generic
+    # sentence-drop patterns. (a) A leading "Here is the rewritten HPI:" preamble
+    # — stripped whole, before the greedy "The rewritten HPI ...." pattern can eat
+    # the first real sentence and leave a "Here is" stub. (b) A trailing
+    # self-referential EDIT LOG the model appends ("I made the following changes:
+    # * Added dates ... * Changed ...") — removed from that marker to the end.
+    text = re.sub(
+        r"^\s*Here\s+(?:is|are|'?s)\s+(?:the\s+|my\s+|an?\s+)?"
+        r"(?:rewritten|revised|updated|corrected|reformatted|final|new|complete|"
+        r"comprehensive)\s+[^:\n]{0,50}?:\s*", "", text, count=1, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?is)\b(?:I\s+(?:have\s+)?(?:also\s+)?made\s+the\s+following|"
+        r"(?:the\s+)?following\s+(?:changes?|edits?|revisions?)\s+(?:were|have\s+been|"
+        r"are)\s+made|Changes?\s+made|Edits?\s+(?:made|applied)|"
+        r"I\s+(?:have\s+)?(?:also\s+)?made\s+(?:these|the)\s+edits?)"
+        r"\b[^:\n]{0,40}:\s*[-*\s].*", "", text)
 
     # Pass 0: rubric-leak truncation. Runs FIRST so the rest of the
     # cleaner doesn't waste cycles on the meta-block, and so subsequent
@@ -453,10 +497,16 @@ def clean_llm_commentary(text: str) -> str:
     # Pass 2: inline placeholder removal (handles any survivors that
     # weren't inside a recognizable sentence boundary).
     text = _INLINE_PLACEHOLDER_RE.sub('', text)
+    # Pass 2b: bare single-token placeholders ("[date]", "[value]") + orphaned
+    # connective/comma.
+    text = _BARE_PLACEHOLDER_RE.sub(' ', text)
 
     # Pass 3: sentence-level drops
     for pat in _SENTENCE_DROP_PATTERNS:
         text = pat.sub('', text)
+    # A mid-text drop can leave a sentence period touching the next sentence's
+    # capital ("follow-up.The patient") — restore the inter-sentence space.
+    text = re.sub(r'([.!?])([A-Z])', r'\1 \2', text)
 
     # Pass 4: legacy inline cleanups
     for pat in _LEGACY_INLINE_PATTERNS:

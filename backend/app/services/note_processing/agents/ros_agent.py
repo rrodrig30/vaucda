@@ -34,4 +34,4 @@ GI: No diarrhea, nausea, vomiting
 GU: See HPI
 MSK: No myalgias or new bone pain
 Neuro: No headache, syncope, dizziness
-CNS: [To be documented during exam]"""
+CNS: No focal weakness, numbness, tingling, tremor, seizures, or memory changes"""

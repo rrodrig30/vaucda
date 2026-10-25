@@ -232,7 +232,28 @@ def identify_notes(clinical_document: str) -> Dict[str, List[Dict[str, str]]]:
     # Use lookahead to keep the marker in each section
     sections = re.split(r'(?=STANDARD TITLE:)', clinical_document, flags=re.IGNORECASE)
 
-    for section in sections:
+    # VistA record header "MM/DD/YYYY HH:MM  Local Title: ..." sits on the line
+    # BEFORE "Standard Title:", so the split leaves each note's date at the
+    # TAIL of the previous section (MARTINEZ: the 03/18/2026 nursing note that
+    # recorded the Eligard dose came out undated, and its administration line
+    # was later filed under a 05/08/2026 ED note).
+    _vista_hdr_re = re.compile(r'(\d{1,2})/(\d{1,2})/(\d{4})\s+\d{1,2}:\d{2}\s+Local Title:', re.IGNORECASE)
+
+    def _date_from_previous_tail(idx: int) -> str:
+        if idx <= 0:
+            return ""
+        tail = sections[idx - 1][-400:]
+        hits = list(_vista_hdr_re.finditer(tail))
+        if not hits:
+            return ""
+        from datetime import datetime as _dt
+        mm, dd, yyyy = (int(hits[-1].group(i)) for i in (1, 2, 3))
+        try:
+            return _dt(yyyy, mm, dd).strftime("%b %d, %Y")
+        except ValueError:
+            return ""
+
+    for _idx, section in enumerate(sections):
         if not section.strip():
             continue
 
@@ -255,7 +276,7 @@ def identify_notes(clinical_document: str) -> Dict[str, List[Dict[str, str]]]:
         # dropped — every note ended up with date="". Downstream HPI
         # synthesis then couldn't differentiate prior-visit snapshots
         # by time.
-        date = _extract_note_date(section)
+        date = _extract_note_date(section) or _date_from_previous_tail(_idx)
 
         # Create note object
         note = {

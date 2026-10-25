@@ -30,8 +30,20 @@ from typing import Optional
 # Comorbidity markers that, when present, substantially reduce life
 # expectancy regardless of age. Each entry is (regex, label).
 _LIFE_LIMITING_FLAGS = (
-    (re.compile(r"\bmetastatic\b(?!\s+prostate)", re.IGNORECASE),
-     "metastatic non-prostate malignancy"),
+    # Only a NAMED non-prostate metastatic cancer counts. A bare
+    # "metastatic" matched metastatic PROSTATE cancer phrased with
+    # intervening words ("metastatic castration-resistant prostate cancer")
+    # or a prostate met SITE ("metastatic ... neoplasm to liver"),
+    # falsely flagging a second malignancy and seeding hallucinated
+    # "very limited life expectancy due to metastatic non-prostate cancer".
+    (re.compile(
+        r"\bmetastatic\s+(?:lung|pancrea\w+|colorectal|colon|gastric|"
+        r"hepatocellular|esophageal|renal\s+cell|urothelial|bladder|"
+        r"breast|melanoma|lymphoma|leukemia|small[-\s]cell|"
+        r"non[-\s]small[-\s]cell|cholangio\w+|ovarian|"
+        r"head\s+and\s+neck)\b",
+        re.IGNORECASE,
+    ), "metastatic non-prostate malignancy"),
     (re.compile(
         r"\b(?:stage\s+iv|advanced)\s+(?:lung|pancreatic|liver|"
         r"gastric|hepatocellular|colorectal|esophageal)\s+(?:cancer|"
@@ -84,6 +96,30 @@ _LIFE_LIMITING_FLAGS = (
 )
 
 
+# Subset of the flags above that are TERMINAL (life expectancy typically well
+# under 5 years) — these force VERY_LIMITED regardless of the actuarial number,
+# because a health-quartile multiplier under-weights an end-stage condition.
+_TERMINAL_FLAG_LABELS = frozenset({
+    "metastatic non-prostate malignancy",
+    "advanced non-prostate cancer",
+    "hospice care",
+    "palliative care",
+    "advanced dementia",
+})
+
+# Positive evidence of excellent health — only then do we apply the "healthiest
+# quartile" (x1.5) uplift to the SSA life expectancy. Absence of severe flags
+# alone is NOT enough (over-estimating life expectancy drives over-treatment).
+_EXCELLENT_HEALTH = re.compile(
+    r"no\s+(?:significant\s+|major\s+|other\s+)?(?:comorbidit|chronic\s+"
+    r"(?:medical\s+)?(?:problems|conditions|illness))|excellent\s+health|"
+    r"very\s+active|physically\s+active|robust|no\s+(?:significant\s+)?PMH\b|"
+    r"no\s+past\s+medical\s+history|otherwise\s+healthy|healthy\s+"
+    r"(?:man|male|adult|woman|female)|ECOG\s+(?:performance\s+status\s+)?0\b",
+    re.IGNORECASE,
+)
+
+
 # Sentinel "do NOT use to discourage workup" markers. If any of these
 # appear in the stage-1 note, the patient has prostate cancer already
 # and is not in the screening population — guardrail rules about PSA
@@ -124,6 +160,45 @@ def _parse_age(stage1_note: str) -> Optional[int]:
         except ValueError:
             pass
     return None
+
+
+_ECOG_RE = re.compile(
+    r"ECOG\s*(?:PS|performance\s+status|status)?\s*(?:of\s+|[:=]\s*)?([0-4])\b",
+    re.IGNORECASE)
+
+# ---- checkbox intake normalization ------------------------------------------
+# The Functional Status intake renders as checkbox rows:
+#   ECOG status:       [] 0  [] 1  [x] 2  [] 3  [] 4
+# Every extractor that reads the note must see only the CHECKED option
+# ("ECOG status: 2") — an unchecked "[] Difficulty walking 1/4 mile" or
+# "[] Poor" would otherwise score as a documented answer. A row with nothing
+# checked is dropped entirely so a blank template is invisible.
+_INTAKE_ROW_RE = re.compile(
+    r"^[ \t]*(ECOG\s+status|Self-rated\s+health|IADL\s+status|Ambulation\s*\(1/4\s*mile\))"
+    r"[ \t]*:(?=.*\[\s*[xX✓✔ ]?\s*\])(.*)$", re.IGNORECASE | re.MULTILINE)
+_OPTION_RE = re.compile(r"\[\s*([xX✓✔])?\s*\]\s*([^\[\n]*?)\s*(?=\[|$)")
+
+
+def normalize_checkbox_intake(text: str) -> str:
+    """Rewrite checkbox intake rows to 'Label: <checked option>' and drop rows
+    with no box checked. Text without such rows is returned unchanged."""
+    if not text or "[" not in text:
+        return text
+
+    def _sub(m):
+        label, body = m.group(1), m.group(2)
+        picked = [opt.strip() for mark, opt in _OPTION_RE.findall(body) if mark and opt.strip()]
+        return f"{label}: {picked[0]}" if picked else ""
+    return _INTAKE_ROW_RE.sub(_sub, text)
+
+
+def _parse_ecog(stage1_note: str) -> Optional[int]:
+    """ECOG performance status 0-4 from the note (the Functional Status intake
+    documents it for cancer patients), or None if not documented."""
+    if not stage1_note:
+        return None
+    m = _ECOG_RE.search(normalize_checkbox_intake(stage1_note))
+    return int(m.group(1)) if m else None
 
 
 def _detect_life_limiting(stage1_note: str) -> list:
@@ -176,31 +251,216 @@ def classify_life_expectancy(stage1_note: str) -> dict:
       STANDARD:     <70 (any), or 70-74 without comorbidities.
                     ⇒ standard AUA early-detection options apply.
     """
+    # Checked intake options only — a blank checkbox template must not score.
+    stage1_note = normalize_checkbox_intake(stage1_note or "")
     age = _parse_age(stage1_note)
     flags = _detect_life_limiting(stage1_note)
     n_flags = len(flags)
 
-    if age is None:
+    # Primary driver: NCCN/AUA SSA actuarial life expectancy adjusted by
+    # comorbidity health quartile (replaces the coarse Charlson 10-yr survival).
+    from .life_expectancy import (estimate_life_expectancy, parse_sex,
+                                   format_life_expectancy, compute_lee_index,
+                                   compute_schonberg_index)
+    sex = parse_sex(stage1_note)
+    excellent = bool(_EXCELLENT_HEALTH.search(stage1_note or "")) and n_flags == 0
+    le = estimate_life_expectancy(age, sex, n_flags, excellent_health=excellent)
+    # Lee 4-yr-mortality index — computed only when functional status is documented.
+    lee = compute_lee_index(stage1_note, age, sex)
+    # Schonberg 9-yr-mortality index — PREFERRED (closest to 10-yr survival) when
+    # its self-report inputs are documented; else the SSA estimate governs.
+    schon = compute_schonberg_index(stage1_note, age, sex)
+    ecog = _parse_ecog(stage1_note)
+
+    if age is None or le is None:
         bucket = "UNKNOWN"
-    elif age >= 85:
-        bucket = "VERY_LIMITED"
-    elif n_flags >= 2:
-        bucket = "VERY_LIMITED"
-    elif age >= 75 and n_flags >= 1:
-        bucket = "VERY_LIMITED"
-    elif age >= 75:
-        bucket = "LIMITED"
-    elif age >= 70 and n_flags >= 1:
-        bucket = "LIMITED"
     else:
-        bucket = "STANDARD"
+        if schon is not None:
+            # Schonberg's own strata: 0-7 low, 8-13 medium, 14+ high mortality.
+            if schon["score"] <= 7:
+                bucket = "STANDARD"
+            elif schon["score"] <= 13:
+                bucket = "LIMITED"
+            else:
+                bucket = "VERY_LIMITED"
+        elif le["years"] >= 10:
+            # Bucket from the SSA estimated years: >=10 STANDARD, 5-10 LIMITED, <5.
+            # (Replaces the old blunt age-only cutoffs — a robust 80-year-old is
+            # no longer auto-LIMITED; the actuarial estimate decides.)
+            bucket = "STANDARD"
+        elif le["years"] >= 5:
+            bucket = "LIMITED"
+        else:
+            bucket = "VERY_LIMITED"
+        # Severe-end safety overrides the actuarial quartile can under-weight:
+        #  - a TERMINAL condition (hospice/palliative/metastatic non-prostate
+        #    cancer/advanced dementia) -> VERY_LIMITED at any age;
+        #  - >=2 severe flags (catastrophic burden) -> VERY_LIMITED;
+        #  - a severe flag in an elderly (>=75) patient -> VERY_LIMITED.
+        _terminal = any(f in _TERMINAL_FLAG_LABELS for f in flags)
+        if _terminal or n_flags >= 2 or (n_flags >= 1 and age >= 75):
+            bucket = "VERY_LIMITED"
+        # Lee index is DOWNGRADE-ONLY: a high 4-yr mortality (score >=10 -> >=42%)
+        # reliably means limited life expectancy, so pull the bucket down at least
+        # one level. A low Lee score never upgrades (4-yr mortality can't confirm
+        # 10-yr survival) — the SSA estimate governs the upside.
+        if lee and lee["score"] >= 14:            # ~64% 4-yr mortality
+            bucket = "VERY_LIMITED"
+        elif lee and lee["score"] >= 10 and bucket == "STANDARD":  # ~42%
+            bucket = "LIMITED"
+        # ECOG performance status (captured in the Functional Status intake):
+        # ECOG 3-4 (in bed >50% of waking hours / bedbound) implies markedly
+        # limited survival at any age; ECOG 2 pulls a STANDARD bucket down to
+        # LIMITED. ECOG 0-1 does not downgrade (ECOG 0 already earns the
+        # healthiest-quartile uplift on the SSA estimate).
+        if ecog is not None and ecog >= 3:
+            bucket = "VERY_LIMITED"
+        elif ecog == 2 and bucket == "STANDARD":
+            bucket = "LIMITED"
+
+    # Honest summary: when a severe/terminal override forced VERY_LIMITED but the
+    # actuarial number is >=5 yr, the table under-weights the end-stage condition
+    # — so don't present that inflated figure; state the limiting driver instead.
+    le_summary = format_life_expectancy(le)
+    disp_years = le["years"] if le else None
+    if le and bucket == "VERY_LIMITED" and le["years"] >= 5:
+        driver_bits = list(flags)
+        if ecog is not None and ecog >= 3 and not any("ECOG" in f for f in flags):
+            driver_bits.append(f"ECOG {ecog}")
+        drivers = ", ".join(driver_bits) if driver_bits else f"age {age}"
+        le_summary = (f"Life expectancy markedly limited (<5 years) given {drivers}; "
+                      f"the actuarial table under-weights end-stage disease.")
+        disp_years = None
+
+    lee_summary = ""
+    if lee:
+        drivers = ", ".join(k for k in lee["contributors"] if k not in ("male",))
+        lee_summary = (f"Lee index {lee['score']} pts (~{lee['mortality_4yr_band']} "
+                       f"4-year mortality"
+                       + (f"; {drivers}" if drivers else "") + ").")
+
+    schon_summary = ""
+    if schon:
+        drivers = ", ".join(k for k in schon["contributors"] if k not in ("male",))
+        schon_summary = (
+            f"Schonberg index {schon['score']} pts: ~{schon['survival_9yr_pct']}% "
+            f"9-year survival (~{schon['mortality_9yr_pct']}% 9-year mortality"
+            + (f"; {drivers}" if drivers else "") + ").")
+
+    # Primary survival figure the synthesis prompt should cite: Schonberg when
+    # available (validated 9-yr, closest to 10-yr survival), else the SSA estimate.
+    primary_summary = schon_summary or le_summary
+    # ECOG 3-4 isn't an input to Schonberg/SSA but overrides the bucket, so annotate
+    # the figure to keep it consistent with a VERY_LIMITED classification.
+    if ecog is not None and ecog >= 3:
+        primary_summary = ((primary_summary + " ") if primary_summary else "") + \
+            (f"ECOG {ecog} indicates markedly limited performance status; "
+             f"survival correspondingly reduced.")
 
     return {
         "bucket": bucket,
         "age": age,
+        "sex": sex,
+        "ecog": ecog,
         "life_limiting_flags": flags,
+        "life_expectancy": le,                       # SSA-based estimate dict (or None)
+        "life_expectancy_years": disp_years,
+        "life_expectancy_summary": le_summary,
+        "lee_index": lee,                            # Lee 4-yr index dict (or None)
+        "lee_index_summary": lee_summary,
+        "schonberg_index": schon,                    # Schonberg 9-yr index (or None)
+        "schonberg_index_summary": schon_summary,
+        "primary_survival_summary": primary_summary,
         "known_prostate_cancer": _has_known_prostate_cancer(stage1_note),
     }
+
+
+_ANY_CANCER_RE = re.compile(
+    r"\bcancer\b|carcinoma|malignan|adenocarcinoma|lymphoma|leukemia|sarcoma|"
+    r"\bGleason\b|Grade\s+Group", re.IGNORECASE)
+_IADL_INDEPENDENT = re.compile(
+    r"independent\s+(?:in|with)\s+(?:all\s+)?(?:IADL|instrumental)|"
+    r"IADL\s+status\s*:\s*Independent\b", re.IGNORECASE)
+_AMBULATES_OK = re.compile(
+    r"no\s+difficulty\s+walking|ambulat\w*\s+(?:independently|without\s+"
+    r"(?:difficulty|assist)|well)|walks?\s+without\s+(?:difficulty|assist)|"
+    r"Ambulation\s*\(1/4\s*mile\)\s*:\s*No\s+difficulty\b", re.IGNORECASE)
+
+# Checkbox intake rows (provider-supplied layout). Each row's options are
+# rendered as "[] option"; the option the chart documents is pre-checked "[x]".
+_INTAKE_ROWS = (
+    ("ECOG status:          ", ["0", "1", "2", "3", "4"], 2),
+    ("Self-rated health:  ", ["Excellent", "Very good", "Good", "Fair", "Poor"], 2),
+    ("IADL status:        ", ["Independent", "Dependent in >=1 IADL"], 3),
+    ("Ambulation (1/4 mile):     ", ["No difficulty", "Difficulty walking 1/4 mile"], 3),
+)
+
+
+def _checkbox_row(label: str, options: list, gap: int, checked: Optional[str]) -> str:
+    boxes = []
+    for opt in options:
+        mark = "[x]" if (checked is not None and opt.lower() == checked.lower()) else "[]"
+        boxes.append(f"{mark} {opt}")
+    return "  " + label + (" " * gap).join(boxes)
+
+
+def build_functional_status_section(stage1_note: str) -> str:
+    """Structured intake that (a) captures the Schonberg self-report inputs
+    (perceived health, IADL status, ambulation) and (b) prompts ECOG performance
+    status for cancer patients — so both the life-expectancy estimate and ECOG
+    are documented. Rendered as checkbox rows; the option the chart already
+    documents is pre-checked, otherwise every box is blank for the provider.
+    Rendered only when relevant (cancer, age >=65, or functional status already
+    documented)."""
+    if not stage1_note:
+        return ""
+    from .life_expectancy import (_SCHON_PERCEIVED, _SCHON_IADL,
+                                  _SCHON_DIFF_QUARTER_MILE, _LEE_FUNC_DOCUMENTED,
+                                  _difficulty_present)
+    stage1_note = normalize_checkbox_intake(stage1_note)
+    info = classify_life_expectancy(stage1_note)
+    age = info.get("age")
+    is_cancer = bool(_ANY_CANCER_RE.search(stage1_note)) or info.get("known_prostate_cancer")
+    relevant = is_cancer or (age is not None and age >= 65) \
+        or bool(_LEE_FUNC_DOCUMENTED.search(stage1_note))
+    if not relevant:
+        return ""
+
+    ecog_row, health_row, iadl_row, amb_row = _INTAKE_ROWS
+    rows = []
+
+    if is_cancer:
+        _e = _parse_ecog(stage1_note)
+        rows.append(_checkbox_row(*ecog_row, str(_e) if _e is not None else None))
+
+    pm = _SCHON_PERCEIVED.search(stage1_note)
+    health = None
+    if pm:
+        val = (next((g for g in pm.groups() if g), "") or "").strip().lower()
+        health = next((o for o in health_row[1] if o.lower() == val), None)
+    rows.append(_checkbox_row(*health_row, health))
+
+    if _SCHON_IADL.search(stage1_note):
+        iadl = "Dependent in >=1 IADL"
+    elif _IADL_INDEPENDENT.search(stage1_note):
+        iadl = "Independent"
+    else:
+        iadl = None
+    rows.append(_checkbox_row(*iadl_row, iadl))
+
+    if _difficulty_present(stage1_note, _SCHON_DIFF_QUARTER_MILE):
+        amb = "Difficulty walking 1/4 mile"
+    elif _AMBULATES_OK.search(stage1_note):
+        amb = "No difficulty"
+    else:
+        amb = None
+    rows.append(_checkbox_row(*amb_row, amb))
+
+    body = "\n".join(rows)
+    est = info.get("primary_survival_summary")
+    if est:
+        body += f"\n\n  Estimated survival: {est}"
+    return body
 
 
 def build_age_guardrail_block(stage1_note: str) -> str:
@@ -227,6 +487,23 @@ def build_age_guardrail_block(stage1_note: str) -> str:
         f"Patient age: {age}",
         f"Life-expectancy bucket: {bucket}",
     ]
+    # NCCN/AUA SSA-actuarial + comorbidity-quartile estimate (the survival
+    # predictor — NOT the Charlson index). The LLM may cite this figure.
+    if info.get("schonberg_index_summary"):
+        # Preferred survival predictor (validated 9-year, closest to 10-year).
+        header.append(info["schonberg_index_summary"]
+                      + " Cite this validated survival estimate (Schonberg index),"
+                        " NOT a Charlson 10-year-survival %.")
+        if info.get("life_expectancy_summary"):
+            header.append("Corroborating actuarial estimate: "
+                          + info["life_expectancy_summary"])
+    elif info.get("life_expectancy_summary"):
+        header.append(info["life_expectancy_summary"]
+                      + " Use this life-expectancy figure (per NCCN/AUA "
+                        "actuarial method), not a Charlson 10-year-survival %.")
+    if info.get("lee_index_summary"):
+        header.append(info["lee_index_summary"]
+                      + " (Lee index — corroborating validated estimate.)")
     if flags:
         header.append("Life-limiting comorbidity flags detected: "
                       + ", ".join(flags))
@@ -238,6 +515,44 @@ def build_age_guardrail_block(stage1_note: str) -> str:
             "to NEW unrelated workup (e.g., another solid-organ "
             "screening question)."
         )
+
+    # Patients with KNOWN prostate cancer are NOT in the screening
+    # population. PSA here is a disease-monitoring marker, not a screening
+    # test — telling the LLM to "stop PSA surveillance" for an mCRPC patient
+    # (HOLES) is clinically wrong and drove context-blind Plan recs. These
+    # variants apply the life-expectancy lens to INTENSITY of intervention
+    # without discontinuing appropriate disease monitoring.
+    rules_by_bucket_known_pc = {
+        "VERY_LIMITED": [
+            "RULES FOR THIS PATIENT (known prostate cancer; life "
+            "expectancy estimated <5 yr):",
+            "- PSA here is a DISEASE-MONITORING marker for the established "
+            "  cancer, NOT a screening test. Do NOT recommend stopping PSA "
+            "  monitoring and do NOT cite screening-cessation guidelines.",
+            "- DO continue appropriate disease monitoring (PSA, symptom "
+            "  assessment) at a cadence matched to the treatment plan.",
+            "- Calibrate INTENSITY of intervention to life expectancy: "
+            "  favor symptom control, quality of life, and goals-of-care "
+            "  discussion over aggressive diagnostics/treatment unlikely "
+            "  to benefit within the remaining life expectancy.",
+            "- Do NOT order NEW detection workup unrelated to the known "
+            "  cancer (e.g., screening for a different organ).",
+            "- Do NOT invent a life-expectancy figure or a non-prostate "
+            "  terminal diagnosis that is not documented in the source.",
+        ],
+        "LIMITED": [
+            "RULES FOR THIS PATIENT (known prostate cancer; life "
+            "expectancy ~5-10 yr):",
+            "- PSA is disease monitoring for the established cancer, not "
+            "  screening — continue it; do NOT apply screening-cessation "
+            "  language.",
+            "- Weigh the intensity of further treatment/diagnostics against "
+            "  life expectancy and competing comorbidity, but keep "
+            "  appropriate monitoring of the known cancer in place.",
+            "- Name an explicit rationale for the surveillance interval "
+            "  (functional status, treatment phase, patient preference).",
+        ],
+    }
 
     rules_by_bucket = {
         "VERY_LIMITED": [
@@ -298,6 +613,12 @@ def build_age_guardrail_block(stage1_note: str) -> str:
         ],
     }
 
-    body = rules_by_bucket.get(bucket, rules_by_bucket["STANDARD"])
+    # Known-PC patients get the disease-monitoring variant (no screening-
+    # cessation) for the life-expectancy-sensitive buckets; STANDARD is the
+    # same either way.
+    if has_pc and bucket in rules_by_bucket_known_pc:
+        body = rules_by_bucket_known_pc[bucket]
+    else:
+        body = rules_by_bucket.get(bucket, rules_by_bucket["STANDARD"])
 
     return "\n".join(header + [""] + body) + "\n=== END AGE / LIFE-EXPECTANCY GUARDRAIL ===\n"
