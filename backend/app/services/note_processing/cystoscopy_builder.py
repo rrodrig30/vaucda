@@ -21,7 +21,7 @@ import re
 from typing import Optional
 
 from .llm_helper import synthesize_with_llm
-from .extractors import extract_imaging, extract_medications, extract_pathology
+from .extractors import extract_psa, extract_imaging, extract_medications, extract_pathology
 from .extractors.lab_extractor import extract_labs
 from .gu_diagnoses import detect_patient_sex, detect_gu_diagnoses
 
@@ -520,6 +520,61 @@ def build_cystoscopy_note(
     culture = _scan_sentences(text, _CULTURE_RE, 3)
     symptoms = _scan_sentences(text, _SYMPTOM_RE, 4)
     tobacco = _scan_sentences(text, re.compile(r"tobacco|smok|cigarette|pack[\s-]?year", re.I), 2)
+
+    # ---- composition v3 (VAUCDA_COMPOSE_V3): whole-chart header, blank findings/A&P,
+    # quote-grounded verification, NO fallback. -----------------------------------
+    from .composition import compose_v3_enabled as _v3_on
+    if _v3_on():
+        from .composition.cysto_compose import build_cysto_context, compose_cysto_header
+        from .composition.verify import verify_section, render_verification_notes
+        from .note_identifier import identify_notes as _identify_notes
+        try:
+            psa_tbl = (extract_psa(text) or "").strip()
+        except Exception:  # noqa: BLE001
+            psa_tbl = ""
+        _tables = {"IMAGING (last 2 years)": imaging, "LABS (last 6 months)": labs, "PATHOLOGY RESULTS": pathology,
+                   "MEDICATIONS": meds, "URINE CULTURE / PRE-OP (chart sentences)": culture,
+                   "ANTICOAGULATION (chart sentences)": anticoag, "PSA CURVE": psa_tbl}
+        _proc_ctx = (f"COMPLETED TURBTs:\n{turbt_ctx}\nBLADDER PATHOLOGY (most recent): {bladder_path or '(none)'}\n"
+                     f"COMPLETED PROSTATE / OUTLET PROCEDURES:\n{outlet_ctx}\n"
+                     f"BOOKED (NOT performed):\n{planned_ctx}")
+        _nd = _identify_notes(clinical_text)
+        _ctx = build_cysto_context(text, _nd.get("gu_notes") or [], patient_facts, _tables, _proc_ctx,
+                                   header.get("name", "") or "", sex, header.get("date", "") or "")
+
+        def _call(p: str) -> str:
+            return synthesize_with_llm(p, task_config=task_config, temperature=0.0, max_tokens=8000) or ""
+
+        print("\n[v3] Composing cystoscopy header from the whole chart "
+              f"(chart {len(_ctx.chart)} chars, prior notes {len(_ctx.prior_clinician_notes)} chars)...")
+        fields, audit = compose_cysto_header(_ctx, _call)
+        vh = verify_section(fields["hpi"], _ctx, patient_facts, _call, is_plan=False, section="cystoscopy HPI")
+        for a in vh.applied:
+            print(f"      [v3] verified edit (cysto HPI): {a[:160]}")
+        footer = render_verification_notes([vh], audit.get("open_questions"))
+        if footer:
+            print("      " + footer.replace("\n", "\n      "))
+        print(f"      [v3] indication {len(fields['indication'])} chars; HPI {len(vh.text)} chars; attempts {audit.get('attempts')}")
+        exam_skeleton = _FEMALE_EXAM_SKELETON if sex == "female" else _MALE_EXAM_SKELETON
+        narrative = f"{_TEMPLATE_NARRATIVE}\n\n{exam_skeleton}"
+        lines = [
+            f"Name: {header['name']}", f"SSN {header['ssn4']}", f"Date: {header['date']}",
+            "\t\t\tCYSTOSCOPY NOTE", "",
+            f"INDICATION: {fields['indication']}", "",
+            f"HPI: {vh.text}", "",
+            "IMAGING:", (imaging or fields.get("imaging_pertinence") or ""), "",
+            "LABS (only last 6 months or less):", (labs or ""), "",
+            "UA WITH CULTURES IF AVAILABLE:", (fields.get("culture") or culture or ""), "",
+            "PATHOLOGY:", (pathology or fields.get("pathology_pertinence") or ""), "",
+            "CONSENT: Obtained via Web IMED", "",
+            f"OPERATOR: {_OPERATOR}", "",
+            f"NARRATIVE:  {narrative}", "",
+            "ASSESSMENT:", "", "PLAN:", "",
+        ]
+        out = "\n".join(lines).rstrip() + "\n"
+        if footer:
+            out += "\n" + footer + "\n"
+        return out
 
     # LLM: HPI + indication + the four per-patient sections in one call.
     ctx = (
